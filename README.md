@@ -1,10 +1,12 @@
 # nStudio
 
+<p align="center">
+  <img src="screenshots/release1.0.gif" alt="nStudio">
+</p>
+
 ## About
 
 nStudio is a lightweight, fully-featured ARM assembly Integrated Development Environment (IDE) built specifically for the TI-Nspire CX and CX II calculators running Ndless. It allows developers to write, edit, and navigate ARM assembly code directly on the calculator itself, providing desktop-like text editing capabilities on a portable device.
-
-![nStudio](screenshots/release1.0.gif)
 
 ## Features
 
