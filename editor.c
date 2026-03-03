@@ -3102,12 +3102,6 @@ static void editor_save_as(void) {
                           sizeof(fname)))
     return;
 
-  {
-    char *dot = strchr(fname, '.');
-    if (dot)
-      *dot = '\0';
-  }
-
   if (fname[0] == '\0') {
     const char *body[] = {"Filename cannot be empty."};
     gfx_window_alert("Save As", body, 1, "OK");
@@ -3115,7 +3109,18 @@ static void editor_save_as(void) {
   }
 
   char newpath[2048];
-  snprintf(newpath, sizeof(newpath), "%s/%s.tns", destdir, fname);
+
+  if (!strchr(fname, '.')) {
+    snprintf(newpath, sizeof(newpath), "%s/%s.%s.tns", destdir, fname,
+             g_settings.asm_extension);
+  } else {
+    int len = strlen(fname);
+    if (len >= 4 && strcmp(fname + len - 4, ".tns") == 0) {
+      snprintf(newpath, sizeof(newpath), "%s/%s", destdir, fname);
+    } else {
+      snprintf(newpath, sizeof(newpath), "%s/%s.tns", destdir, fname);
+    }
+  }
 
   if (save_file(newpath)) {
     strncpy(g_filepath, newpath, sizeof(g_filepath) - 1);
