@@ -1257,6 +1257,7 @@ static void do_insert_char(char c) {
   undo_push();
   if (sel_active_flag())
     sel_delete_region();
+
   gb_move(&g_buf, cursor_pos);
   gb_insert(&g_buf, c);
   cursor_pos++;
@@ -1269,11 +1270,16 @@ static void do_enter(void) {
   undo_push();
   if (sel_active_flag())
     sel_delete_region();
+
   int indent = 0;
   int line_start = line_starts[cursor_row];
   int ll = line_len(&g_buf, cursor_row);
+
+  /* Only look for indentation spaces that are BEFORE the cursor */
+  int max_indent = cursor_pos - line_start;
+
   if (g_settings.auto_indent) {
-    while (indent < ll) {
+    while (indent < ll && indent < max_indent) {
       char c = gb_get(&g_buf, line_start + indent);
       if (c == ' ' || c == '\t')
         indent++;
@@ -1281,13 +1287,19 @@ static void do_enter(void) {
         break;
     }
   }
+
   gb_move(&g_buf, cursor_pos);
   gb_insert(&g_buf, '\n');
   cursor_pos++;
-  for (int i = 0; i < indent; i++) {
+
+  int i;
+  for (i = 0; i < indent; i++) {
+    /* Safe to read from line_start + i because it is strictly before the
+     * insertion point */
     gb_insert(&g_buf, gb_get(&g_buf, line_start + i));
     cursor_pos++;
   }
+
   rebuild_lines(&g_buf);
   cursor_sync_pos();
   g_modified = 1;
