@@ -791,8 +791,11 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
   int last_ch = 0;
   int rep_timer = 0;
 
-  while (any_key_pressed())
+  while (any_key_pressed()) {
     msleep(20);
+    idle();
+  }
+
   input_render(title, prompt, buf, cursor, wx, wy);
 
   for (;;) {
@@ -801,8 +804,10 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
     int shift = (int)isKeyPressed(KEY_NSPIRE_SHIFT);
 
     if (isKeyPressed(KEY_NSPIRE_ENTER)) {
-      while (any_key_pressed())
+      while (any_key_pressed()) {
         msleep(20);
+        idle();
+      }
       if (len == 0)
         continue;
       int copy = len < outmax - 1 ? len : outmax - 1;
@@ -811,8 +816,10 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
       return 1;
     }
     if (isKeyPressed(KEY_NSPIRE_ESC)) {
-      while (any_key_pressed())
+      while (any_key_pressed()) {
         msleep(20);
+        idle();
+      }
       return 0;
     }
     if (isKeyPressed(KEY_NSPIRE_DEL)) {
@@ -847,6 +854,7 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
       if (rep_timer < INP_REPEAT_DELAY ||
           (rep_timer - INP_REPEAT_DELAY) % INP_REPEAT_RATE != 0) {
         msleep(16);
+        idle();
         continue;
       }
     }
@@ -865,7 +873,9 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
     }
 
     input_render(title, prompt, buf, cursor, wx, wy);
+
     msleep(16);
+    idle();
   }
 }
 
@@ -945,8 +955,10 @@ static int confirm_run(int wx, int wy, int win_w, int win_h, const char *title,
                        const int *bw, int n, int gap) {
   int focus = 0;
 
-  while (any_key_pressed())
+  while (any_key_pressed()) {
     msleep(20);
+    idle();
+  }
 
   for (;;) {
     int sep_y = confirm_draw_frame(wx, wy, win_w, win_h, title, body, nbody);
@@ -956,22 +968,30 @@ static int confirm_run(int wx, int wy, int win_w, int win_h, const char *title,
     if (isKeyPressed(KEY_NSPIRE_LEFT) || isKeyPressed(KEY_NSPIRE_4)) {
       if (focus > 0)
         focus--;
-      while (isKeyPressed(KEY_NSPIRE_LEFT) || isKeyPressed(KEY_NSPIRE_4))
+      while (isKeyPressed(KEY_NSPIRE_LEFT) || isKeyPressed(KEY_NSPIRE_4)) {
         msleep(20);
+        idle();
+      }
     } else if (isKeyPressed(KEY_NSPIRE_RIGHT) || isKeyPressed(KEY_NSPIRE_6)) {
       if (focus < n - 1)
         focus++;
-      while (isKeyPressed(KEY_NSPIRE_RIGHT) || isKeyPressed(KEY_NSPIRE_6))
+      while (isKeyPressed(KEY_NSPIRE_RIGHT) || isKeyPressed(KEY_NSPIRE_6)) {
         msleep(20);
+        idle();
+      }
     } else if (isKeyPressed(KEY_NSPIRE_ENTER) ||
                isKeyPressed(KEY_NSPIRE_SPACE) ||
                isKeyPressed(KEY_NSPIRE_CLICK)) {
-      while (any_key_pressed())
+      while (any_key_pressed()) {
         msleep(20);
+        idle();
+      }
       return focus;
     } else if (isKeyPressed(KEY_NSPIRE_ESC)) {
-      while (any_key_pressed())
+      while (any_key_pressed()) {
         msleep(20);
+        idle();
+      }
       return -1;
     } else {
       msleep(20);
