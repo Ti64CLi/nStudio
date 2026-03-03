@@ -66,3 +66,7 @@ This will produce the `nstudio.tns` executable.
 1. Transfer the `nstudio.tns` file to your TI-Nspire using the TI-Nspire Student Software, N-Link, or TiLP.
 2. Ensure Ndless is installed and active on your calculator.
 3. Open `nstudio.tns` from the calculator's native file browser to launch the application. Settings are automatically saved to `/documents/ndless/nstudio.cfg`.
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 (GPLv3).
