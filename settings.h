@@ -77,4 +77,10 @@ void settings_apply_theme(void); /* Pushes g_settings out to g_default_theme */
  */
 int settings_find_nasm(char *out, int outsz);
 
+/*
+ * Opens the settings UI window.
+ * Blocks until the user closes or applies the settings.
+ */
+void settings_ui_open(void);
+
 #endif /* SETTINGS_H */

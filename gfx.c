@@ -681,7 +681,7 @@ int gfx_menu(const char *title, const char *subtitle, const char **items,
  * gfx_input_filename  -  single-line filename input dialog
  * ================================================================ */
 
-#define INPUT_KEYMAP_SIZE 39
+#define INPUT_KEYMAP_SIZE 40
 
 typedef struct {
   t_key key;
@@ -709,8 +709,7 @@ static const InputKey input_keymap[INPUT_KEYMAP_SIZE] = {
     {KEY_NSPIRE_6, '6', '^'},      {KEY_NSPIRE_7, '7', '&'},
     {KEY_NSPIRE_8, '8', '*'},      {KEY_NSPIRE_9, '9', '('},
     {KEY_NSPIRE_MINUS, '-', '_'},  {KEY_NSPIRE_PERIOD, '.', '.'},
-    {KEY_NSPIRE_DIVIDE, '/', '/'},
-
+    {KEY_NSPIRE_DIVIDE, '/', '/'}, {KEY_NSPIRE_SPACE, ' ', '_'},
 };
 
 #define INP_WIN_W 260
