@@ -107,6 +107,19 @@ static void action_settings(void) {
   GfxWidget *w_ext_val = widget_create_text(
       col2, yy, ww, row_h, g_settings.asm_extension, 16, "Edit ASM Extension:");
   yy += row_h;
+  GfxWidget *w_nasm_lbl =
+      widget_create_label(col1, yy, col2 - col1, row_h, "nasm Path:");
+  GfxWidget *w_nasm_val = widget_create_text(
+      col2, yy, ww, row_h, g_settings.nasm_path, 255, "nasm Executable Path:");
+  yy += row_h;
+  GfxWidget *w_nasm_detect =
+      widget_create_button(col1, yy, 260, row_h, "Auto-detect nasm");
+  yy += row_h;
+  GfxWidget *w_nasm_args_lbl =
+      widget_create_label(col1, yy, col2 - col1, row_h, "nasm Args:");
+  GfxWidget *w_nasm_args_val = widget_create_text(
+      col2, yy, ww, row_h, g_settings.nasm_args, 127, "nasm Arguments:");
+  yy += row_h;
 
   yy += 10;
 
@@ -218,17 +231,22 @@ static void action_settings(void) {
   GfxWidget *btn_restore = widget_create_button(145, yy, 125, row_h, "Restore");
 
   GfxWidget *children[] = {
-      w_beh_hdr,   w_tab_lbl, w_tab_val, w_ind_lbl, w_ind_val, w_syn_lbl,
-      w_syn_val,   w_ext_lbl, w_ext_val, w_app_hdr, w_thm_lbl, w_thm_val,
-      w_bg_lbl,    w_bg_val,  w_fg_lbl,  w_fg_val,  w_acc_lbl, w_acc_val,
-      w_atx_lbl,   w_atx_val, w_ttb_lbl, w_ttb_val, w_ttf_lbl, w_ttf_val,
-      w_itm_lbl,   w_itm_val, w_brl_lbl, w_brl_val, w_brd_lbl, w_brd_val,
-      w_syx_hdr,   w_nrm_lbl, w_nrm_val, w_mnm_lbl, w_mnm_val, w_reg_lbl,
-      w_reg_val,   w_imm_lbl, w_imm_val, w_lbl_lbl, w_lbl_val, w_cmt_lbl,
-      w_cmt_val,   w_dir_lbl, w_dir_val, w_str_lbl, w_str_val, btn_apply,
-      btn_restore,
+      w_beh_hdr,  w_tab_lbl,     w_tab_val,       w_ind_lbl,       w_ind_val,
+      w_syn_lbl,  w_syn_val,     w_ext_lbl,       w_ext_val,       w_nasm_lbl,
+      w_nasm_val, w_nasm_detect, w_nasm_args_lbl, w_nasm_args_val, w_app_hdr,
+      w_thm_lbl,  w_thm_val,     w_bg_lbl,        w_bg_val,        w_fg_lbl,
+      w_fg_val,   w_acc_lbl,     w_acc_val,       w_atx_lbl,       w_atx_val,
+      w_ttb_lbl,  w_ttb_val,     w_ttf_lbl,       w_ttf_val,       w_itm_lbl,
+      w_itm_val,  w_brl_lbl,     w_brl_val,       w_brd_lbl,       w_brd_val,
+      w_syx_hdr,  w_nrm_lbl,     w_nrm_val,       w_mnm_lbl,       w_mnm_val,
+      w_reg_lbl,  w_reg_val,     w_imm_lbl,       w_imm_val,       w_lbl_lbl,
+      w_lbl_val,  w_cmt_lbl,     w_cmt_val,       w_dir_lbl,       w_dir_val,
+      w_str_lbl,  w_str_val,     btn_apply,       btn_restore,
   };
   int num_widgets = (int)(sizeof(children) / sizeof(GfxWidget *));
+  int idx_nasm_detect = 11; /* w_nasm_detect */
+  int idx_apply = num_widgets - 2;
+  int idx_restore = num_widgets - 1;
 
   SettingsContext ctx;
   ctx.original = g_settings;
@@ -251,12 +269,30 @@ static void action_settings(void) {
   for (;;) {
     int result = gfx_window_exec(&win);
 
-    if (result == num_widgets - 2) {
+    if (result == idx_nasm_detect) {
+      char found[256];
+      if (settings_find_nasm(found, sizeof(found))) {
+        strncpy(g_settings.nasm_path, found, 255);
+        g_settings.nasm_path[255] = '\0';
+        const char *ok2[2] = {"nasm found:", found};
+        gfx_window_alert("Auto-detect", ok2, 2, "OK");
+      } else {
+        static const char *body[] = {"nasm.tns not found in /documents.",
+                                     "Please select the nasm executable."};
+        gfx_window_alert("Auto-detect", body, 2, "OK");
+        const char *picked = filebrowser_select();
+        gfx_init(); /* filebrowser may have called gfx_deinit */
+        if (picked && picked[0]) {
+          strncpy(g_settings.nasm_path, picked, 255);
+          g_settings.nasm_path[255] = '\0';
+        }
+      }
+    } else if (result == idx_apply) {
       ctx.original = g_settings;
       settings_save();
       win.focused_idx = 2;
 
-    } else if (result == num_widgets - 1) {
+    } else if (result == idx_restore) {
       g_settings = ctx.original;
       ctx.current_frame = g_settings;
       settings_apply_theme();

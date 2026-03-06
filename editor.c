@@ -1134,6 +1134,7 @@ static const KeyMap keymap[KEYMAP_SIZE] = {
 #define ACT_SAVE_AS (-43)
 #define ACT_GOTO_LINE (-44)
 #define ACT_GOTO_LABEL (-45)
+#define ACT_ASSEMBLE (-46)
 
 static int last_action = ACT_NONE;
 static int repeat_timer = 0;
@@ -1231,6 +1232,8 @@ static int poll_key(void) {
     return ACT_REPLACE;
   if (ctrl && isKeyPressed(KEY_NSPIRE_A))
     return ACT_SEL_ALL;
+  if (ctrl && isKeyPressed(KEY_NSPIRE_B))
+    return ACT_ASSEMBLE;
   if (ctrl && isKeyPressed(KEY_NSPIRE_TRIG))
     return ACT_CHEATSHEET;
 
@@ -3493,11 +3496,12 @@ static const char *menu_nav_items[] = {
 static const char *menu_view_items[] = {"ARM Catalog", "Label Browser",
                                         "Instruction Help (Ctrl+Trig)"};
 static const char *menu_settings_items[] = {"Preferences"};
+static const char *menu_assemble_items[] = {"Assemble (Ctrl+B)"};
 
 static const MenuDef g_menus[] = {
     {"File", menu_file_items, 5},         {"Edit", menu_edit_items, 10},
     {"Navigate", menu_nav_items, 4},      {"View", menu_view_items, 3},
-    {"Settings", menu_settings_items, 1},
+    {"Assemble", menu_assemble_items, 1}, {"Settings", menu_settings_items, 1},
 };
 #define NMENU ((int)(sizeof(g_menus) / sizeof(g_menus[0])))
 
@@ -3589,6 +3593,73 @@ static void menu_draw(int top_sel, int sub_sel, int in_sub) {
                   in_sub ? sub_sel : -1, in_sub);
 
   gfx_flip();
+}
+
+/* ================================================================
+ * Assemble current file via nasm
+ * ================================================================ */
+static void editor_assemble(void) {
+  if (g_settings.nasm_path[0] == '\0') {
+    static const char *body[] = {
+        "No nasm executable path is set.",
+        "Please configure it in Settings > Preferences."};
+    gfx_window_alert("Assemble", body, 2, "OK");
+    return;
+  }
+
+  if (g_filepath[0] == '\0') {
+    static const char *body[] = {"The file has not been saved yet.",
+                                 "Save it now before assembling."};
+    int choice = gfx_window_confirm2("Assemble", body, 2, "Save Now", "Cancel");
+    if (choice != 0)
+      return;
+    editor_save_as();
+    if (g_filepath[0] == '\0')
+      return; /* User cancelled the Save As dialog */
+  } else if (g_modified) {
+    static const char *body[] = {"The file has unsaved changes.",
+                                 "Save before assembling?"};
+    int choice =
+        gfx_window_confirm2("Assemble", body, 2, "Save & Assemble", "Cancel");
+    if (choice != 0)
+      return;
+    save_file(g_filepath);
+    g_modified = 0;
+  }
+
+  /*
+   * argv layout seen by nasm:
+   *   argv[0]  = nasm executable name  (set by nl_exec / Ndless)
+   *   argv[1]  = asm source file path  (args[0])
+   *   argv[2+] = tokens from g_settings.nasm_args
+   *
+   * nl_exec takes only the *extra* arguments after the program name,
+   * and argsn / args[] map straight to argv[1..] of the child.
+   *
+   * We tokenise nasm_args in a local copy (strtok is destructive).
+   * Maximum supported extra tokens: 16.
+   */
+#define NASM_MAX_ARGS 18 /* 1 (filepath) + up to 16 flag tokens + sentinel */
+  char args_copy[128];
+  strncpy(args_copy, g_settings.nasm_args, sizeof(args_copy) - 1);
+  args_copy[sizeof(args_copy) - 1] = '\0';
+
+  char *args[NASM_MAX_ARGS];
+  int argsn = 0;
+  args[argsn++] = g_filepath; /* always first: the source file */
+
+  char *tok = strtok(args_copy, " \t");
+  while (tok && argsn < NASM_MAX_ARGS - 1) {
+    args[argsn++] = tok;
+    tok = strtok(NULL, " \t");
+  }
+
+  nl_exec(g_settings.nasm_path, argsn, args);
+  /*
+   * nl_exec returns after the child exits (or immediately if it could not
+   * be launched).
+   */
+#undef NASM_MAX_ARGS
 }
 
 /* ── Menu action dispatch ──
@@ -3683,6 +3754,13 @@ static int menu_dispatch(int top, int sub) {
   }
 
   if (top == 4) {
+    if (sub == 0) {
+      editor_assemble();
+      return 1;
+    }
+  }
+
+  if (top == 5) {
     if (sub == 0) {
       editor_open_settings();
       return 1;
@@ -4071,6 +4149,10 @@ int editor_open(const char *path) {
 
     case ACT_CHEATSHEET:
       editor_cheatsheet();
+      break;
+
+    case ACT_ASSEMBLE:
+      editor_assemble();
       break;
 
     default:

@@ -1,6 +1,8 @@
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "gfx.h"
 #include "settings.h"
@@ -60,6 +62,8 @@ void settings_defaults(NStudioSettings *s) {
   s->auto_indent = 1;
   s->syntax_highlight = 1;
   strncpy(s->asm_extension, "asm", 31);
+  s->nasm_path[0] = '\0';
+  strncpy(s->nasm_args, "--ask-name --no-auto-tns", 127);
   settings_theme_dark(s);
 }
 
@@ -111,55 +115,74 @@ void settings_load(void) {
   settings_defaults(&g_settings);
   FILE *f = fopen(SETTINGS_FILE, "r");
   if (f) {
-    char line[128], k[64], v[64];
+    char line[256], k[64], v[192];
     while (fgets(line, sizeof(line), f)) {
-      if (sscanf(line, "%63[^=]=%63s", k, v) == 2) {
-        int vi = atoi(v);
-        if (!strcmp(k, "tab_width"))
-          g_settings.tab_width = vi;
-        else if (!strcmp(k, "auto_indent"))
-          g_settings.auto_indent = vi;
-        else if (!strcmp(k, "syntax_highlight"))
-          g_settings.syntax_highlight = vi;
-        else if (!strcmp(k, "asm_extension"))
-          strncpy(g_settings.asm_extension, v, 31);
-        else if (!strcmp(k, "theme"))
-          g_settings.theme = vi;
-        else if (!strcmp(k, "ui_bg"))
-          g_settings.ui_bg = vi;
-        else if (!strcmp(k, "ui_fg"))
-          g_settings.ui_fg = vi;
-        else if (!strcmp(k, "ui_border_light"))
-          g_settings.ui_border_light = vi;
-        else if (!strcmp(k, "ui_border_dark"))
-          g_settings.ui_border_dark = vi;
-        else if (!strcmp(k, "ui_title_bg"))
-          g_settings.ui_title_bg = vi;
-        else if (!strcmp(k, "ui_title_fg"))
-          g_settings.ui_title_fg = vi;
-        else if (!strcmp(k, "ui_accent"))
-          g_settings.ui_accent = vi;
-        else if (!strcmp(k, "ui_accent_text"))
-          g_settings.ui_accent_text = vi;
-        else if (!strcmp(k, "ui_item_bg"))
-          g_settings.ui_item_bg = vi;
-        else if (!strcmp(k, "syn_mnem"))
-          g_settings.syn.mnem = vi;
-        else if (!strcmp(k, "syn_reg"))
-          g_settings.syn.reg = vi;
-        else if (!strcmp(k, "syn_imm"))
-          g_settings.syn.imm = vi;
-        else if (!strcmp(k, "syn_label"))
-          g_settings.syn.label = vi;
-        else if (!strcmp(k, "syn_comment"))
-          g_settings.syn.comment = vi;
-        else if (!strcmp(k, "syn_directive"))
-          g_settings.syn.directive = vi;
-        else if (!strcmp(k, "syn_string"))
-          g_settings.syn.string = vi;
-        else if (!strcmp(k, "syn_normal"))
-          g_settings.syn.normal = vi;
-      }
+      /* Strip trailing newline/CR */
+      int ll = (int)strlen(line);
+      while (ll > 0 && (line[ll - 1] == '\n' || line[ll - 1] == '\r'))
+        line[--ll] = '\0';
+
+      /* Split on first '=' only, preserving spaces in value */
+      char *eq = strchr(line, '=');
+      if (!eq)
+        continue;
+      int klen = (int)(eq - line);
+      if (klen <= 0 || klen >= 64)
+        continue;
+      strncpy(k, line, klen);
+      k[klen] = '\0';
+      strncpy(v, eq + 1, 191);
+      v[191] = '\0';
+
+      int vi = atoi(v);
+      if (!strcmp(k, "tab_width"))
+        g_settings.tab_width = vi;
+      else if (!strcmp(k, "auto_indent"))
+        g_settings.auto_indent = vi;
+      else if (!strcmp(k, "syntax_highlight"))
+        g_settings.syntax_highlight = vi;
+      else if (!strcmp(k, "asm_extension"))
+        strncpy(g_settings.asm_extension, v, 31);
+      else if (!strcmp(k, "theme"))
+        g_settings.theme = vi;
+      else if (!strcmp(k, "ui_bg"))
+        g_settings.ui_bg = vi;
+      else if (!strcmp(k, "ui_fg"))
+        g_settings.ui_fg = vi;
+      else if (!strcmp(k, "ui_border_light"))
+        g_settings.ui_border_light = vi;
+      else if (!strcmp(k, "ui_border_dark"))
+        g_settings.ui_border_dark = vi;
+      else if (!strcmp(k, "ui_title_bg"))
+        g_settings.ui_title_bg = vi;
+      else if (!strcmp(k, "ui_title_fg"))
+        g_settings.ui_title_fg = vi;
+      else if (!strcmp(k, "ui_accent"))
+        g_settings.ui_accent = vi;
+      else if (!strcmp(k, "ui_accent_text"))
+        g_settings.ui_accent_text = vi;
+      else if (!strcmp(k, "ui_item_bg"))
+        g_settings.ui_item_bg = vi;
+      else if (!strcmp(k, "syn_mnem"))
+        g_settings.syn.mnem = vi;
+      else if (!strcmp(k, "syn_reg"))
+        g_settings.syn.reg = vi;
+      else if (!strcmp(k, "syn_imm"))
+        g_settings.syn.imm = vi;
+      else if (!strcmp(k, "syn_label"))
+        g_settings.syn.label = vi;
+      else if (!strcmp(k, "syn_comment"))
+        g_settings.syn.comment = vi;
+      else if (!strcmp(k, "syn_directive"))
+        g_settings.syn.directive = vi;
+      else if (!strcmp(k, "syn_string"))
+        g_settings.syn.string = vi;
+      else if (!strcmp(k, "syn_normal"))
+        g_settings.syn.normal = vi;
+      else if (!strcmp(k, "nasm_path"))
+        strncpy(g_settings.nasm_path, v, 255);
+      else if (!strcmp(k, "nasm_args"))
+        strncpy(g_settings.nasm_args, v, 127);
     }
     fclose(f);
   }
@@ -202,5 +225,59 @@ void settings_save(void) {
   fprintf(f, "syn_directive=%d\n", g_settings.syn.directive);
   fprintf(f, "syn_string=%d\n", g_settings.syn.string);
   fprintf(f, "syn_normal=%d\n", g_settings.syn.normal);
+  fprintf(f, "nasm_path=%s\n", g_settings.nasm_path);
+  fprintf(f, "nasm_args=%s\n", g_settings.nasm_args);
   fclose(f);
+}
+
+/* ================================================================
+ * Auto-detect nasm executable
+ * Recursively scans /documents for a file named "nasm.tns".
+ * ================================================================ */
+static int find_nasm_recursive(const char *dir, char *out, int outsz) {
+  DIR *d = opendir(dir);
+  if (!d)
+    return 0;
+
+  struct dirent *de;
+  while ((de = readdir(d)) != NULL) {
+    if (de->d_name[0] == '.')
+      continue;
+
+    char full[512];
+    snprintf(full, sizeof(full), "%s/%s", dir, de->d_name);
+
+    struct stat st;
+    if (stat(full, &st) != 0)
+      continue;
+
+    if (S_ISDIR(st.st_mode)) {
+      if (find_nasm_recursive(full, out, outsz)) {
+        closedir(d);
+        return 1;
+      }
+    } else {
+      /* Match "nasm.tns" case-insensitively */
+      const char *name = de->d_name;
+      if ((name[0] == 'n' || name[0] == 'N') &&
+          (name[1] == 'a' || name[1] == 'A') &&
+          (name[2] == 's' || name[2] == 'S') &&
+          (name[3] == 'm' || name[3] == 'M') && name[4] == '.' &&
+          (name[5] == 't' || name[5] == 'T') &&
+          (name[6] == 'n' || name[6] == 'N') &&
+          (name[7] == 's' || name[7] == 'S') && name[8] == '\0') {
+        strncpy(out, full, outsz - 1);
+        out[outsz - 1] = '\0';
+        closedir(d);
+        return 1;
+      }
+    }
+  }
+
+  closedir(d);
+  return 0;
+}
+
+int settings_find_nasm(char *out, int outsz) {
+  return find_nasm_recursive("/documents", out, outsz);
 }
