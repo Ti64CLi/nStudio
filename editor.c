@@ -4869,8 +4869,6 @@ int editor_open(const char *path) {
 
   g_modified = 0;
 
-  load_file(path);
-
   cursor_pos = 0;
   cursor_row = 0;
   cursor_col = 0;
