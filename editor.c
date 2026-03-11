@@ -374,11 +374,50 @@ static uint16_t tok_colour(TokType t) {
   }
 }
 
+static const char *get_syscall_name(long num);
+
 static void render_line_highlighted(const char *line_buf, int px, int py,
                                     uint16_t bg, int col_off, int max_w) {
   int len = (int)strlen(line_buf);
   int i = 0;
   int draw_x = px - col_off * GFX_CHAR_W;
+
+  /* Pre-scan for SWI/SVC to render an inline hint */
+  int is_syscall = 0;
+  long sys_num = -1;
+  int scan_i = 0;
+  while (scan_i < len) {
+    while (scan_i < len &&
+           (line_buf[scan_i] == ' ' || line_buf[scan_i] == '\t'))
+      scan_i++;
+    if (scan_i >= len || line_buf[scan_i] == ';')
+      break;
+
+    int start = scan_i;
+    while (scan_i < len && (isalnum((unsigned char)line_buf[scan_i]) ||
+                            line_buf[scan_i] == '_'))
+      scan_i++;
+    int tok_len = scan_i - start;
+
+    if (tok_len == 3 && (strncaseeq(line_buf + start, "swi", 3) ||
+                         strncaseeq(line_buf + start, "svc", 3))) {
+      while (scan_i < len &&
+             (line_buf[scan_i] == ' ' || line_buf[scan_i] == '\t'))
+        scan_i++;
+      if (scan_i < len && line_buf[scan_i] == '#')
+        scan_i++;
+      if (scan_i < len) {
+        char *end;
+        sys_num = strtol(line_buf + scan_i, &end, 0);
+        if (end != line_buf + scan_i)
+          is_syscall = 1;
+      }
+      break;
+    }
+    while (scan_i < len && line_buf[scan_i] != ' ' &&
+           line_buf[scan_i] != '\t' && line_buf[scan_i] != ';')
+      scan_i++;
+  }
 
 #define DRAWC(ch, fg)                                                          \
   do {                                                                         \
@@ -447,8 +486,6 @@ static void render_line_highlighted(const char *line_buf, int px, int py,
       int wlen = i - start;
 
       TokType t = TOK_OTHER;
-      /* A label is a bare word at column 0 that is not a known
-         mnemonic, register, shift operator, or directive. */
       if (start == 0 && !is_reg(line_buf + start, wlen) &&
           !is_mnem(line_buf + start, wlen) &&
           !is_shift(line_buf + start, wlen) &&
@@ -474,6 +511,26 @@ static void render_line_highlighted(const char *line_buf, int px, int py,
   }
 
 done_line:
+  /* Render the inline syscall hint */
+  if (is_syscall) {
+    const char *sname = get_syscall_name(sys_num);
+    if (sname) {
+      char hint[64];
+      snprintf(hint, sizeof(hint), "  [%s]", sname);
+      int h_i = 0;
+      while (hint[h_i]) {
+        if (draw_x >= px && draw_x + GFX_CHAR_W <= px + max_w) {
+          gfx_drawchar(draw_x, py, hint[h_i], C_CMT, bg);
+        } else if (draw_x >= px + max_w) {
+          break;
+        }
+        draw_x += GFX_CHAR_W;
+        h_i++;
+      }
+    }
+  }
+
+  /* Clear remaining visual line */
   if (draw_x < px + max_w) {
     int fill_x = draw_x < px ? px : draw_x;
     if (fill_x < px + max_w)
@@ -963,9 +1020,8 @@ static void render_editor_core(void) {
       gfx_fillrect(0, text_bottom, GFX_W, status_top - text_bottom, C_BG);
   }
 
-  /* ── Selection highlight pass ──
-     Walk every visible row; for each character inside [sel_lo, sel_hi)
-     overdraw it with the selection background and foreground colours.  */
+  /* Selection highlight pass:
+   Overdraw characters inside [sel_lo, sel_hi) with the selection colours. */
   if (sel_active_flag()) {
     int lo = sel_lo(), hi = sel_hi();
     uint16_t SEL_BG = g_default_theme.accent;
@@ -1082,7 +1138,7 @@ static const KeyMap keymap[KEYMAP_SIZE] = {
     {KEY_NSPIRE_SPACE, ' ', ' ', 0},       {KEY_NSPIRE_EXP, '^', '~', 0},
     {KEY_NSPIRE_BAR, '|', '\\', 0},        {KEY_NSPIRE_QUOTE, '"', '"', 0},
     {KEY_NSPIRE_APOSTROPHE, '\'', '`', 0}, {KEY_NSPIRE_MULTIPLY, '*', '*', 0},
-    {KEY_NSPIRE_EQU, '=', '+', 0},         {KEY_NSPIRE_NEGATIVE, '~', '~', 0},
+    {KEY_NSPIRE_EQU, '=', '+', 0},         {KEY_NSPIRE_NEGATIVE, ';', '~', 0},
     {KEY_NSPIRE_GTHAN, '>', ',', 0},       {KEY_NSPIRE_LTHAN, '<', '{', 0},
     {KEY_NSPIRE_QUES, '?', '?', 0},
 };
@@ -1135,6 +1191,9 @@ static const KeyMap keymap[KEYMAP_SIZE] = {
 #define ACT_GOTO_LINE (-44)
 #define ACT_GOTO_LABEL (-45)
 #define ACT_ASSEMBLE (-46)
+#define ACT_SYSCALL_CATALOG (-47)
+#define ACT_BS_WORD (-48)
+#define ACT_DEL_WORD (-49)
 
 static int last_action = ACT_NONE;
 static int repeat_timer = 0;
@@ -1199,8 +1258,15 @@ static int poll_key(void) {
   if (isKeyPressed(KEY_NSPIRE_MENU) && ctrl)
     return ACT_FILE_BOT;
 
-  if (isKeyPressed(KEY_NSPIRE_DEL))
-    return shift ? ACT_DEL : ACT_BS;
+  if (isKeyPressed(KEY_NSPIRE_DEL)) {
+    if (ctrl && shift)
+      return ACT_DEL_WORD;
+    if (ctrl)
+      return ACT_BS_WORD;
+    if (shift)
+      return ACT_DEL;
+    return ACT_BS;
+  }
 
   if (ctrl && isKeyPressed(KEY_NSPIRE_O))
     return ACT_OPEN;
@@ -1237,8 +1303,11 @@ static int poll_key(void) {
   if (ctrl && isKeyPressed(KEY_NSPIRE_TRIG))
     return ACT_CHEATSHEET;
 
-  if (isKeyPressed(KEY_NSPIRE_CAT))
+  if (isKeyPressed(KEY_NSPIRE_CAT)) {
+    if (shift)
+      return ACT_SYSCALL_CATALOG;
     return ACT_CATALOG;
+  }
 
   for (int i = 0; i < KEYMAP_SIZE; i++) {
     if (!isKeyPressed(keymap[i].key))
@@ -1463,6 +1532,73 @@ static void do_word_right(void) {
   cursor_sync_pos();
 }
 
+static void do_bs_word(void) {
+  if (sel_active_flag()) {
+    undo_push();
+    sel_delete_region();
+    return;
+  }
+  if (cursor_pos == 0)
+    return;
+  undo_push();
+  int old_pos = cursor_pos;
+
+  /* Find the start of the previous word */
+  while (cursor_pos > 0 && IS_HSPACE(gb_get(&g_buf, cursor_pos - 1)))
+    cursor_pos--;
+  if (cursor_pos > 0) {
+    if (IS_WORD(gb_get(&g_buf, cursor_pos - 1))) {
+      while (cursor_pos > 0 && IS_WORD(gb_get(&g_buf, cursor_pos - 1)))
+        cursor_pos--;
+    } else {
+      cursor_pos--;
+    }
+  }
+
+  int count = old_pos - cursor_pos;
+  cursor_pos = old_pos; /* Restore cursor to delete backwards */
+  gb_move(&g_buf, cursor_pos);
+  for (int i = 0; i < count; i++) {
+    gb_backspace(&g_buf);
+    cursor_pos--;
+  }
+  rebuild_lines(&g_buf);
+  cursor_sync_pos();
+  g_modified = 1;
+}
+
+static void do_del_word(void) {
+  if (sel_active_flag()) {
+    undo_push();
+    sel_delete_region();
+    return;
+  }
+  int len = gb_len(&g_buf);
+  if (cursor_pos >= len)
+    return;
+  undo_push();
+  int target_pos = cursor_pos;
+
+  /* Find the end of the next word */
+  if (IS_WORD(gb_get(&g_buf, target_pos))) {
+    while (target_pos < len && IS_WORD(gb_get(&g_buf, target_pos)))
+      target_pos++;
+  } else if (!IS_HSPACE(gb_get(&g_buf, target_pos))) {
+    target_pos++;
+  }
+  while (target_pos < len && IS_HSPACE(gb_get(&g_buf, target_pos)))
+    target_pos++;
+
+  int count = target_pos - cursor_pos;
+  gb_move(&g_buf, cursor_pos);
+  for (int i = 0; i < count; i++) {
+    gb_delete(&g_buf);
+  }
+  rebuild_lines(&g_buf);
+  cursor_sync_pos();
+  g_modified = 1;
+}
+
 static void do_file_top(void) {
   sel_clear();
   cursor_pos = 0;
@@ -1479,9 +1615,9 @@ static void do_file_bot(void) {
   cursor_sync_rowcol();
 }
 
-/* ── Selection-extending movement variants ──
-   Each saves old cursor_pos as anchor (first call), then moves
-   and updates sel_active.                                        */
+/* Selection-extending movement variants.
+   Each saves the old cursor_pos as anchor (first call), then moves and updates
+   sel_active. */
 static void do_sel_left(void) {
   int old = cursor_pos;
   if (cursor_pos > 0) {
@@ -2228,6 +2364,1017 @@ static const char *catalog_pick(void) {
 }
 
 /* ================================================================
+ * Ndless Syscall Catalog
+ * ================================================================ */
+typedef struct {
+  const char *name;
+  int num;
+  const char *args;
+  const char *desc;
+} SyscallInfo;
+
+/* ================================================================
+ * Ndless Syscall Catalog (Complete List)
+ * ================================================================ */
+static const SyscallInfo db_syscalls[] = {
+    /* File I/O & Nucleus RTOS */
+    {"fopen", 0, "const char *path, const char *mode",
+     "Opens a file (Nucleus)."},
+    {"fread", 1, "void *ptr, size_t size, size_t count, NUC_FILE *stream",
+     "Reads data from a file."},
+    {"fwrite", 2, "void *ptr, size_t size, size_t count, NUC_FILE *stream",
+     "Writes data to a file."},
+    {"fclose", 3, "NUC_FILE *stream", "Closes an open file."},
+    {"fgets", 4, "char *str, int n, NUC_FILE *stream",
+     "Reads a string from a file."},
+    {"printf", 10, "const char *format, ...", "Prints formatted output."},
+    {"sprintf", 11, "char *str, const char *format, ...",
+     "Formats and stores characters."},
+    {"fprintf", 12, "FILE *stream, const char *format, ...",
+     "Prints formatted output to a file."},
+    {"TCT_Local_Control_Interrupts", 14, "int mask",
+     "Sets the interrupt mask."},
+    {"mkdir", 15, "const char *path, mode_t mode", "Creates a directory."},
+    {"rmdir", 16, "const char *path", "Removes a directory."},
+    {"chdir", 17, "const char *path", "Changes current working directory."},
+    {"stat", 18, "const char *path, struct nuc_stat *buf", "Gets file status."},
+    {"unlink", 19, "const char *path", "Deletes a file."},
+    {"rename", 20, "const char *oldname, const char *newname",
+     "Renames a file."},
+    {"TCC_Terminate_Task", 21, "NU_TASK *task", "Terminates a Nucleus task."},
+    {"puts", 22, "const char *str", "Writes a string to stdout."},
+    {"NU_Get_First", 23, "struct dstat *statobj, const char *pattern",
+     "Finds first file matching pattern."},
+    {"NU_Get_Next", 24, "struct dstat *statobj",
+     "Finds next file matching pattern."},
+    {"NU_Done", 25, "struct dstat *statobj", "Frees dstat structure elements."},
+    {"show_dialog_box2_", 30,
+     "int p1, const char *t, const char *m, const char **b",
+     "Shows a basic dialog box."},
+    {"_vsprintf", 32, "char *str, const char *format, va_list ap",
+     "Formatted output to string."},
+    {"fseek", 33, "NUC_FILE *stream, long offset, int whence",
+     "Sets file position indicator."},
+    {"NU_Current_Dir", 34, "const char *drive, char *path",
+     "Gets current working directory."},
+    {"read_unaligned_longword", 35, "const void *ptr",
+     "Reads 32-bit unaligned word."},
+    {"read_unaligned_word", 36, "const void *ptr",
+     "Reads 16-bit unaligned word."},
+    {"fgetc", 52, "FILE *stream", "Gets next character from file."},
+    {"NU_Set_Current_Dir", 53, "const char *name",
+     "Sets current working directory."},
+    {"fputc", 54, "int char, FILE *stream", "Writes character to file."},
+    {"freopen", 60, "const char *path, const char *mode, FILE *stream",
+     "Reopens a file stream."},
+    {"errno_addr", 61, "void", "Returns pointer to errno."},
+    {"ungetc", 65, "int char, FILE *stream",
+     "Pushes character back to stream."},
+    {"fflush", 69, "FILE *stream", "Flushes output buffer."},
+    {"remove", 70, "const char *filename", "Deletes a file."},
+    {"stdin", 71, "void", "Standard input stream."},
+    {"stdout", 72, "void", "Standard output stream."},
+    {"stderr", 73, "void", "Standard error stream."},
+    {"ferror", 74, "FILE *stream", "Tests error indicator on stream."},
+    {"TCC_Current_Task_Pointer", 88, "void",
+     "Returns pointer to current Nucleus task."},
+    {"ftell", 89, "NUC_FILE *stream", "Returns current file position."},
+    {"NU_Open", 90, "char *path, uint32_t flags, uint32_t mode",
+     "Opens a Nucleus file descriptor."},
+    {"NU_Close", 91, "PCFD fd", "Closes a Nucleus file descriptor."},
+    {"NU_Truncate", 92, "PCFD fd, long int size",
+     "Truncates a Nucleus file descriptor."},
+    {"_show_msgbox_2b", 93,
+     "int p1, const char *t, const char *m, const char *b1, ...",
+     "Message box with 2 buttons."},
+    {"_show_msgbox_3b", 94,
+     "int p1, const char *t, const char *m, const char *b1, ...",
+     "Message box with 3 buttons."},
+    {"opendir", 95, "const char *path", "Opens a directory stream."},
+    {"readdir", 96, "NUC_DIR *dirp", "Reads directory entry."},
+    {"closedir", 97, "NUC_DIR *dirp", "Closes directory stream."},
+
+    /* Strings, Memory & CTYPE */
+    {"malloc", 5, "size_t size", "Allocates memory."},
+    {"free", 6, "void *ptr", "Frees memory."},
+    {"memset", 7, "void *str, int c, size_t n", "Fills memory."},
+    {"memcpy", 8, "void *dest, const void *src, size_t n", "Copies memory."},
+    {"memcmp", 9, "const void *str1, const void *str2, size_t n",
+     "Compares memory."},
+    {"strcmp", 26, "const char *str1, const char *str2", "Compares strings."},
+    {"strcpy", 27, "char *dest, const char *src", "Copies string."},
+    {"strncat", 28, "char *dest, const char *src, size_t n",
+     "Concatenates string (max n)."},
+    {"strlen", 29, "const char *str", "Gets string length."},
+    {"strrchr", 31, "const char *str, int c", "Finds last occurrence of char."},
+    {"strncpy", 37, "char *dest, const char *src, size_t n",
+     "Copies string (max n)."},
+    {"isalpha", 38, "int c", "Checks if character is alphabetic."},
+    {"isascii", 39, "int c", "Checks if character is ASCII."},
+    {"isdigit", 40, "int c", "Checks if character is a digit."},
+    {"islower", 41, "int c", "Checks if character is lowercase."},
+    {"isprint", 42, "int c", "Checks if character is printable."},
+    {"isspace", 43, "int c", "Checks if character is whitespace."},
+    {"isupper", 44, "int c", "Checks if character is uppercase."},
+    {"isxdigit", 45, "int c", "Checks if character is hex digit."},
+    {"tolower", 46, "int c", "Converts character to lowercase."},
+    {"atoi", 47, "const char *str", "Converts string to integer."},
+    {"atof", 48, "const char *str", "Converts string to double."},
+    {"calloc", 49, "size_t nitems, size_t size",
+     "Allocates zero-initialized memory."},
+    {"realloc", 50, "void *ptr, size_t size", "Reallocates memory."},
+    {"strpbrk", 51, "const char *str1, const char *str2",
+     "Finds first matching character."},
+    {"memmove", 55, "void *dest, const void *src, size_t n",
+     "Moves memory block securely."},
+    {"memrev", 56, "void *str, size_t n", "Reverses a memory block."},
+    {"strchr", 57, "const char *str, int c", "Finds first occurrence of char."},
+    {"strncmp", 58, "const char *str1, const char *str2, size_t n",
+     "Compares strings (max n)."},
+    {"toupper", 62, "int c", "Converts character to uppercase."},
+    {"strtod", 63, "const char *str, char **endptr",
+     "Converts string to double."},
+    {"strtol", 64, "const char *str, char **endptr, int base",
+     "Converts string to long integer."},
+    {"strerror", 66, "int errnum", "Gets string describing error number."},
+    {"strcat", 67, "char *dest, const char *src", "Concatenates strings."},
+    {"strstr", 68, "const char *haystack, const char *needle",
+     "Finds substring."},
+    {"strtok", 200, "char *str, const char *delim", "Tokenizes a string."},
+    {"rand", 206, "void", "Returns a pseudo-random integer."},
+    {"srand", 207, "unsigned int seed", "Seeds the random number generator."},
+    {"strtoul", 208, "const char *str, char **endptr, int base",
+     "Converts string to unsigned long."},
+    {"sscanf", 266, "const char *str, const char *format, ...",
+     "Reads formatted input from string."},
+    {"snprintf", 332, "char *str, size_t size, const char *format, ...",
+     "Safe formatted output to string."},
+    {"_vprintf", 333, "const char *format, va_list ap",
+     "Formatted output to stdout."},
+    {"_vfprintf", 334, "FILE *stream, const char *format, va_list ap",
+     "Formatted output to file."},
+    {"_vsnprintf", 335,
+     "char *str, size_t size, const char *format, va_list ap",
+     "Safe formatted output to string."},
+
+    /* Zlib Compression */
+    {"adler32", 77, "uLong adler, const Bytef *buf, uInt len",
+     "Computes Adler-32 checksum."},
+    {"crc32", 78, "uLong crc, const Bytef *buf, uInt len",
+     "Computes CRC-32 checksum."},
+    {"crc32_combine", 79, "uLong crc1, uLong crc2, z_off_t len2",
+     "Combines two CRC-32 checksums."},
+    {"zlibVersion", 80, "void", "Returns zlib version string."},
+    {"zlibCompileFlags", 81, "void", "Returns zlib compile flags."},
+    {"deflateInit2_", 82, "z_streamp strm, int level, int method, ...",
+     "Initializes compression."},
+    {"deflate", 83, "z_streamp strm, int flush", "Compresses data."},
+    {"deflateEnd", 84, "z_streamp strm", "Ends compression."},
+    {"inflateInit2_", 85, "z_streamp strm, int windowBits, ...",
+     "Initializes decompression."},
+    {"inflate", 86, "z_streamp strm, int flush", "Decompresses data."},
+    {"inflateEnd", 87, "z_streamp strm", "Ends decompression."},
+
+    /* Hardware, Touchpad & Events */
+    {"touchpad_read", 75, "unsigned char p1, unsigned char p2, void *p3",
+     "Reads touchpad state."},
+    {"touchpad_write", 76, "unsigned char p1, unsigned char p2, void *p3",
+     "Writes touchpad state."},
+    {"keypad_type", 59, "void", "Returns the hardware keypad type."},
+    {"get_event", 261, "struct s_ns_event *event", "Gets next system event."},
+    {"send_key_event", 262,
+     "struct s_ns_event *event, unsigned short key, BOOL, BOOL",
+     "Sends a key event to OS."},
+    {"send_click_event", 263,
+     "struct s_ns_event *event, unsigned short, BOOL, BOOL",
+     "Sends a click event to OS."},
+    {"send_pad_event", 264,
+     "struct s_ns_event *event, unsigned short, BOOL, BOOL",
+     "Sends a touchpad event to OS."},
+    {"getcwd", 265, "char *buf, size_t size",
+     "Gets current working directory."},
+    {"read_nand", 336,
+     "void *dest, int size, int offset, int u, int max, void *cb",
+     "Reads raw NAND memory."},
+    {"write_nand", 337, "void *src, int size, unsigned int offset",
+     "Writes raw NAND memory."},
+    {"nand_erase_range", 338, "int start, int end",
+     "Erases a block of NAND memory."},
+
+    /* Lua C API */
+    {"luaL_register", 98,
+     "lua_State *L, const char *libname, const luaL_Reg *l",
+     "Registers C functions to Lua."},
+    {"luaL_checklstring", 99, "lua_State *L, int arg, size_t *l",
+     "Checks for string argument."},
+    {"luaL_error", 100, "lua_State *L, const char *fmt, ...",
+     "Raises Lua error."},
+    {"luaI_openlib", 101,
+     "lua_State *L, const char *libname, const luaL_Reg *l, int nup",
+     "Opens a Lua library."},
+    {"luaL_getmetafield", 102, "lua_State *L, int obj, const char *e",
+     "Pushes metafield onto stack."},
+    {"luaL_callmeta", 103, "lua_State *L, int obj, const char *e",
+     "Calls a metamethod."},
+    {"luaL_typerror", 104, "lua_State *L, int arg, const char *tname",
+     "Generates a type error."},
+    {"luaL_argerror", 105, "lua_State *L, int arg, const char *extramsg",
+     "Generates an arg error."},
+    {"luaL_optlstring", 106,
+     "lua_State *L, int arg, const char *def, size_t *l",
+     "Gets optional string arg."},
+    {"luaL_checknumber", 107, "lua_State *L, int arg",
+     "Checks for number arg."},
+    {"luaL_optnumber", 108, "lua_State *L, int arg, lua_Number def",
+     "Gets optional number arg."},
+    {"luaL_checkinteger", 109, "lua_State *L, int arg",
+     "Checks for integer arg."},
+    {"luaL_optinteger", 110, "lua_State *L, int arg, lua_Integer def",
+     "Gets optional integer arg."},
+    {"luaL_checkstack", 111, "lua_State *L, int sz, const char *msg",
+     "Grows stack size safely."},
+    {"luaL_checktype", 112, "lua_State *L, int arg, int t",
+     "Checks type of argument."},
+    {"luaL_checkany", 113, "lua_State *L, int arg",
+     "Checks if argument exists."},
+    {"luaL_newmetatable", 114, "lua_State *L, const char *tname",
+     "Creates a metatable."},
+    {"luaL_checkudata", 115, "lua_State *L, int arg, const char *tname",
+     "Checks userdata type."},
+    {"luaL_where", 116, "lua_State *L, int lvl",
+     "Pushes code location string."},
+    {"luaL_checkoption", 117,
+     "lua_State *L, int arg, const char *def, const char *const lst[]",
+     "Checks string against list."},
+    {"luaL_ref", 118, "lua_State *L, int t", "Creates a reference in table."},
+    {"luaL_unref", 119, "lua_State *L, int t, int ref",
+     "Releases a reference."},
+    {"luaL_loadfile", 120, "lua_State *L, const char *filename",
+     "Loads a Lua file as chunk."},
+    {"luaL_loadbuffer", 121,
+     "lua_State *L, const char *buff, size_t sz, const char *name",
+     "Loads buffer as chunk."},
+    {"luaL_loadstring", 122, "lua_State *L, const char *s",
+     "Loads string as chunk."},
+    {"luaL_newstate", 123, "void", "Creates new Lua state."},
+    {"luaL_gsub", 124,
+     "lua_State *L, const char *s, const char *p, const char *r",
+     "String substitution."},
+    {"luaL_findtable", 125,
+     "lua_State *L, int idx, const char *fname, int szhint",
+     "Finds/creates table."},
+    {"luaL_buffinit", 126, "lua_State *L, luaL_Buffer *B",
+     "Initializes string buffer."},
+    {"luaL_prepbuffer", 127, "luaL_Buffer *B", "Returns buffer memory ptr."},
+    {"luaL_addlstring", 128, "luaL_Buffer *B, const char *s, size_t l",
+     "Adds string to buffer."},
+    {"luaL_addstring", 129, "luaL_Buffer *B, const char *s",
+     "Adds C string to buffer."},
+    {"luaL_addvalue", 130, "luaL_Buffer *B", "Adds stack top to buffer."},
+    {"luaL_pushresult", 131, "luaL_Buffer *B", "Pushes buffer onto stack."},
+    {"lua_newstate", 132, "lua_Alloc f, void *ud",
+     "Creates state with custom allocator."},
+    {"lua_close", 133, "lua_State *L", "Destroys all Lua objects."},
+    {"lua_newthread", 134, "lua_State *L", "Creates a new thread/coroutine."},
+    {"lua_atpanic", 135, "lua_State *L, lua_CFunction panicf",
+     "Sets panic function."},
+    {"lua_gettop", 136, "lua_State *L", "Gets top index of stack."},
+    {"lua_settop", 137, "lua_State *L, int idx", "Sets top index of stack."},
+    {"lua_pushvalue", 138, "lua_State *L, int idx", "Copies value to top."},
+    {"lua_remove", 139, "lua_State *L, int idx", "Removes element at index."},
+    {"lua_insert", 140, "lua_State *L, int idx", "Moves top element to index."},
+    {"lua_replace", 141, "lua_State *L, int idx", "Replaces element at index."},
+    {"lua_checkstack", 142, "lua_State *L, int extra", "Ensures stack size."},
+    {"lua_xmove", 143, "lua_State *from, lua_State *to, int n",
+     "Moves values between threads."},
+    {"lua_isnumber", 144, "lua_State *L, int idx",
+     "Checks if value is number."},
+    {"lua_isstring", 145, "lua_State *L, int idx",
+     "Checks if value is string."},
+    {"lua_iscfunction", 146, "lua_State *L, int idx",
+     "Checks if value is C function."},
+    {"lua_isuserdata", 147, "lua_State *L, int idx",
+     "Checks if value is userdata."},
+    {"lua_type", 148, "lua_State *L, int idx", "Returns type of value."},
+    {"lua_typename", 149, "lua_State *L, int tp", "Returns type name."},
+    {"lua_equal", 150, "lua_State *L, int idx1, int idx2",
+     "Checks if values are equal."},
+    {"lua_rawequal", 151, "lua_State *L, int idx1, int idx2",
+     "Checks if values are raw equal."},
+    {"lua_lessthan", 152, "lua_State *L, int idx1, int idx2",
+     "Checks if value 1 < value 2."},
+    {"lua_tonumber", 153, "lua_State *L, int idx", "Converts value to number."},
+    {"lua_tointeger", 154, "lua_State *L, int idx",
+     "Converts value to integer."},
+    {"lua_toboolean", 155, "lua_State *L, int idx",
+     "Converts value to boolean."},
+    {"lua_tolstring", 156, "lua_State *L, int idx, size_t *len",
+     "Converts value to string."},
+    {"lua_objlen", 157, "lua_State *L, int idx", "Returns length of object."},
+    {"lua_tocfunction", 158, "lua_State *L, int idx",
+     "Converts value to C function."},
+    {"lua_touserdata", 159, "lua_State *L, int idx",
+     "Converts value to userdata."},
+    {"lua_tothread", 160, "lua_State *L, int idx", "Converts value to thread."},
+    {"lua_topointer", 161, "lua_State *L, int idx",
+     "Converts value to void pointer."},
+    {"lua_pushnil", 162, "lua_State *L", "Pushes nil."},
+    {"lua_pushnumber", 163, "lua_State *L, lua_Number n", "Pushes number."},
+    {"lua_pushinteger", 164, "lua_State *L, lua_Integer n", "Pushes integer."},
+    {"lua_pushlstring", 165, "lua_State *L, const char *s, size_t len",
+     "Pushes string by length."},
+    {"lua_pushstring", 166, "lua_State *L, const char *s", "Pushes C string."},
+    {"lua_pushfstring", 168, "lua_State *L, const char *fmt, ...",
+     "Pushes formatted string."},
+    {"lua_pushcclosure", 169, "lua_State *L, lua_CFunction fn, int n",
+     "Pushes C closure."},
+    {"lua_pushboolean", 170, "lua_State *L, int b", "Pushes boolean."},
+    {"lua_gettable", 171, "lua_State *L, int idx", "Pushes t[k]."},
+    {"lua_getfield", 172, "lua_State *L, int idx, const char *k",
+     "Pushes t[k] string key."},
+    {"lua_rawget", 173, "lua_State *L, int idx", "Pushes t[k] raw."},
+    {"lua_rawgeti", 174, "lua_State *L, int idx, int n",
+     "Pushes t[n] raw integer."},
+    {"lua_createtable", 175, "lua_State *L, int narr, int nrec",
+     "Creates preallocated table."},
+    {"lua_newuserdata", 176, "lua_State *L, size_t size",
+     "Allocates userdata."},
+    {"lua_getmetatable", 177, "lua_State *L, int idx",
+     "Pushes metatable of value."},
+    {"lua_getfenv", 178, "lua_State *L, int idx", "Pushes environment table."},
+    {"lua_settable", 179, "lua_State *L, int idx", "Sets t[k] = v."},
+    {"lua_setfield", 180, "lua_State *L, int idx, const char *k",
+     "Sets t[k] = v string key."},
+    {"lua_rawset", 181, "lua_State *L, int idx", "Sets t[k] = v raw."},
+    {"lua_rawseti", 182, "lua_State *L, int idx, int n",
+     "Sets t[n] = v raw integer."},
+    {"lua_setmetatable", 183, "lua_State *L, int idx",
+     "Sets metatable of value."},
+    {"lua_setfenv", 184, "lua_State *L, int idx", "Sets environment table."},
+    {"lua_call", 185, "lua_State *L, int nargs, int nresults",
+     "Calls a function."},
+    {"lua_pcall", 186, "lua_State *L, int nargs, int nresults, int errfunc",
+     "Calls function safely."},
+    {"lua_cpcall", 187, "lua_State *L, lua_CFunction func, void *ud",
+     "Calls C function safely."},
+    {"lua_load", 188,
+     "lua_State *L, lua_Reader reader, void *dt, const char *cn",
+     "Loads Lua chunk."},
+    {"lua_dump", 189, "lua_State *L, lua_Writer writer, void *data",
+     "Dumps chunk as bytecode."},
+    {"lua_yield", 190, "lua_State *L, int nresults", "Yields coroutine."},
+    {"lua_resume", 191, "lua_State *L, int narg", "Resumes coroutine."},
+    {"lua_status", 192, "lua_State *L", "Returns thread status."},
+    {"lua_gc", 193, "lua_State *L, int what, int data",
+     "Controls garbage collector."},
+    {"lua_error", 194, "lua_State *L", "Generates a Lua error."},
+    {"lua_next", 195, "lua_State *L, int idx",
+     "Pops key, pushes next key-value."},
+    {"lua_concat", 196, "lua_State *L, int n",
+     "Concatenates n values on stack."},
+    {"lua_getstack", 197, "lua_State *L, int level, lua_Debug *ar",
+     "Gets info about call stack."},
+
+    /* UTF-16 String Extension API */
+    {"ascii2utf16", 13, "void *buf, const char *str, int max_size",
+     "Converts ASCII to UTF16."},
+    {"utf162ascii", 201, "char *buf, const uint16_t *str, int max_size",
+     "Converts UTF16 to ASCII."},
+    {"utf16_strlen", 202, "const uint16_t *str",
+     "Returns the length of a UTF16 string."},
+    {"string_new", 209, "void", "Returns a new empty String structure."},
+    {"string_free", 210, "String str", "Frees the String structure."},
+    {"string_to_ascii", 211, "String str",
+     "Returns String converted to ASCII."},
+    {"string_lower", 212, "String str", "Lowers all characters in String."},
+    {"string_charAt", 213, "String str, int pos",
+     "Returns the character at pos."},
+    {"string_concat_utf16", 214, "String str, const char *utf16",
+     "Concatenates a utf16 string."},
+    {"string_set_ascii", 215, "String str, const char *ascii",
+     "Erases content with an ASCII string."},
+    {"string_set_utf16", 216, "String str, const char *utf16",
+     "Erases content with a utf16 string."},
+    {"string_indexOf_utf16", 217, "String str, int start, const char *pattern",
+     "Returns the index of a pattern."},
+    {"string_last_indexOf_utf16", 218,
+     "String str, int start, const char *pattern",
+     "Returns last index of pattern."},
+    {"string_compareTo_utf16", 219, "String str, const char *pattern",
+     "Compares String to utf16 string."},
+    {"string_substring", 220, "String dst, String src, int start, int end",
+     "Extracts a substring."},
+    {"string_erase", 221, "String str, int n", "Erases first n characters."},
+    {"string_truncate", 222, "String str, int n",
+     "Truncates String to n characters."},
+    {"string_substring_utf16", 223, "String str, const char *pat, int *ptr",
+     "Returns string up to pattern."},
+    {"string_insert_replace_utf16", 224,
+     "String str, const char *pat, int start, int end",
+     "Replaces a substring."},
+    {"string_insert_utf16", 225, "String str, const char *pat, int pos",
+     "Inserts utf16 at pos."},
+    {"string_sprintf_utf16", 226, "String str, const char *fmt, ...",
+     "Formatted print to UTF16 String."},
+
+    /* Graphic Context (GC) API */
+    {"gui_gc_global_GC_ptr", 298, "void", "Pointer to OS allocated Gc."},
+    {"gui_gc_free", 299, "Gc gc", "Frees the given Graphic Context."},
+    {"gui_gc_copy", 300, "Gc gc, int w, int h",
+     "Allocates a new Gc copying parameters (not buffer)."},
+    {"gui_gc_begin", 301, "Gc gc", "Initializes graphic port before drawing."},
+    {"gui_gc_finish", 302, "Gc gc", "Cleans up graphic port parameters."},
+    {"gui_gc_clipRect", 303, "Gc gc, int x, int y, int w, int h, int op",
+     "Constrains drawing to region."},
+    {"gui_gc_setColorRGB", 304, "Gc gc, int r, int g, int b",
+     "Changes the pen color (RGB)."},
+    {"gui_gc_setColor", 305, "Gc gc, int color",
+     "Changes pen color (0xRRGGBB)."},
+    {"gui_gc_setAlpha", 306, "Gc gc, int alpha", "Sets pen alpha mode."},
+    {"gui_gc_setFont", 307, "Gc gc, gui_gc_Font font",
+     "Changes the active font."},
+    {"gui_gc_getFont", 308, "Gc gc", "Returns the current font."},
+    {"gui_gc_setPen", 309, "Gc gc, gui_gc_PenSize size, gui_gc_PenMode mode",
+     "Changes the pen size and mode."},
+    {"gui_gc_setRegion", 310,
+     "Gc gc, int xs, int ys, int ws, int hs, int x, int y, int w, int h",
+     "Sets region viewport."},
+    {"gui_gc_drawArc", 311,
+     "Gc gc, int x, int y, int w, int h, int start, int end", "Draws an arc."},
+    {"gui_gc_drawIcon", 312, "Gc gc, int res, int icon, int x, int y",
+     "Draws OS predefined icon."},
+    {"gui_gc_drawSprite", 313, "Gc gc, gui_gc_Sprite *spr, int x, int y",
+     "Draws a sprite array."},
+    {"gui_gc_drawLine", 314, "Gc gc, int x1, int y1, int x2, int y2",
+     "Draws a line."},
+    {"gui_gc_drawRect", 315, "Gc gc, int x, int y, int w, int h",
+     "Draws an empty rectangle."},
+    {"gui_gc_drawString", 316,
+     "Gc gc, char *utf16, int x, int y, gui_gc_StringMode flags",
+     "Draws a UTF16 string."},
+    {"gui_gc_drawPoly", 317, "Gc gc, unsigned int *points, unsigned int count",
+     "Draws a polygon shape."},
+    {"gui_gc_fillArc", 318,
+     "Gc gc, int x, int y, int w, int h, int start, int end", "Fills an arc."},
+    {"gui_gc_fillPoly", 319, "Gc gc, unsigned int *points, unsigned int count",
+     "Fills a polygon shape."},
+    {"gui_gc_fillRect", 320, "Gc gc, int x, int y, int w, int h",
+     "Fills a rectangle."},
+    {"gui_gc_fillGradient", 321,
+     "Gc gc, int x, int y1, int w, int y2, int c1, int c2, int vert",
+     "Fills a gradient."},
+    {"gui_gc_drawImage", 322, "Gc gc, char *TI_Image, int x, int y",
+     "Draws an image in TI.Image format."},
+    {"gui_gc_getStringWidth", 323,
+     "Gc gc, gui_gc_Font font, char *utf16, int start, int len",
+     "Gets string pixel width."},
+    {"gui_gc_getCharWidth", 324, "Gc gc, gui_gc_Font font, short utf16_char",
+     "Gets width of character."},
+    {"gui_gc_getStringSmallHeight", 325,
+     "Gc gc, gui_gc_Font font, char *utf16, int start, int len",
+     "Gets small height of string."},
+    {"gui_gc_getCharHeight", 326, "Gc gc, gui_gc_Font font, short utf16_char",
+     "Gets the height of a character."},
+    {"gui_gc_getStringHeight", 327,
+     "Gc gc, gui_gc_Font font, char *utf16, int start, int len",
+     "Gets full height of string."},
+    {"gui_gc_getFontHeight", 328, "Gc gc, gui_gc_Font font",
+     "Gets max height of font."},
+    {"gui_gc_getIconSize", 329, "Gc gc, int res, int icon, int *w, int *h",
+     "Gets dimensions of OS icon."},
+    {"gui_gc_blit_gc", 330,
+     "Gc src, int xs, int ys, int ws, int hs, Gc dst, int xd, int yd, int wd, "
+     "int hd",
+     "Blits and stretches from one Gc to another."},
+    {"gui_gc_blit_buffer", 331,
+     "Gc gc, char *buffer, int xb, int yb, int wb, int hb",
+     "Blits from a raw buffer to a Gc."},
+
+    /* Miscellaneous OS Services & Menus */
+    {"refresh_homescr", 198, "void", "Refreshes the TI-Nspire homescreen."},
+    {"refresh_docbrowser", 199, "int p1", "Refreshes the Document Browser."},
+    {"_show_1NumericInput", 203,
+     "int p1, const char *title, const char *sub, const char *lbl, int *val, "
+     "...",
+     "Shows a 1-numeric input dialog."},
+    {"_show_2NumericInput", 204,
+     "int p1, const char *title, const char *sub, const char *lbl1, int *val1, "
+     "...",
+     "Shows a 2-numeric input dialog."},
+    {"_show_msgUserInput", 205,
+     "int p1, String *str, const char *title, const char *sub",
+     "Shows a text input dialog."},
+    {"calc_cmd", 339,
+     "void *p1, void *p2, const uint16_t *expr, void *p4, void *p5",
+     "Evaluates a math expression."},
+    {"get_res_string", 340, "int res, int strid",
+     "Gets OS translated resource string."},
+    {"disp_str", 341, "const char *str, int *x, int y",
+     "Displays a basic string to LCD."},
+    {"TI_MS_MathExprToStr", 342, "void *p1, void *p2, uint16_t **str",
+     "Converts math expression object to string."},
+    {"get_documents_dir", 297, "void", "Returns path to /documents."},
+
+    /* USB Host Driver API (usbd_) */
+    {"usbd_open_pipe", 227,
+     "usbd_interface_handle ih, uint8_t a, uint8_t e, usbd_pipe_handle *p",
+     "Opens USB pipe."},
+    {"usbd_close_pipe", 228, "usbd_pipe_handle p", "Closes USB pipe."},
+    {"usbd_transfer", 229, "usbd_xfer_handle xfer", "Initiates USB transfer."},
+    {"usbd_alloc_xfer", 230, "usbd_device_handle dev",
+     "Allocates USB transfer struct."},
+    {"usbd_free_xfer", 231, "usbd_xfer_handle xfer",
+     "Frees USB transfer struct."},
+    {"usbd_setup_xfer", 232,
+     "usbd_xfer_handle xfer, usbd_pipe_handle p, usbd_private_handle priv, ...",
+     "Setups standard transfer."},
+    {"usbd_setup_isoc_xfer", 233,
+     "usbd_xfer_handle xfer, usbd_pipe_handle p, usbd_private_handle priv, ...",
+     "Setups isochronous transfer."},
+    {"usbd_get_xfer_status", 234,
+     "usbd_xfer_handle xfer, usbd_private_handle *p, void **b, uint32_t *len, "
+     "usbd_status *s",
+     "Gets transfer status."},
+    {"usbd_interface2endpoint_descriptor", 235,
+     "usbd_interface_handle ih, uint8_t e", "Gets endpoint desc."},
+    {"usbd_abort_pipe", 236, "usbd_pipe_handle p",
+     "Aborts pending transfers on pipe."},
+    {"usbd_clear_endpoint_stall", 237, "usbd_pipe_handle p",
+     "Clears stall condition on endpoint."},
+    {"usbd_endpoint_count", 238, "usbd_interface_handle ih, uint8_t *c",
+     "Gets number of endpoints."},
+    {"usbd_interface_count", 239, "usbd_device_handle dev, uint8_t *c",
+     "Gets number of interfaces."},
+    {"usbd_interface2device_handle", 240,
+     "usbd_interface_handle ih, usbd_device_handle *dev",
+     "Gets device from interface."},
+    {"usbd_device2interface_handle", 241,
+     "usbd_device_handle dev, uint8_t iface, usbd_interface_handle *ih",
+     "Gets interface from device."},
+    {"usbd_pipe2device_handle", 242, "usbd_pipe_handle p",
+     "Gets device from pipe."},
+    {"usbd_sync_transfer", 243, "usbd_xfer_handle xfer",
+     "Executes synchronous transfer."},
+    {"usbd_open_pipe_intr", 244,
+     "usbd_interface_handle ih, uint8_t a, uint8_t e, usbd_pipe_handle *p, ...",
+     "Opens interrupt pipe."},
+    {"usbd_do_request", 245,
+     "usbd_device_handle dev, usb_device_request_t *req, void *data",
+     "Executes control request."},
+    {"usbd_do_request_flags", 246,
+     "usbd_device_handle dev, usb_device_request_t *req, void *data, uint16_t "
+     "f, int *act",
+     "Executes control request with flags."},
+    {"usbd_do_request_flags_pipe", 247,
+     "usbd_device_handle dev, usbd_pipe_handle p, usb_device_request_t *req, "
+     "...",
+     "Executes request on specific pipe."},
+    {"usbd_get_interface_descriptor", 248, "usbd_interface_handle ih",
+     "Gets interface descriptor."},
+    {"usbd_get_config_descriptor", 249, "usbd_device_handle dev",
+     "Gets config descriptor."},
+    {"usbd_get_device_descriptor", 250, "usbd_device_handle dev",
+     "Gets device descriptor."},
+    {"usbd_set_interface", 251, "usbd_interface_handle ih, int alt",
+     "Sets interface alternate setting."},
+    {"usbd_get_interface", 252, "usbd_interface_handle ih, uint8_t *alt",
+     "Gets interface alternate setting."},
+    {"usbd_find_idesc", 253, "usb_config_descriptor_t *cd, int i, int a",
+     "Finds interface descriptor inside config."},
+    {"usbd_errstr", 254, "usbd_status err", "Returns USB error string."},
+    {"usbd_devinfo", 255, "usbd_device_handle dev, int b, char *str",
+     "Gets device info string."},
+    {"usbd_get_quirks", 256, "usbd_device_handle dev",
+     "Gets USB device quirks."},
+    {"usbd_get_endpoint_descriptor", 257, "usbd_interface_handle ih, uint8_t e",
+     "Gets endpoint descriptor by index."},
+    {"usb_register_driver", 258,
+     "int p1, int(*p2[])(device_t), const char* p3, int p4, unsigned int p5",
+     "Registers USB class driver."},
+    {"device_get_softc", 259, "device_t dev", "Gets softc of device."},
+    {"device_get_ivars", 260, "device_t dev", "Gets ivars of device."},
+
+    /* NavNet Protocol API */
+    {"TI_NN_SendKeyPress", 267, "void", "Sends key press via NavNet."},
+    {"TI_NN_IsNodeResponsive", 268, "void", "Checks if remote node responds."},
+    {"TI_NN_NodeEnumDone", 269, "nn_oh_t oh", "Terminates node enumeration."},
+    {"TI_NN_NodeEnumNext", 270, "nn_oh_t oh, nn_nh_t *nh",
+     "Gets next node in enumeration."},
+    {"TI_NN_GetConnMaxPktSize", 271, "nn_ch_t ch",
+     "Gets max packet size for connection."},
+    {"TI_NN_Read", 272,
+     "nn_ch_t ch, uint32_t timeout_ms, void *buf, uint32_t buf_size, uint32_t "
+     "*recv_size",
+     "Reads packet from NavNet."},
+    {"TI_NN_Write", 273, "nn_ch_t ch, void *buf, uint32_t data_size",
+     "Writes packet to NavNet."},
+    {"TI_NN_StartService", 274,
+     "uint32_t id, void *data, void(*cb)(nn_ch_t,void*)",
+     "Exposes a NavNet service."},
+    {"TI_NN_StopService", 275, "uint32_t service_id",
+     "Stops exposing a service."},
+    {"TI_NN_Connect", 276, "nn_nh_t nh, uint32_t service_id, nn_ch_t *ch",
+     "Connects to a remote NavNet service."},
+    {"TI_NN_Disconnect", 277, "nn_ch_t ch", "Disconnects from remote service."},
+    {"TI_NN_NodeEnumInit", 278, "nn_oh_t oh",
+     "Initiates NavNet node enumeration."},
+    {"TI_NN_UnregisterNotifyCallback", 279, "void",
+     "Unregisters NavNet event callback."},
+    {"TI_NN_RegisterNotifyCallback", 280, "uint32_t flags, void (*cb)(void)",
+     "Registers for NavNet events."},
+    {"TI_NN_InstallOS", 281, "void", "Initiates remote OS install."},
+    {"TI_NN_GetNodeInfo", 282, "void", "Gets information about remote node."},
+    {"TI_NN_DestroyOperationHandle", 283, "nn_oh_t oh",
+     "Destroys NavNet operation handle."},
+    {"TI_NN_CreateOperationHandle", 284, "void",
+     "Creates NavNet operation handle."},
+    {"TI_NN_GetNodeScreen", 285, "void", "Captures remote node screen."},
+    {"TI_NN_CopyFile", 286, "void", "Copies remote file."},
+    {"TI_NN_Rename", 287, "void", "Renames remote file/folder."},
+    {"TI_NN_RmDir", 288, "void", "Removes remote directory."},
+    {"TI_NN_MkDir", 289, "void", "Creates remote directory."},
+    {"TI_NN_DeleteFile", 290, "void", "Deletes remote file."},
+    {"TI_NN_GetFileAttributes", 291, "void", "Gets remote file attributes."},
+    {"TI_NN_PutFile", 292,
+     "nn_nh_t nh, nn_oh_t oh, const char *local, const char *remote",
+     "Transfers file via NavNet."},
+    {"TI_NN_DirEnumDone", 293, "void",
+     "Terminates remote directory enumeration."},
+    {"TI_NN_DirEnumNext", 294, "void", "Gets next remote directory entry."},
+    {"TI_NN_DirEnumInit", 295, "void",
+     "Initiates remote directory enumeration."},
+    {"TI_NN_GetFile", 296, "void", "Receives file via NavNet."},
+
+    /* Ndless OS Extensions (Requires 0x200000 bitmask) */
+    {"nl_osvalue", 0x200000, "const int values[], unsigned size",
+     "Returns OS-dependent array value."},
+    {"nl_relocdatab", 0x200001, "void",
+     "Returns base address of .data relocations."},
+    {"nl_hwtype", 0x200002, "void",
+     "Returns the hardware type ID (0=Clickpad, 1=Touchpad, etc)."},
+    {"nl_isstartup", 0x200003, "void",
+     "Returns TRUE if program is running at OS startup."},
+    {"nl_lua_getstate", 0x200004, "void",
+     "Returns global Lua state of current document."},
+    {"nl_set_resident", 0x200005, "void",
+     "Marks program to not free memory on exit."},
+    {"nl_ndless_rev", 0x200006, "void",
+     "Returns the current Ndless revision number."},
+    {"nl_no_scr_redraw", 0x200007, "void",
+     "Prevents screen restore on program exit."},
+    {"nl_loaded_by_3rd_party_loader", 0x200008, "void",
+     "Returns TRUE if loaded by 3rd party loader."},
+    {"nl_hwsubtype", 0x200009, "void",
+     "Returns hardware sub-type (CX/CX-II vs Older)."},
+    {"nl_exec", 0x20000A, "const char *prgm_path, int argsn, char *args[]",
+     "Executes another .tns program."},
+    {"nl_osid", 0x20000B, "void", "Returns exact OS version identifier."},
+    {"_nl_hassyscall", 0x20000C, "int syscall_num",
+     "Checks if a specific syscall is available."},
+    {"nl_lcd_blit", 0x20000D, "void",
+     "Blits Ndless internal FB to hardware LCD."},
+    {"nl_lcd_type", 0x20000E, "void", "Returns the physical LCD panel type."},
+    {"nl_lcd_init", 0x20000F, "void",
+     "Re-initializes hardware LCD parameters."},
+
+    /* Emulator Integration (Requires 0x400000 bitmask) */
+    {"NDLSEMU_DEBUG_ALLOC", 0x400000, "void *ptr, size_t size",
+     "Notifies emulator of memory allocation."},
+    {"NDLSEMU_DEBUG_FREE", 0x400001, "void *ptr",
+     "Notifies emulator of memory free."}};
+#define NSYSCALLS ((int)(sizeof(db_syscalls) / sizeof(db_syscalls[0])))
+
+static const char *get_syscall_name(long num) {
+  for (int i = 0; i < NSYSCALLS; i++) {
+    if (db_syscalls[i].num == num)
+      return db_syscalls[i].name;
+  }
+  return NULL;
+}
+
+static void draw_scrolled_text(int x_min, int x_max, int y, const char *str,
+                               int *col_idx, int hscroll, uint16_t fg,
+                               uint16_t bg) {
+  for (int i = 0; str[i]; i++, (*col_idx)++) {
+    int px = x_min + (*col_idx - hscroll) * GFX_CHAR_W;
+    if (px >= x_min && px + GFX_CHAR_W <= x_max) {
+      gfx_drawchar(px, y, str[i], fg, bg);
+    }
+  }
+}
+
+static void syscall_show_desc(const SyscallInfo *si) {
+  const int WIN_W = GFX_W - 16;
+  const int WIN_H = 120;
+  const int WIN_X = 8;
+  const int WIN_Y = (GFX_H - WIN_H) / 2;
+  const int TITLE_H = 12;
+  const int BTN_H = 12;
+  const int PAD = 5;
+
+  int hscroll = 0;
+
+  char title[128];
+  snprintf(title, sizeof(title), "Syscall %d: %s", si->num, si->name);
+
+  while (any_key_pressed())
+    msleep(20);
+
+  int redraw = 1;
+  for (;;) {
+    if (redraw) {
+      gfx_fillrect(WIN_X + 3, WIN_Y + 3, WIN_W, WIN_H,
+                   g_default_theme.border_dark);
+      gfx_borderrect(WIN_X, WIN_Y, WIN_W, WIN_H, g_default_theme.bg,
+                     g_default_theme.border_light);
+      gfx_fillrect(WIN_X + 1, WIN_Y + 1, WIN_W - 2, TITLE_H,
+                   g_default_theme.title_bg);
+
+      int c = 0;
+      draw_scrolled_text(WIN_X + PAD, WIN_X + WIN_W - PAD,
+                         WIN_Y + 1 + (TITLE_H - GFX_FONT_H) / 2, title, &c,
+                         hscroll, g_default_theme.title_fg,
+                         g_default_theme.title_bg);
+
+      gfx_fillrect(WIN_X + 1, WIN_Y + 1 + TITLE_H, WIN_W - 2,
+                   WIN_H - TITLE_H - BTN_H - 1, g_default_theme.bg);
+
+      int ty = WIN_Y + 1 + TITLE_H + PAD;
+
+      c = 0;
+      draw_scrolled_text(WIN_X + PAD, WIN_X + WIN_W - PAD, ty, "Arguments:", &c,
+                         0, g_default_theme.accent, g_default_theme.bg);
+      ty += GFX_FONT_H + 2;
+      c = 0;
+      draw_scrolled_text(WIN_X + PAD + 10, WIN_X + WIN_W - PAD, ty,
+                         si->args[0] ? si->args : "(none)", &c, hscroll,
+                         g_default_theme.fg, g_default_theme.bg);
+      ty += GFX_FONT_H + 10;
+
+      c = 0;
+      draw_scrolled_text(WIN_X + PAD, WIN_X + WIN_W - PAD, ty,
+                         "Description:", &c, 0, g_default_theme.accent,
+                         g_default_theme.bg);
+      ty += GFX_FONT_H + 2;
+      c = 0;
+      draw_scrolled_text(WIN_X + PAD + 10, WIN_X + WIN_W - PAD, ty, si->desc,
+                         &c, hscroll, g_default_theme.fg, g_default_theme.bg);
+
+      int hy = WIN_Y + WIN_H - BTN_H - 1;
+      gfx_hline(WIN_X + 1, hy, WIN_W - 2, g_default_theme.border_light);
+      gfx_fillrect(WIN_X + 1, hy + 1, WIN_W - 2, BTN_H - 1, g_default_theme.bg);
+
+      c = 0;
+      draw_scrolled_text(WIN_X + PAD, WIN_X + WIN_W - PAD, hy + 2,
+                         "Left/Right: pan   Esc/Enter: close", &c, 0,
+                         g_default_theme.fg, g_default_theme.bg);
+
+      gfx_flip();
+      redraw = 0;
+    }
+
+    NavAction nav = gfx_poll_nav();
+    if (nav == NAV_NONE) {
+      msleep(16);
+      idle();
+      continue;
+    }
+
+    int ctrl = isKeyPressed(KEY_NSPIRE_CTRL);
+    int visible_cols = (WIN_W - 2 * PAD) / GFX_CHAR_W;
+
+    if (nav == NAV_ESC || nav == NAV_ENTER || nav == NAV_CAT) {
+      while (any_key_pressed())
+        msleep(20);
+      break;
+    } else if (nav == NAV_LEFT) {
+      if (hscroll > 0) {
+        hscroll -= ctrl ? visible_cols : 8;
+        if (hscroll < 0)
+          hscroll = 0;
+        redraw = 1;
+      }
+    } else if (nav == NAV_RIGHT) {
+      hscroll += ctrl ? visible_cols : 8;
+      redraw = 1;
+    }
+  }
+}
+
+static void syscall_draw(int sel, int scroll, int hscroll, int max_hscroll,
+                         int total_cols, int visible_cols) {
+  uint16_t WIN_BG = g_default_theme.bg;
+  uint16_t WIN_FG = g_default_theme.fg;
+  uint16_t TITLE_BG = g_default_theme.title_bg;
+  uint16_t TITLE_FG = g_default_theme.title_fg;
+  uint16_t SEL_BG = g_default_theme.accent;
+  uint16_t SEL_FG = g_default_theme.accent_text;
+  uint16_t BORDER = g_default_theme.border_light;
+  uint16_t SHADOW = g_default_theme.border_dark;
+  uint16_t ARGS_FG = g_default_theme.accent;
+
+  gfx_fillrect(CAT_WIN_X + 3, CAT_WIN_Y + 3, CAT_WIN_W, CAT_WIN_H, SHADOW);
+  gfx_borderrect(CAT_WIN_X, CAT_WIN_Y, CAT_WIN_W, CAT_WIN_H, WIN_BG, BORDER);
+  gfx_fillrect(CAT_WIN_X + 1, CAT_WIN_Y + 1, CAT_WIN_W - 2, CAT_TITLE_H,
+               TITLE_BG);
+
+  int c = 0;
+  draw_scrolled_text(CAT_WIN_X + 4, CAT_WIN_X + CAT_WIN_W - 4,
+                     CAT_WIN_Y + 1 + (CAT_TITLE_H - GFX_FONT_H) / 2,
+                     "Ndless Syscalls Catalog", &c, 0, TITLE_FG, TITLE_BG);
+
+  /* Draw list background */
+  gfx_fillrect(CAT_WIN_X + 1, CAT_LIST_Y, CAT_WIN_W - 2, CAT_LIST_H, WIN_BG);
+
+  for (int vi = 0; vi < CAT_ROWS_VIS; vi++) {
+    int ri = scroll + vi;
+    int row_y = CAT_LIST_Y + vi * CAT_ROW_H;
+
+    if (ri >= NSYSCALLS)
+      continue;
+
+    int is_sel = (ri == sel);
+    const SyscallInfo *si = &db_syscalls[ri];
+
+    uint16_t bg = is_sel ? SEL_BG : WIN_BG;
+    uint16_t fg = is_sel ? SEL_FG : WIN_FG;
+    uint16_t afg = is_sel ? SEL_FG : ARGS_FG;
+
+    gfx_fillrect(CAT_WIN_X + 1, row_y, CAT_WIN_W - 2, CAT_ROW_H, bg);
+
+    int c_col = 0;
+    char numbuf[16];
+    snprintf(numbuf, sizeof(numbuf), "%-8d", si->num);
+    draw_scrolled_text(CAT_WIN_X + 1 + CAT_INDENT, CAT_WIN_X + CAT_WIN_W - 6,
+                       row_y + 1, numbuf, &c_col, hscroll, fg, bg);
+
+    char namebuf[48];
+    snprintf(namebuf, sizeof(namebuf), "%-36.36s ", si->name);
+    draw_scrolled_text(CAT_WIN_X + 1 + CAT_INDENT, CAT_WIN_X + CAT_WIN_W - 6,
+                       row_y + 1, namebuf, &c_col, hscroll, fg, bg);
+
+    if (si->args[0]) {
+      draw_scrolled_text(CAT_WIN_X + 1 + CAT_INDENT, CAT_WIN_X + CAT_WIN_W - 6,
+                         row_y + 1, si->args, &c_col, hscroll, afg, bg);
+    }
+  }
+
+  if (NSYSCALLS > CAT_ROWS_VIS) {
+    int bar_total = CAT_LIST_H;
+    int bar_h = bar_total * CAT_ROWS_VIS / NSYSCALLS;
+    if (bar_h < 4)
+      bar_h = 4;
+    int ms = NSYSCALLS - CAT_ROWS_VIS;
+    int bar_y = CAT_LIST_Y + (bar_total - bar_h) * scroll / (ms > 0 ? ms : 1);
+    gfx_fillrect(CAT_WIN_X + CAT_WIN_W - 4, CAT_LIST_Y, 3, bar_total,
+                 g_default_theme.item_bg);
+    gfx_fillrect(CAT_WIN_X + CAT_WIN_W - 4, bar_y, 3, bar_h, BORDER);
+  }
+
+  if (max_hscroll > 0) {
+    int bar_total_w = CAT_WIN_W - 6; /* Leave space for vertical scrollbar */
+    int bar_w = bar_total_w * visible_cols / total_cols;
+    if (bar_w < 8)
+      bar_w = 8;
+    int bar_x = CAT_WIN_X + 1 + (bar_total_w - bar_w) * hscroll / max_hscroll;
+    int bar_y = CAT_LIST_Y + CAT_LIST_H -
+                4; /* Position at the very bottom of the list */
+
+    gfx_fillrect(CAT_WIN_X + 1, bar_y, bar_total_w, 4, g_default_theme.item_bg);
+    gfx_fillrect(bar_x, bar_y, bar_w, 4, BORDER);
+  }
+
+  int hy = CAT_WIN_Y + CAT_WIN_H - CAT_HINT_H - 1;
+  gfx_hline(CAT_WIN_X + 1, hy, CAT_WIN_W - 2, BORDER);
+  gfx_fillrect(CAT_WIN_X + 1, hy + 1, CAT_WIN_W - 2, CAT_HINT_H - 1, WIN_BG);
+
+  c = 0;
+  draw_scrolled_text(CAT_WIN_X + 4, CAT_WIN_X + CAT_WIN_W - 4, hy + 2,
+                     "Enter:ins  Shift:desc  < >:pan  Esc:close", &c, 0, WIN_FG,
+                     WIN_BG);
+
+  gfx_flip();
+}
+
+static const SyscallInfo *syscall_pick(void) {
+  int sel = 0, scroll = 0, hscroll = 0;
+
+  int max_arg_len = 0;
+  for (int i = 0; i < NSYSCALLS; i++) {
+    int len = (int)strlen(db_syscalls[i].args);
+    if (len > max_arg_len)
+      max_arg_len = len;
+  }
+
+  int total_cols = 8 + 37 + max_arg_len;
+  int visible_cols = (CAT_WIN_W - 6 - CAT_INDENT - 1) / GFX_CHAR_W;
+
+  int max_hscroll = total_cols - visible_cols;
+  if (max_hscroll < 0)
+    max_hscroll = 0;
+
+  while (any_key_pressed())
+    msleep(20);
+  syscall_draw(sel, scroll, hscroll, max_hscroll, total_cols, visible_cols);
+
+  for (;;) {
+    NavAction nav = gfx_poll_nav();
+    if (nav == NAV_NONE) {
+      msleep(16);
+      idle();
+      continue;
+    }
+
+    int shift = isKeyPressed(KEY_NSPIRE_SHIFT);
+    int ctrl = isKeyPressed(KEY_NSPIRE_CTRL);
+
+    if (nav == NAV_ESC || (nav == NAV_CAT && shift)) {
+      while (any_key_pressed())
+        msleep(20);
+      return NULL;
+    } else if (nav == NAV_UP) {
+      if (ctrl) {
+        /* Page up */
+        sel -= CAT_ROWS_VIS;
+        if (sel < 0)
+          sel = 0;
+        scroll -= CAT_ROWS_VIS;
+        if (scroll < 0)
+          scroll = 0;
+        if (sel < scroll)
+          scroll = sel; /* ensure selection remains visible */
+      } else {
+        if (sel > 0) {
+          sel--;
+          if (sel < scroll)
+            scroll = sel;
+        }
+      }
+    } else if (nav == NAV_DOWN) {
+      if (ctrl) {
+        /* Page down */
+        sel += CAT_ROWS_VIS;
+        if (sel > NSYSCALLS - 1)
+          sel = NSYSCALLS - 1;
+        scroll += CAT_ROWS_VIS;
+        if (scroll > NSYSCALLS - CAT_ROWS_VIS)
+          scroll = NSYSCALLS - CAT_ROWS_VIS;
+        if (scroll < 0)
+          scroll = 0;
+        if (sel >= scroll + CAT_ROWS_VIS)
+          scroll = sel - CAT_ROWS_VIS + 1;
+      } else {
+        if (sel < NSYSCALLS - 1) {
+          sel++;
+          if (sel >= scroll + CAT_ROWS_VIS)
+            scroll = sel - CAT_ROWS_VIS + 1;
+        }
+      }
+    } else if (nav == NAV_LEFT) {
+      if (hscroll > 0) {
+        hscroll -= ctrl ? visible_cols : 8;
+        if (hscroll < 0)
+          hscroll = 0;
+      }
+    } else if (nav == NAV_RIGHT) {
+      if (hscroll < max_hscroll) {
+        hscroll += ctrl ? visible_cols : 8;
+        if (hscroll > max_hscroll)
+          hscroll = max_hscroll;
+      }
+    } else if (nav == NAV_ENTER) {
+      if (shift) {
+        syscall_show_desc(&db_syscalls[sel]);
+        syscall_draw(sel, scroll, hscroll, max_hscroll, total_cols,
+                     visible_cols);
+        continue;
+      } else {
+        while (any_key_pressed())
+          msleep(20);
+        return &db_syscalls[sel];
+      }
+    }
+    syscall_draw(sel, scroll, hscroll, max_hscroll, total_cols, visible_cols);
+  }
+}
+
+static void editor_syscall_catalog(void) {
+  const SyscallInfo *sc = syscall_pick();
+  if (sc) {
+    char buf[32];
+    /* Format Ndless extensions natively as hex for readability */
+    if (sc->num >= 0x200000) {
+      snprintf(buf, sizeof(buf), "swi #0x%X", sc->num);
+    } else {
+      snprintf(buf, sizeof(buf), "swi #%d", sc->num);
+    }
+    for (int i = 0; buf[i]; i++) {
+      do_insert_char(buf[i]);
+    }
+  }
+}
+
+/* ================================================================
  * Cheat sheet
  *
  * Reads the word under the cursor, looks it up in the MnemInfo
@@ -2340,6 +3487,62 @@ static void editor_cheatsheet(void) {
   const char *line = line_scratch;
   int len = (int)strlen(line);
 
+  /* Check for SWI/SVC instructions on the current line */
+  int is_syscall = 0;
+  long sys_num = -1;
+  int scan_i = 0;
+
+  while (scan_i < len) {
+    while (scan_i < len && (line[scan_i] == ' ' || line[scan_i] == '\t'))
+      scan_i++;
+    if (scan_i >= len || line[scan_i] == ';')
+      break;
+
+    int start = scan_i;
+    while (scan_i < len &&
+           (isalnum((unsigned char)line[scan_i]) || line[scan_i] == '_'))
+      scan_i++;
+    int tok_len = scan_i - start;
+
+    if (tok_len == 3 && (strncaseeq(line + start, "swi", 3) ||
+                         strncaseeq(line + start, "svc", 3))) {
+      while (scan_i < len && (line[scan_i] == ' ' || line[scan_i] == '\t'))
+        scan_i++;
+
+      /* Skip optional '#' prefix */
+      if (scan_i < len && line[scan_i] == '#')
+        scan_i++;
+
+      if (scan_i < len) {
+        char *end;
+        sys_num = strtol(line + scan_i, &end, 0); /* Handles dec and hex */
+        if (end != line + scan_i)
+          is_syscall = 1;
+      }
+      break;
+    }
+    while (scan_i < len && line[scan_i] != ' ' && line[scan_i] != '\t' &&
+           line[scan_i] != ';')
+      scan_i++;
+  }
+
+  /* Show syscall description if found */
+  if (is_syscall) {
+    for (int s = 0; s < NSYSCALLS; s++) {
+      if (db_syscalls[s].num == sys_num) {
+        syscall_show_desc(&db_syscalls[s]);
+        return;
+      }
+    }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Syscall %ld (0x%lX) not in catalog.", sys_num,
+             sys_num);
+    const char *body[] = {msg};
+    gfx_window_alert("Unknown Syscall", body, 1, "OK");
+    return;
+  }
+
+  /* Standard ARM instruction lookup based on cursor position */
   int col = cursor_col;
   if (col > len)
     col = len;
@@ -2369,6 +3572,7 @@ static void editor_cheatsheet(void) {
     return;
   }
 
+  /* Render the ARM mnemonic details popup */
   const int WIN_W = GFX_W - 16;
   const int WIN_X = 8;
   const int WIN_Y = 8;
@@ -3235,14 +4439,15 @@ static const char *menu_edit_items[] = {
     "Replace (Ctrl+H)"};
 static const char *menu_nav_items[] = {
     "Go to Line (Ctrl+G)", "Go to Label (Ctrl+L)", "File Top", "File Bottom"};
-static const char *menu_view_items[] = {"ARM Catalog", "Label Browser",
-                                        "Instruction Help (Ctrl+Trig)"};
+static const char *menu_view_items[] = {
+    "ARM Catalog", "Ndless Syscalls (Shift+Cat)", "Label Browser",
+    "Instruction Help (Ctrl+Trig)"};
 static const char *menu_settings_items[] = {"Preferences"};
 static const char *menu_assemble_items[] = {"Assemble (Ctrl+B)"};
 
 static const MenuDef g_menus[] = {
     {"File", menu_file_items, 5},         {"Edit", menu_edit_items, 10},
-    {"Navigate", menu_nav_items, 4},      {"View", menu_view_items, 3},
+    {"Navigate", menu_nav_items, 4},      {"View", menu_view_items, 4},
     {"Assemble", menu_assemble_items, 1}, {"Settings", menu_settings_items, 1},
 };
 #define NMENU ((int)(sizeof(g_menus) / sizeof(g_menus[0])))
@@ -3412,9 +4617,8 @@ static void editor_assemble(void) {
 #undef NASM_MAX_ARGS
 }
 
-/* ── Menu action dispatch ──
-   Returns 1 = action done (close menu + redraw),
-           2 = close editor requested.              */
+/* Menu action dispatch.
+   Returns 1 if handled (close menu + redraw), 2 if close editor requested. */
 static int menu_dispatch(int top, int sub) {
   if (top == 0) {
     if (sub == 0) {
@@ -3498,7 +4702,15 @@ static int menu_dispatch(int top, int sub) {
       return 1;
     }
     if (sub == 1) {
+      editor_syscall_catalog();
+      return 1;
+    }
+    if (sub == 2) {
       editor_label_browser();
+      return 1;
+    }
+    if (sub == 3) {
+      editor_cheatsheet();
       return 1;
     }
   }
@@ -3703,19 +4915,6 @@ int editor_open(const char *path) {
       continue;
     }
 
-    if (isKeyPressed(KEY_NSPIRE_CAT) && !isKeyPressed(KEY_NSPIRE_CTRL)) {
-      while (any_key_pressed())
-        msleep(20);
-      const char *m = catalog_pick();
-      if (m) {
-        for (const char *p = m; *p; p++)
-          do_insert_char(*p);
-      }
-      scroll_to_cursor();
-      render_all();
-      continue;
-    }
-
     int act = key_repeat_poll();
 
     if (act == ACT_NONE) {
@@ -3780,6 +4979,12 @@ int editor_open(const char *path) {
       break;
     case ACT_DEL:
       do_delete();
+      break;
+    case ACT_BS_WORD:
+      do_bs_word();
+      break;
+    case ACT_DEL_WORD:
+      do_del_word();
       break;
     case ACT_TAB:
       do_tab();
@@ -3892,6 +5097,10 @@ int editor_open(const char *path) {
       }
       break;
     }
+
+    case ACT_SYSCALL_CATALOG:
+      editor_syscall_catalog();
+      break;
 
     case ACT_JUMP_LABEL:
       editor_jump_to_label();
