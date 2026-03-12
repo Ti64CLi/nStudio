@@ -229,11 +229,26 @@ int gfx_drawchar(int x, int y, char ch, uint16_t fg, uint16_t bg) {
     idx = 63;
   const uint8_t *glyph = font5x8[idx - 32];
 
+  /* Quick out-of-clip check for the whole cell */
+  if (x + GFX_CHAR_W <= clip_x0 || x >= clip_x1 || y + GFX_FONT_H <= clip_y0 ||
+      y >= clip_y1)
+    return GFX_CHAR_W;
+
   for (int row = 0; row < GFX_FONT_H; row++) {
+    int py = y + row;
+    if (py < clip_y0 || py >= clip_y1)
+      continue;
     uint8_t bits = glyph[row];
-    for (int col = 0; col < GFX_FONT_W; col++)
-      gfx_setpixel(x + col, y + row, (bits & (0x10 >> col)) ? fg : bg);
-    gfx_setpixel(x + GFX_FONT_W, y + row, bg);
+    uint16_t *rowptr = fb + py * GFX_W;
+    for (int col = 0; col < GFX_FONT_W; col++) {
+      int px = x + col;
+      if (px >= clip_x0 && px < clip_x1)
+        rowptr[px] = (bits & (0x10 >> col)) ? fg : bg;
+    }
+    /* Trailing gap pixel */
+    int px = x + GFX_FONT_W;
+    if (px >= clip_x0 && px < clip_x1)
+      rowptr[px] = bg;
   }
   return GFX_CHAR_W;
 }
