@@ -20,11 +20,8 @@
 static void action_new_file(void) { editor_open(""); }
 
 static void action_open_file(void) {
-  /* filebrowser_select() owns the screen; on cancel it calls gfx_deinit().
-     Re-initialise before returning to the main menu. */
   const char *path = filebrowser_select();
   if (!path) {
-    gfx_init();
     return;
   }
   editor_open(path);

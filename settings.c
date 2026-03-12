@@ -536,7 +536,6 @@ void settings_ui_open(void) {
         gfx_window_alert("Auto-detect", body, 2, "OK");
 
         const char *picked = filebrowser_select();
-        gfx_init(); /* filebrowser may call gfx_deinit internally */
         if (picked && picked[0]) {
           strncpy(g_settings.nasm_path, picked, 255);
           g_settings.nasm_path[255] = '\0';
