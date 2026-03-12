@@ -1779,17 +1779,19 @@ static const char charmap_chars[] = "()[]{}<>"
 
 static char charmap_pick(void) {
   static char chars[128];
-  int nchars = 0;
-  for (int i = 0; charmap_chars[i] && nchars < 127; i++) {
-    char c = charmap_chars[i];
-    int dup = 0;
-    for (int j = 0; j < nchars; j++)
-      if (chars[j] == c) {
-        dup = 1;
-        break;
-      }
-    if (!dup)
-      chars[nchars++] = c;
+  static int nchars = 0;
+  if (nchars == 0) { /* build once */
+    for (int i = 0; charmap_chars[i] && nchars < 127; i++) {
+      char c = charmap_chars[i];
+      int dup = 0;
+      for (int j = 0; j < nchars; j++)
+        if (chars[j] == c) {
+          dup = 1;
+          break;
+        }
+      if (!dup)
+        chars[nchars++] = c;
+    }
   }
 
   int nrows = (nchars + CM_COLS - 1) / CM_COLS;
