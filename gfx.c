@@ -65,9 +65,17 @@ void gfx_fillrect(int x, int y, int w, int h, uint16_t col) {
   int cy0 = y < clip_y0 ? clip_y0 : y;
   int cx1 = x + w > clip_x1 ? clip_x1 : x + w;
   int cy1 = y + h > clip_y1 ? clip_y1 : y + h;
-  for (int r = cy0; r < cy1; r++)
-    for (int c = cx0; c < cx1; c++)
-      fb[r * GFX_W + c] = col;
+
+  int run = cx1 - cx0;
+  if (run <= 0)
+    return;
+
+  for (int r = cy0; r < cy1; r++) {
+    uint16_t *row = fb + r * GFX_W + cx0;
+
+    for (int c = 0; c < run; c++)
+      row[c] = col;
+  }
 }
 
 void gfx_hline(int x, int y, int len, uint16_t col) {
@@ -75,8 +83,15 @@ void gfx_hline(int x, int y, int len, uint16_t col) {
     return;
   int cx0 = x < clip_x0 ? clip_x0 : x;
   int cx1 = x + len > clip_x1 ? clip_x1 : x + len;
-  for (int c = cx0; c < cx1; c++)
-    fb[y * GFX_W + c] = col;
+
+  int run = cx1 - cx0;
+  if (run <= 0)
+    return;
+
+  uint16_t *row = fb + y * GFX_W + cx0;
+
+  for (int c = 0; c < run; c++)
+    row[c] = col;
 }
 
 void gfx_vline(int x, int y, int len, uint16_t col) {
@@ -84,8 +99,17 @@ void gfx_vline(int x, int y, int len, uint16_t col) {
     return;
   int cy0 = y < clip_y0 ? clip_y0 : y;
   int cy1 = y + len > clip_y1 ? clip_y1 : y + len;
-  for (int r = cy0; r < cy1; r++)
-    fb[r * GFX_W + x] = col;
+
+  int run = cy1 - cy0;
+  if (run <= 0)
+    return;
+
+  uint16_t *column = fb + cy0 * GFX_W + x;
+
+  for (int r = 0; r < run; r++) {
+    *column = col;
+    column += GFX_W;
+  }
 }
 
 void gfx_borderrect(int x, int y, int w, int h, uint16_t fill,
