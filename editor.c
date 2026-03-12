@@ -4199,8 +4199,10 @@ static void labels_scan(void) {
 /* Return the line (0-based) of the label with the given name,
    case-insensitive.  Returns -1 if not found. */
 static int label_find(const char *name) {
+  int nlen = (int)strlen(name);
   for (int i = 0; i < g_nlabels; i++) {
-    if (strncaseeq(g_labels[i].name, name, MAX_LABEL_LEN))
+    int llen = (int)strlen(g_labels[i].name);
+    if (llen == nlen && strncaseeq(g_labels[i].name, name, nlen))
       return g_labels[i].line;
   }
   return -1;
@@ -4475,7 +4477,7 @@ static const char *menu_file_items[] = {
     "Save (Ctrl+S)", "Save As (Ctrl+Shift+S)", "Open (Ctrl+O)", "---", "Close"};
 static const char *menu_edit_items[] = {
     "Undo (Ctrl+Z)",       "Redo (Ctrl+Y)", "---",
-    "Cut (Ctrl+X)",        "Copy (Ctrl+C)", "Paste (Ctrl+P)",
+    "Cut (Ctrl+X)",        "Copy (Ctrl+C)", "Paste (Ctrl+V)",
     "Select All (Ctrl+A)", "---",           "Search (Ctrl+F)",
     "Replace (Ctrl+H)"};
 static const char *menu_nav_items[] = {
