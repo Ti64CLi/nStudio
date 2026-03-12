@@ -260,13 +260,7 @@ static int find_nasm_recursive(const char *dir, char *out, int outsz) {
     } else {
       /* Match "nasm.tns" case-insensitively */
       const char *name = de->d_name;
-      if ((name[0] == 'n' || name[0] == 'N') &&
-          (name[1] == 'a' || name[1] == 'A') &&
-          (name[2] == 's' || name[2] == 'S') &&
-          (name[3] == 'm' || name[3] == 'M') && name[4] == '.' &&
-          (name[5] == 't' || name[5] == 'T') &&
-          (name[6] == 'n' || name[6] == 'N') &&
-          (name[7] == 's' || name[7] == 'S') && name[8] == '\0') {
+      if (strcasecmp(name, "nasm.tns") == 0) {
         strncpy(out, full, outsz - 1);
         out[outsz - 1] = '\0';
         closedir(d);
