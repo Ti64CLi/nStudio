@@ -574,9 +574,13 @@ static int save_file(const char *path) {
   FILE *f = fopen(path, "wb");
   if (!f)
     return 0;
-  int len = gb_len(&g_buf);
-  for (int i = 0; i < len; i++)
-    fputc(gb_get(&g_buf, i), f);
+  /* Write the two contiguous halves of the gap buffer directly.
+     No per-character translation needed — they are already in memory. */
+  if (g_buf.gap_lo > 0)
+    fwrite(g_buf.buf, 1, g_buf.gap_lo, f);
+  int after_len = g_buf.size - g_buf.gap_hi;
+  if (after_len > 0)
+    fwrite(g_buf.buf + g_buf.gap_hi, 1, after_len, f);
   fclose(f);
   return 1;
 }
@@ -591,8 +595,22 @@ static void extract_line(int row) {
   int ll = line_len(&g_buf, row);
   if (ll > (int)sizeof(line_scratch) - 1)
     ll = (int)sizeof(line_scratch) - 1;
-  for (int i = 0; i < ll; i++)
-    line_scratch[i] = gb_get(&g_buf, start + i);
+
+  /* Copy directly from the gap buffer's two contiguous halves. */
+  int out = 0;
+  if (start < g_buf.gap_lo) {
+    int take = g_buf.gap_lo - start;
+    if (take > ll)
+      take = ll;
+    memcpy(line_scratch, g_buf.buf + start, take);
+    out += take;
+  }
+  if (out < ll) {
+    int phys_start = (start < g_buf.gap_lo)
+                         ? g_buf.gap_hi
+                         : g_buf.gap_hi + (start - g_buf.gap_lo);
+    memcpy(line_scratch + out, g_buf.buf + phys_start, ll - out);
+  }
   line_scratch[ll] = '\0';
 }
 
@@ -731,8 +749,10 @@ static void undo_push(void) {
   s->buf = (char *)malloc(len + 1);
   if (!s->buf)
     return;
-  for (int i = 0; i < len; i++)
-    s->buf[i] = gb_get(&g_buf, i);
+  /* Copy both halves directly, no per-character branch needed. */
+  memcpy(s->buf, g_buf.buf, g_buf.gap_lo);
+  int after = g_buf.size - g_buf.gap_hi;
+  memcpy(s->buf + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, after);
   s->buf[len] = '\0';
   s->len = len;
   s->cursor = cursor_pos;
@@ -770,8 +790,10 @@ static void do_undo(void) {
   snap_free(r);
   r->buf = (char *)malloc(len + 1);
   if (r->buf) {
-    for (int i = 0; i < len; i++)
-      r->buf[i] = gb_get(&g_buf, i);
+    /* Copy both halves directly, no per-character branch needed. */
+    memcpy(r->buf, g_buf.buf, g_buf.gap_lo);
+    int after = g_buf.size - g_buf.gap_hi;
+    memcpy(r->buf + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, after);
     r->buf[len] = '\0';
     r->len = len;
     r->cursor = cursor_pos;
@@ -789,16 +811,33 @@ static void do_undo(void) {
 static void do_redo(void) {
   if (g_redo_count == 0)
     return;
+
+  /* Manually save the current state to the Undo ring
+        (We cannot use undo_push() because it wipes the redo ring) */
+  int len = gb_len(&g_buf);
+  UndoSnap *u = &g_undo_ring[g_undo_head % UNDO_MAX];
+  snap_free(u);
+  u->buf = (char *)malloc(len + 1);
+  if (u->buf) {
+    for (int i = 0; i < len; i++)
+      u->buf[i] = gb_get(&g_buf, i);
+    u->buf[len] = '\0';
+    u->len = len;
+    u->cursor = cursor_pos;
+    u->s_anchor = sel_anchor;
+    u->s_active = sel_active;
+    g_undo_head = (g_undo_head + 1) % UNDO_MAX;
+    if (g_undo_count < UNDO_MAX)
+      g_undo_count++;
+  }
+
+  /* Pop the target entry from the Redo ring */
   g_redo_head = (g_redo_head - 1 + UNDO_MAX) % UNDO_MAX;
   g_redo_count--;
-  undo_push();
-  g_undo_count--; /* undo_push incremented it; balance */
+
+  /* Restore the targeted future state into the editor */
   snap_restore(&g_redo_ring[g_redo_head]);
 }
-
-/* Convenience: take snapshot then perform a mutating action.
-   All mutating do_* call undo_push() internally via these macros. */
-#define EDIT_BEGIN() undo_push()
 
 /* ================================================================
  * Search / Search-and-Replace
