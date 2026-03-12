@@ -3779,9 +3779,9 @@ static int fb_load_dir(const char *path, int pick_dir, int filter_asm) {
       const char *suffix = de->d_name + nlen - (elen + 5);
       if (suffix[0] != '.')
         continue;
-      if (strncmp(suffix + 1, g_settings.asm_extension, elen) != 0)
+      if (strncasecmp(suffix + 1, g_settings.asm_extension, elen) != 0)
         continue;
-      if (strcmp(suffix + 1 + elen, ".tns") != 0)
+      if (strcasecmp(suffix + 1 + elen, ".tns") != 0)
         continue;
     }
 
