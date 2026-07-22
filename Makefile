@@ -1,12 +1,10 @@
 DEBUG = FALSE
 
 GCC = nspire-gcc
-AS  = nspire-as
-GXX = nspire-g++
 LD  = nspire-ld
 GENZEHN = genzehn
 
-GCCFLAGS = -Wall -W -marm
+GCCFLAGS = -Wall -W -marm -MMD -MP
 LDFLAGS =
 ZEHNFLAGS = --name "nstudio" --uses-lcd-blit true --240x320-support true
 
@@ -16,27 +14,17 @@ else
 	GCCFLAGS += -O0 -g
 endif
 
-OBJS = $(patsubst %.c, %.o, $(shell find . -name \*.c))
-OBJS += $(patsubst %.cpp, %.o, $(shell find . -name \*.cpp))
-OBJS += $(patsubst %.S, %.o, $(shell find . -name \*.S))
+SRCS = nstudio.c gfx.c editor.c settings.c gapbuf.c syntax.c asmdb.c browser.c optab.c util.c
+OBJS = $(SRCS:.c=.o)
+DEPS = $(OBJS:.o=.d)
 EXE = nstudio
-DISTDIR = .
-vpath %.tns $(DISTDIR)
-vpath %.elf $(DISTDIR)
 
 all: $(EXE).tns
 
 %.o: %.c
 	$(GCC) $(GCCFLAGS) -c $< -o $@
 
-%.o: %.cpp
-	$(GXX) $(GCCFLAGS) -c $< -o $@
-	
-%.o: %.S
-	$(AS) -c $< -o $@
-
 $(EXE).elf: $(OBJS)
-	mkdir -p $(DISTDIR)
 	$(LD) $^ -o $@ $(LDFLAGS)
 
 $(EXE).tns: $(EXE).elf
@@ -44,5 +32,9 @@ $(EXE).tns: $(EXE).elf
 	make-prg $@.zehn $@
 	rm $@.zehn
 
+-include $(DEPS)
+
 clean:
-	rm -f $(OBJS) $(DISTDIR)/$(EXE).tns $(DISTDIR)/$(EXE).elf $(DISTDIR)/$(EXE).zehn
+	rm -f $(OBJS) $(DEPS) $(EXE).tns $(EXE).elf $(EXE).tns.zehn
+
+.PHONY: all clean
