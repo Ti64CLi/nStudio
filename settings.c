@@ -112,8 +112,76 @@ void settings_theme_light(NStudioSettings *s) {
   s->syn.normal = 0;
 }
 
+/* Config lines whose keys nStudio does not manage (e.g. nasm's
+   nasm_last_dir) are preserved verbatim and written back on save, so
+   the two apps sharing this file do not erase each other's keys. */
+static char g_extra_config[1024];
+static int g_extra_len;
+
+static int is_known_key(const char *k) {
+  static const char *keys[] = {
+      "tab_width",   "auto_indent",     "syntax_highlight",
+      "asm_extension", "theme",         "ui_bg",
+      "ui_fg",       "ui_border_light", "ui_border_dark",
+      "ui_title_bg", "ui_title_fg",     "ui_accent",
+      "ui_accent_text", "ui_item_bg",   "syn_mnem",
+      "syn_reg",     "syn_imm",         "syn_label",
+      "syn_comment", "syn_directive",   "syn_string",
+      "syn_normal",  "nasm_path",       "nasm_args", NULL};
+  for (int i = 0; keys[i]; i++)
+    if (!strcmp(k, keys[i]))
+      return 1;
+  return 0;
+}
+
+static int clampi(int v, int lo, int hi) {
+  if (v < lo)
+    return lo;
+  if (v > hi)
+    return hi;
+  return v;
+}
+
+/* Clamp every palette index to a valid entry and other numeric fields
+   to their supported range, so a hand-edited or corrupt config cannot
+   drive out-of-bounds reads in the colour picker. */
+static void settings_validate(NStudioSettings *s) {
+  int maxc = g_palette_size - 1;
+  s->tab_width = clampi(s->tab_width, 1, 8);
+  s->auto_indent = s->auto_indent ? 1 : 0;
+  s->syntax_highlight = s->syntax_highlight ? 1 : 0;
+  s->theme = clampi(s->theme, 0, 2);
+  s->ui_bg = clampi(s->ui_bg, 0, maxc);
+  s->ui_fg = clampi(s->ui_fg, 0, maxc);
+  s->ui_border_light = clampi(s->ui_border_light, 0, maxc);
+  s->ui_border_dark = clampi(s->ui_border_dark, 0, maxc);
+  s->ui_title_bg = clampi(s->ui_title_bg, 0, maxc);
+  s->ui_title_fg = clampi(s->ui_title_fg, 0, maxc);
+  s->ui_accent = clampi(s->ui_accent, 0, maxc);
+  s->ui_accent_text = clampi(s->ui_accent_text, 0, maxc);
+  s->ui_item_bg = clampi(s->ui_item_bg, 0, maxc);
+  s->syn.mnem = clampi(s->syn.mnem, 0, maxc);
+  s->syn.reg = clampi(s->syn.reg, 0, maxc);
+  s->syn.imm = clampi(s->syn.imm, 0, maxc);
+  s->syn.label = clampi(s->syn.label, 0, maxc);
+  s->syn.comment = clampi(s->syn.comment, 0, maxc);
+  s->syn.directive = clampi(s->syn.directive, 0, maxc);
+  s->syn.string = clampi(s->syn.string, 0, maxc);
+  s->syn.normal = clampi(s->syn.normal, 0, maxc);
+}
+
+/* strncpy that always NUL-terminates. */
+static void copy_str(char *dst, const char *src, int dstsz) {
+  int n = dstsz - 1;
+  strncpy(dst, src, n);
+  dst[n] = '\0';
+}
+
 void settings_load(void) {
   settings_defaults(&g_settings);
+  g_extra_config[0] = '\0';
+  g_extra_len = 0;
+
   FILE *f = fopen(SETTINGS_FILE, "r");
   if (f) {
     char line[256], k[64], v[192];
@@ -132,8 +200,19 @@ void settings_load(void) {
         continue;
       strncpy(k, line, klen);
       k[klen] = '\0';
-      strncpy(v, eq + 1, 191);
-      v[191] = '\0';
+      copy_str(v, eq + 1, sizeof(v));
+
+      if (!is_known_key(k)) {
+        /* Preserve foreign keys so we round-trip nasm's own settings. */
+        int need = ll + 1;
+        if (g_extra_len + need < (int)sizeof(g_extra_config)) {
+          memcpy(g_extra_config + g_extra_len, line, ll);
+          g_extra_len += ll;
+          g_extra_config[g_extra_len++] = '\n';
+          g_extra_config[g_extra_len] = '\0';
+        }
+        continue;
+      }
 
       int vi = atoi(v);
       if (!strcmp(k, "tab_width"))
@@ -143,7 +222,7 @@ void settings_load(void) {
       else if (!strcmp(k, "syntax_highlight"))
         g_settings.syntax_highlight = vi;
       else if (!strcmp(k, "asm_extension"))
-        strncpy(g_settings.asm_extension, v, 31);
+        copy_str(g_settings.asm_extension, v, sizeof(g_settings.asm_extension));
       else if (!strcmp(k, "theme"))
         g_settings.theme = vi;
       else if (!strcmp(k, "ui_bg"))
@@ -181,9 +260,9 @@ void settings_load(void) {
       else if (!strcmp(k, "syn_normal"))
         g_settings.syn.normal = vi;
       else if (!strcmp(k, "nasm_path"))
-        strncpy(g_settings.nasm_path, v, 255);
+        copy_str(g_settings.nasm_path, v, sizeof(g_settings.nasm_path));
       else if (!strcmp(k, "nasm_args"))
-        strncpy(g_settings.nasm_args, v, 127);
+        copy_str(g_settings.nasm_args, v, sizeof(g_settings.nasm_args));
     }
     fclose(f);
   }
@@ -195,6 +274,7 @@ void settings_load(void) {
   else if (g_settings.theme == 1)
     settings_theme_light(&g_settings);
 
+  settings_validate(&g_settings);
   settings_apply_theme();
 }
 
@@ -228,6 +308,11 @@ void settings_save(void) {
   fprintf(f, "syn_normal=%d\n", g_settings.syn.normal);
   fprintf(f, "nasm_path=%s\n", g_settings.nasm_path);
   fprintf(f, "nasm_args=%s\n", g_settings.nasm_args);
+
+  /* Re-emit foreign keys (e.g. nasm's nasm_last_dir) untouched. */
+  if (g_extra_len > 0)
+    fwrite(g_extra_config, 1, g_extra_len, f);
+
   fclose(f);
 }
 
@@ -278,12 +363,14 @@ int settings_find_nasm(char *out, int outsz) {
 }
 
 /* ================================================================
- * Unified Settings UI
+ * Settings UI
  * ================================================================ */
 
 typedef struct {
   NStudioSettings original;
   NStudioSettings current_frame;
+  int idx_apply;
+  int idx_restore;
 } SettingsContext;
 
 static void settings_ui_tick(GfxWindow *win) {
@@ -316,8 +403,8 @@ static void settings_ui_tick(GfxWindow *win) {
 
   int changed =
       (memcmp(&g_settings, &ctx->original, sizeof(NStudioSettings)) != 0);
-  win->children[win->num_children - 2]->disabled = !changed;
-  win->children[win->num_children - 1]->disabled = !changed;
+  win->children[ctx->idx_apply]->disabled = !changed;
+  win->children[ctx->idx_restore]->disabled = !changed;
 
   ctx->current_frame = g_settings;
 }
@@ -496,9 +583,21 @@ void settings_ui_open(void) {
   int idx_apply = num_widgets - 2;
   int idx_restore = num_widgets - 1;
 
+  /* If any widget allocation failed, free what we have and bail out
+     rather than letting the window manager dereference a NULL child. */
+  for (int i = 0; i < num_widgets; i++) {
+    if (!children[i]) {
+      for (int j = 0; j < num_widgets; j++)
+        free(children[j]);
+      return;
+    }
+  }
+
   SettingsContext ctx;
   ctx.original = g_settings;
   ctx.current_frame = g_settings;
+  ctx.idx_apply = idx_apply;
+  ctx.idx_restore = idx_restore;
 
   GfxWindow win;
   win.x = (GFX_W - 280) / 2;
