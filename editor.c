@@ -4,37 +4,36 @@
  *
  * Architecture
  * ------------
- * Text is stored in a gap buffer:  [before_gap | ---gap--- | after_gap]
+ * Text is stored in a gap buffer (gapbuf.c):
+ *   [before_gap | ---gap--- | after_gap]
  * The cursor is always at the start of the gap.
  * A line-start table is rebuilt after every edit (cheap for files up to
  * a few thousand lines).
  *
- * Syntax highlighting (per-line, stateless)
- * -----------------------------------------
- * Each line is tokenised left-to-right:
- *   LABEL   word followed by ':'           -> yellow
- *   MNEM    known ARM mnemonic             -> cyan
- *   REG     r0-r15 / sp / lr / pc / cpsr   -> green
- *   IMM     #... or 0x...                  -> orange
- *   COMMENT ; to end of line               -> grey
- *   DIRECT  . or % prefixed word           -> magenta
- *   STRING  "..." or '...'                 -> orange (same as imm)
- *   OTHER                                  -> white
+ * Syntax highlighting lives in syntax.c and follows the nasm assembler
+ * exactly (classification is driven by nasm's own optab.c tables).
+ * Note the nasm label rule: a label is any valid identifier in column 0
+ * (letter first) - there is NO trailing colon, and instructions must be
+ * indented.
  */
 
 #include <ctype.h>
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #include <keys.h>
 #include <libndls.h>
 
+#include "asmdb.h"
+#include "browser.h"
 #include "editor.h"
+#include "gapbuf.h"
 #include "gfx.h"
 #include "settings.h"
+#include "syntax.h"
 
 /* ================================================================
  * Layout constants
@@ -50,7 +49,7 @@
 #define ROWS_VIS (EDIT_H / GFX_FONT_H)
 
 /* ================================================================
- * Colours — Dynamically mapped to the unified UI settings
+ * Colours: mapped to the UI settings
  * ================================================================ */
 #define C_BG settings_col(g_settings.ui_bg)
 #define C_FG settings_col(g_settings.ui_fg)
@@ -63,127 +62,11 @@
 #define C_STATUS_FG settings_col(g_settings.ui_title_fg)
 #define C_MODIFIED settings_col(g_settings.syn.label)
 
-#define C_MNEM settings_col(g_settings.syn.mnem)
-#define C_REG settings_col(g_settings.syn.reg)
-#define C_IMM settings_col(g_settings.syn.imm)
-#define C_LABEL settings_col(g_settings.syn.label)
-#define C_CMT settings_col(g_settings.syn.comment)
-#define C_DIR settings_col(g_settings.syn.directive)
-#define C_STR settings_col(g_settings.syn.string)
 
 /* ================================================================
- * Gap buffer
+ * Document buffer (gap buffer + line table live in gapbuf.c)
  * ================================================================ */
-#define GAP_INIT 4096
-#define GAP_GROW 2048
-
-typedef struct {
-  char *buf;  /* the whole allocation                          */
-  int size;   /* total allocation size                         */
-  int gap_lo; /* first byte of gap (= cursor position)         */
-  int gap_hi; /* first byte after gap                          */
-} GapBuf;
-
-static void gb_init(GapBuf *g) {
-  g->buf = (char *)malloc(GAP_INIT);
-  g->size = GAP_INIT;
-  g->gap_lo = 0;
-  g->gap_hi = GAP_INIT;
-  if (g->buf)
-    memset(g->buf, 0, GAP_INIT);
-}
-
-static void gb_free(GapBuf *g) {
-  free(g->buf);
-  g->buf = NULL;
-}
-
-static int gb_len(const GapBuf *g) { return g->size - (g->gap_hi - g->gap_lo); }
-
-static int gb_phys(const GapBuf *g, int idx) {
-  return idx < g->gap_lo ? idx : idx + (g->gap_hi - g->gap_lo);
-}
-
-static char gb_get(const GapBuf *g, int idx) { return g->buf[gb_phys(g, idx)]; }
-
-static void gb_ensure(GapBuf *g, int need) {
-  int have = g->gap_hi - g->gap_lo;
-  if (have >= need)
-    return;
-  int extra = need - have + GAP_GROW;
-  int newsize = g->size + extra;
-  char *nb = (char *)realloc(g->buf, newsize);
-  if (!nb)
-    return;
-  int after = g->size - g->gap_hi;
-  memmove(nb + newsize - after, nb + g->gap_hi, after);
-  g->buf = nb;
-  g->gap_hi = newsize - after;
-  g->size = newsize;
-}
-
-static void gb_move(GapBuf *g, int pos) {
-  if (pos == g->gap_lo)
-    return;
-  int gaplen = g->gap_hi - g->gap_lo;
-  if (pos < g->gap_lo) {
-    int n = g->gap_lo - pos;
-    memmove(g->buf + g->gap_hi - n, g->buf + pos, n);
-    g->gap_lo = pos;
-    g->gap_hi = pos + gaplen;
-  } else {
-    int n = pos - g->gap_lo;
-    memmove(g->buf + g->gap_lo, g->buf + g->gap_hi, n);
-    g->gap_lo = pos;
-    g->gap_hi = pos + gaplen;
-  }
-}
-
-static void gb_insert(GapBuf *g, char c) {
-  gb_ensure(g, 1);
-  g->buf[g->gap_lo++] = c;
-}
-
-static void gb_inserts(GapBuf *g, const char *s) {
-  while (*s)
-    gb_insert(g, *s++);
-}
-
-static void gb_backspace(GapBuf *g) {
-  if (g->gap_lo > 0)
-    g->gap_lo--;
-}
-
-static void gb_delete(GapBuf *g) {
-  if (g->gap_hi < g->size)
-    g->gap_hi++;
-}
-
-/* ================================================================
- * Line table
- * ================================================================ */
-#define MAX_LINES 4096
-
 static GapBuf g_buf;
-static int line_starts[MAX_LINES];
-static int num_lines;
-
-static void rebuild_lines(const GapBuf *g) {
-  int len = gb_len(g);
-  num_lines = 0;
-  line_starts[num_lines++] = 0;
-  int i;
-  for (i = 0; i < len && num_lines < MAX_LINES; i++) {
-    if (gb_get(g, i) == '\n')
-      line_starts[num_lines++] = i + 1;
-  }
-}
-
-static int line_len(const GapBuf *g, int line) {
-  int start = line_starts[line];
-  int end = (line + 1 < num_lines) ? line_starts[line + 1] - 1 : gb_len(g);
-  return end - start;
-}
 
 /* ================================================================
  * Cursor management
@@ -193,9 +76,15 @@ static int cursor_row;
 static int cursor_col;
 static int scroll_row;
 static int scroll_col;
+/* Column the cursor tries to keep while moving vertically, so up/down
+   across short lines does not permanently lose the horizontal position. */
+static int cursor_goal_col;
 
 static void cursor_sync_pos(void) {
   int i;
+  int len = gb_len(&g_buf);
+  if (cursor_pos > len)
+    cursor_pos = len;
   cursor_row = 0;
   for (i = 1; i < num_lines; i++) {
     if (line_starts[i] <= cursor_pos)
@@ -225,329 +114,20 @@ static void scroll_to_cursor(void) {
 }
 
 /* ================================================================
- * ARM syntax highlighting
- * ================================================================ */
-
-/* ARM mnemonics (uppercase, base only — condition codes stripped on match) */
-static const char *arm_mnems[] = {
-    "ADC",   "ADD",   "AND",   "B",    "BIC",   "BL",    "BX",   "CLZ",
-    "CMN",   "CMP",   "EOR",   "LDM",  "LDR",   "MCR",   "MLA",  "MOV",
-    "MRC",   "MRS",   "MSR",   "MUL",  "MVN",   "ORR",   "RSB",  "RSC",
-    "SBC",   "SMLAL", "SMULL", "STM",  "STR",   "SUB",   "SWI",  "SVC",
-    "SWP",   "SWPB",  "TEQ",   "TST",  "UMLAL", "UMULL", "LDRB", "LDRH",
-    "LDRSB", "LDRSH", "STRB",  "STRH", "LDRBT", "STRBT", "LDRT", "STRT",
-    "ADR",   NULL};
-
-static const char *arm_regs[] = {
-    "R0",       "R1",       "R2",       "R3",       "R4",       "R5",
-    "R6",       "R7",       "R8",       "R9",       "R10",      "R11",
-    "R12",      "R13",      "R14",      "R15",      "SP",       "LR",
-    "PC",       "CPSR",     "SPSR",     "CPSR_ALL", "CPSR_FLG", "CPSR_CTL",
-    "SPSR_ALL", "SPSR_FLG", "SPSR_CTL", NULL};
-
-static const char *arm_directives[] = {
-    "ALIGN", "DCD", "DCDU", "DCW", "DCWU", "DCB", "INCBIN", "INCLUDE", NULL};
-
-/* Case-insensitive compare of at most n chars */
-static int strncaseeq(const char *a, const char *b, int n) {
-  int i;
-  for (i = 0; i < n; i++) {
-    if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
-      return 0;
-    if (!a[i])
-      return 1;
-  }
-  return 1;
-}
-
-/* Check if `word` (length wlen, uppercase) matches any entry in table */
-static int in_table(const char *word, int wlen, const char **table) {
-  int i;
-  for (i = 0; table[i]; i++) {
-    int tlen = (int)strlen(table[i]);
-    if (tlen == wlen && strncaseeq(word, table[i], wlen))
-      return 1;
-  }
-  return 0;
-}
-
-static int is_mnem(const char *word, int wlen) {
-  static const char *cc[] = {"EQ", "NE", "CS", "CC", "MI", "PL",
-                             "VS", "VC", "HI", "LS", "GE", "LT",
-                             "GT", "LE", "AL", "HS", "LO", NULL};
-  static const char *am[] = {"IA", "IB", "DA", "DB", "FD",
-                             "FA", "ED", "EA", NULL};
-
-  int lens[8];
-  int nlens = 0;
-
-#define PUSH(l)                                                                \
-  do {                                                                         \
-    if ((l) > 0)                                                               \
-      lens[nlens++] = (l);                                                     \
-  } while (0)
-
-  PUSH(wlen);
-
-  int no_s = wlen;
-  if (wlen > 1 && toupper((unsigned char)word[wlen - 1]) == 'S')
-    no_s = wlen - 1;
-  if (no_s != wlen)
-    PUSH(no_s);
-
-  int base_count = nlens;
-  for (int ti = 0; ti < base_count; ti++) {
-    int l = lens[ti];
-    if (l > 2) {
-      for (int i = 0; cc[i]; i++) {
-        if (strncaseeq(word + l - 2, cc[i], 2))
-          PUSH(l - 2);
-      }
-    }
-  }
-
-  int after_cc_count = nlens;
-  for (int ti = 0; ti < after_cc_count; ti++) {
-    int l = lens[ti];
-    if (l > 2) {
-      for (int i = 0; am[i]; i++) {
-        if (strncaseeq(word + l - 2, am[i], 2))
-          PUSH(l - 2);
-      }
-    }
-  }
-
-#undef PUSH
-
-  for (int ti = 0; ti < nlens; ti++) {
-    if (in_table(word, lens[ti], arm_mnems))
-      return 1;
-  }
-  return 0;
-}
-
-static int is_reg(const char *word, int wlen) {
-  return in_table(word, wlen, arm_regs);
-}
-
-static int is_directive(const char *word, int wlen) {
-  return in_table(word, wlen, arm_directives);
-}
-
-static const char *arm_shifts[] = {"LSL", "LSR", "ASR", "ROR", "RRX", NULL};
-
-static int is_shift(const char *word, int wlen) {
-  return in_table(word, wlen, arm_shifts);
-}
-
-typedef enum {
-  TOK_OTHER,
-  TOK_MNEM,
-  TOK_REG,
-  TOK_IMM,
-  TOK_LABEL,
-  TOK_CMT,
-  TOK_DIR,
-  TOK_STR
-} TokType;
-
-static uint16_t tok_colour(TokType t) {
-  if (!g_settings.syntax_highlight)
-    return C_FG;
-  switch (t) {
-  case TOK_MNEM:
-    return C_MNEM;
-  case TOK_REG:
-    return C_REG;
-  case TOK_IMM:
-    return C_IMM;
-  case TOK_LABEL:
-    return C_LABEL;
-  case TOK_CMT:
-    return C_CMT;
-  case TOK_DIR:
-    return C_DIR;
-  case TOK_STR:
-    return C_STR;
-  default:
-    return C_FG;
-  }
-}
-
-static const char *get_syscall_name(long num);
-
-static void render_line_highlighted(const char *line_buf, int px, int py,
-                                    uint16_t bg, int col_off, int max_w) {
-  int len = (int)strlen(line_buf);
-  int i = 0;
-  int draw_x = px - col_off * GFX_CHAR_W;
-
-  /* Pre-scan for SWI/SVC to render an inline hint */
-  int is_syscall = 0;
-  long sys_num = -1;
-  int scan_i = 0;
-  while (scan_i < len) {
-    while (scan_i < len &&
-           (line_buf[scan_i] == ' ' || line_buf[scan_i] == '\t'))
-      scan_i++;
-    if (scan_i >= len || line_buf[scan_i] == ';')
-      break;
-
-    int start = scan_i;
-    while (scan_i < len && (isalnum((unsigned char)line_buf[scan_i]) ||
-                            line_buf[scan_i] == '_'))
-      scan_i++;
-    int tok_len = scan_i - start;
-
-    if (tok_len == 3 && (strncaseeq(line_buf + start, "swi", 3) ||
-                         strncaseeq(line_buf + start, "svc", 3))) {
-      while (scan_i < len &&
-             (line_buf[scan_i] == ' ' || line_buf[scan_i] == '\t'))
-        scan_i++;
-      if (scan_i < len && line_buf[scan_i] == '#')
-        scan_i++;
-      if (scan_i < len) {
-        char *end;
-        sys_num = strtol(line_buf + scan_i, &end, 0);
-        if (end != line_buf + scan_i)
-          is_syscall = 1;
-      }
-      break;
-    }
-    while (scan_i < len && line_buf[scan_i] != ' ' &&
-           line_buf[scan_i] != '\t' && line_buf[scan_i] != ';')
-      scan_i++;
-  }
-
-#define DRAWC(ch, fg)                                                          \
-  do {                                                                         \
-    if (draw_x >= px && draw_x + GFX_CHAR_W <= px + max_w)                     \
-      gfx_drawchar(draw_x, py, (ch), (fg), bg);                                \
-    else if (draw_x >= px + max_w)                                             \
-      goto done_line;                                                          \
-    draw_x += GFX_CHAR_W;                                                      \
-  } while (0)
-
-  while (i < len) {
-    char c = line_buf[i];
-
-    if (c == ';') {
-      while (i < len) {
-        DRAWC(line_buf[i], C_CMT);
-        i++;
-      }
-      break;
-    }
-
-    if (c == '"' || c == '\'') {
-      char delim = c;
-      DRAWC(c, C_STR);
-      i++;
-      while (i < len && line_buf[i] != delim) {
-        DRAWC(line_buf[i], C_STR);
-        i++;
-      }
-      if (i < len) {
-        DRAWC(line_buf[i], C_STR);
-        i++;
-      }
-      continue;
-    }
-
-    if (c == '#' || (c == '0' && i + 1 < len &&
-                     (line_buf[i + 1] == 'x' || line_buf[i + 1] == 'X'))) {
-      while (i < len && !isspace((unsigned char)line_buf[i]) &&
-             line_buf[i] != ',' && line_buf[i] != ']' && line_buf[i] != ')') {
-        DRAWC(line_buf[i], C_IMM);
-        i++;
-      }
-      continue;
-    }
-
-    if ((c == '.' || c == '%') && i + 1 < len &&
-        (isalpha((unsigned char)line_buf[i + 1]) || line_buf[i + 1] == '_')) {
-      int start = i;
-      while (i < len && (isalnum((unsigned char)line_buf[i]) ||
-                         line_buf[i] == '.' || line_buf[i] == '_'))
-        i++;
-      int wlen = i - start;
-      TokType t = is_directive(line_buf + start, wlen) ? TOK_DIR : TOK_OTHER;
-      for (int j = start; j < i; j++) {
-        DRAWC(line_buf[j], tok_colour(t));
-      }
-      continue;
-    }
-
-    if (isalpha((unsigned char)c) || c == '_') {
-      int start = i;
-      while (i < len &&
-             (isalnum((unsigned char)line_buf[i]) || line_buf[i] == '_'))
-        i++;
-      int wlen = i - start;
-
-      TokType t = TOK_OTHER;
-      if (start == 0 && !is_reg(line_buf + start, wlen) &&
-          !is_mnem(line_buf + start, wlen) &&
-          !is_shift(line_buf + start, wlen) &&
-          !is_directive(line_buf + start, wlen)) {
-        t = TOK_LABEL;
-      } else if (is_reg(line_buf + start, wlen))
-        t = TOK_REG;
-      else if (is_mnem(line_buf + start, wlen))
-        t = TOK_MNEM;
-      else if (is_shift(line_buf + start, wlen))
-        t = TOK_MNEM;
-      else if (is_directive(line_buf + start, wlen))
-        t = TOK_DIR;
-
-      for (int j = start; j < i; j++) {
-        DRAWC(line_buf[j], tok_colour(t));
-      }
-      continue;
-    }
-
-    DRAWC(c, C_FG);
-    i++;
-  }
-
-done_line:
-  /* Render the inline syscall hint */
-  if (is_syscall) {
-    const char *sname = get_syscall_name(sys_num);
-    if (sname) {
-      char hint[64];
-      snprintf(hint, sizeof(hint), "  [%s]", sname);
-      int h_i = 0;
-      while (hint[h_i]) {
-        if (draw_x >= px && draw_x + GFX_CHAR_W <= px + max_w) {
-          gfx_drawchar(draw_x, py, hint[h_i], C_CMT, bg);
-        } else if (draw_x >= px + max_w) {
-          break;
-        }
-        draw_x += GFX_CHAR_W;
-        h_i++;
-      }
-    }
-  }
-
-  /* Clear remaining visual line */
-  if (draw_x < px + max_w) {
-    int fill_x = draw_x < px ? px : draw_x;
-    if (fill_x < px + max_w)
-      gfx_fillrect(fill_x, py, px + max_w - fill_x, GFX_FONT_H, bg);
-  }
-#undef DRAWC
-}
-
-/* ================================================================
  * File I/O
  * ================================================================ */
 static char g_filepath[512];
 static int g_modified;
+static int g_saved; /* set once any save succeeds during this editor session */
+static int g_readonly; /* file opened read-only (not an asm source) */
+static int g_crlf;     /* 0 = LF line endings, 1 = CRLF (write \r\n) */
+
+static int path_is_asm_source(const char *path);
 
 static int load_file(const char *path) {
   FILE *f = fopen(path, "rb");
   gb_init(&g_buf);
+  g_crlf = 0;
   if (!f) {
     rebuild_lines(&g_buf);
     return 0;
@@ -556,11 +136,26 @@ static int load_file(const char *path) {
   long sz = ftell(f);
   rewind(f);
   if (sz > 0) {
-    char *tmp = (char *)malloc(sz + 1);
+    char *tmp = (char *)malloc(sz);
     if (tmp) {
       size_t br = fread(tmp, 1, sz, f);
-      tmp[br] = '\0';
-      gb_inserts(&g_buf, tmp);
+      if (path_is_asm_source(path)) {
+        /* Editable source: normalise CRLF -> LF in the buffer and
+           remember the file's style so it round-trips on save. */
+        int out = 0;
+        for (size_t i = 0; i < br; i++) {
+          if (tmp[i] == '\r' && i + 1 < br && tmp[i + 1] == '\n') {
+            g_crlf = 1;
+            continue;
+          }
+          tmp[out++] = tmp[i];
+        }
+        gb_insert_n(&g_buf, tmp, out);
+      } else {
+        /* Byte-exact insert: NUL bytes survive, so an accidentally
+           opened binary is not truncated and round-trips on save. */
+        gb_insert_n(&g_buf, tmp, (int)br);
+      }
       free(tmp);
     }
   }
@@ -570,19 +165,74 @@ static int load_file(const char *path) {
   return 1;
 }
 
+/* Write a run of bytes, expanding '\n' to "\r\n" when in CRLF mode. */
+static void write_bytes(FILE *f, const char *p, int n) {
+  if (!g_crlf) {
+    fwrite(p, 1, n, f);
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    if (p[i] == '\n')
+      fputc('\r', f);
+    fputc(p[i], f);
+  }
+}
+
 static int save_file(const char *path) {
   FILE *f = fopen(path, "wb");
   if (!f)
     return 0;
-  /* Write the two contiguous halves of the gap buffer directly.
-     No per-character translation needed — they are already in memory. */
+  /* Write the two contiguous halves of the gap buffer, translating line
+     endings for CRLF files. */
   if (g_buf.gap_lo > 0)
-    fwrite(g_buf.buf, 1, g_buf.gap_lo, f);
+    write_bytes(f, g_buf.buf, g_buf.gap_lo);
   int after_len = g_buf.size - g_buf.gap_hi;
   if (after_len > 0)
-    fwrite(g_buf.buf + g_buf.gap_hi, 1, after_len, f);
+    write_bytes(f, g_buf.buf + g_buf.gap_hi, after_len);
   fclose(f);
   return 1;
+}
+
+/* Does this filename look like an assembler source?
+   Matches ".<ext>.tns" or bare ".<ext>", the same rule the nasm
+   assembler applies to decide what it can build. */
+static int path_is_asm_source(const char *path) {
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  int nlen = (int)strlen(base);
+  int elen = (int)strlen(g_settings.asm_extension);
+  if (elen == 0)
+    return 1; /* no extension configured: treat everything as editable */
+
+  char suf[64];
+  snprintf(suf, sizeof(suf), ".%s.tns", g_settings.asm_extension);
+  int sl = (int)strlen(suf);
+  if (nlen >= sl && strcasecmp(base + nlen - sl, suf) == 0)
+    return 1;
+
+  snprintf(suf, sizeof(suf), ".%s", g_settings.asm_extension);
+  sl = (int)strlen(suf);
+  if (nlen >= sl && strcasecmp(base + nlen - sl, suf) == 0)
+    return 1;
+
+  return 0;
+}
+
+/* Ask before the first modification of a read-only file.
+   Returns 1 if editing may proceed. */
+static int editor_confirm_rw(void) {
+  if (!g_readonly)
+    return 1;
+  static const char *body[] = {
+      "This file was opened read-only because it",
+      "does not match your ASM source extension.",
+      "Enable editing anyway?"};
+  if (gfx_window_confirm2("Read-only", body, 3, "Enable editing", "Cancel") ==
+      0) {
+    g_readonly = 0;
+    return 1;
+  }
+  return 0;
 }
 
 /* ================================================================
@@ -622,7 +272,7 @@ static void extract_line(int row) {
  * sel_anchor is where the selection started (fixed end).
  * sel_active follows the cursor (moving end).
  * ================================================================ */
-/* Forward declaration — render_all is defined after render_editor_core,
+/* Forward declaration: render_all is defined after render_editor_core,
    but is needed by the search helpers which live above both. */
 static void render_all(void);
 
@@ -677,6 +327,9 @@ static void sel_delete_region(void) {
 static char *g_clipboard = NULL;
 static int g_clipboard_len = 0;
 
+typedef enum { UK_NONE, UK_INSERT, UK_DELETE, UK_OTHER } UndoKind;
+static void undo_checkpoint(UndoKind kind);
+
 static void clipboard_copy(int cut) {
   if (!sel_active_flag())
     return;
@@ -691,20 +344,24 @@ static void clipboard_copy(int cut) {
     g_clipboard[i] = gb_get(&g_buf, lo + i);
   g_clipboard[len] = '\0';
   g_clipboard_len = len;
-  if (cut)
+  if (cut) {
+    undo_checkpoint(UK_OTHER);
     sel_delete_region();
-  else
+  } else {
     sel_clear();
+  }
 }
 
 static void clipboard_paste(void) {
   if (!g_clipboard || g_clipboard_len == 0)
     return;
+  undo_checkpoint(UK_OTHER);
   if (sel_active_flag())
     sel_delete_region();
   gb_move(&g_buf, cursor_pos);
   for (int i = 0; i < g_clipboard_len; i++) {
-    gb_insert(&g_buf, g_clipboard[i]);
+    if (!gb_insert(&g_buf, g_clipboard[i]))
+      break;
     cursor_pos++;
   }
   rebuild_lines(&g_buf);
@@ -742,35 +399,57 @@ static void snap_free(UndoSnap *s) {
   s->len = 0;
 }
 
-static void undo_push(void) {
+/* Capture the current buffer + cursor into ring[*head] and advance the
+   ring.  The copy is allocated before the old slot is freed, so a failed
+   allocation leaves the ring fully intact.  Returns 1 on success. */
+static int snap_capture(UndoSnap *ring, int *head, int *count) {
   int len = gb_len(&g_buf);
-  UndoSnap *s = &g_undo_ring[g_undo_head % UNDO_MAX];
-  snap_free(s);
-  s->buf = (char *)malloc(len + 1);
-  if (!s->buf)
-    return;
+  char *nb = (char *)malloc(len + 1);
+  if (!nb)
+    return 0;
   /* Copy both halves directly, no per-character branch needed. */
-  memcpy(s->buf, g_buf.buf, g_buf.gap_lo);
+  memcpy(nb, g_buf.buf, g_buf.gap_lo);
   int after = g_buf.size - g_buf.gap_hi;
-  memcpy(s->buf + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, after);
-  s->buf[len] = '\0';
+  memcpy(nb + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, after);
+  nb[len] = '\0';
+
+  UndoSnap *s = &ring[*head % UNDO_MAX];
+  snap_free(s);
+  s->buf = nb;
   s->len = len;
   s->cursor = cursor_pos;
   s->s_anchor = sel_anchor;
   s->s_active = sel_active;
-  g_undo_head = (g_undo_head + 1) % UNDO_MAX;
-  if (g_undo_count < UNDO_MAX)
-    g_undo_count++;
-  for (int i = 0; i < g_redo_count; i++)
+  *head = (*head + 1) % UNDO_MAX;
+  if (*count < UNDO_MAX)
+    (*count)++;
+  return 1;
+}
+
+/* Undo coalescing: consecutive same-kind edits share one snapshot, so
+   the 32-slot ring covers many keystrokes and undo steps back a word
+   or edit at a time.  Movement and other operations break the group.
+   (UndoKind is declared near the clipboard code above.) */
+static UndoKind g_undo_kind = UK_NONE;
+
+/* Force the next edit to start a fresh undo group. */
+static void undo_break(void) { g_undo_kind = UK_NONE; }
+
+static void undo_push(void) {
+  if (!snap_capture(g_undo_ring, &g_undo_head, &g_undo_count))
+    return;
+  for (int i = 0; i < UNDO_MAX; i++)
     snap_free(&g_redo_ring[i]);
   g_redo_count = 0;
   g_redo_head = 0;
 }
 
 static void snap_restore(UndoSnap *s) {
+  if (!s->buf)
+    return;
   gb_free(&g_buf);
   gb_init(&g_buf);
-  gb_inserts(&g_buf, s->buf);
+  gb_insert_n(&g_buf, s->buf, s->len);
   gb_move(&g_buf, 0);
   rebuild_lines(&g_buf);
   cursor_pos = s->cursor;
@@ -785,58 +464,38 @@ static void snap_restore(UndoSnap *s) {
 static void do_undo(void) {
   if (g_undo_count == 0)
     return;
-  int len = gb_len(&g_buf);
-  UndoSnap *r = &g_redo_ring[g_redo_head % UNDO_MAX];
-  snap_free(r);
-  r->buf = (char *)malloc(len + 1);
-  if (r->buf) {
-    /* Copy both halves directly, no per-character branch needed. */
-    memcpy(r->buf, g_buf.buf, g_buf.gap_lo);
-    int after = g_buf.size - g_buf.gap_hi;
-    memcpy(r->buf + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, after);
-    r->buf[len] = '\0';
-    r->len = len;
-    r->cursor = cursor_pos;
-    r->s_anchor = sel_anchor;
-    r->s_active = sel_active;
-    g_redo_head = (g_redo_head + 1) % UNDO_MAX;
-    if (g_redo_count < UNDO_MAX)
-      g_redo_count++;
-  }
+  /* Save the current state to the Redo ring first; if that fails,
+     abort rather than silently losing the redo path. */
+  if (!snap_capture(g_redo_ring, &g_redo_head, &g_redo_count))
+    return;
   g_undo_head = (g_undo_head - 1 + UNDO_MAX) % UNDO_MAX;
   g_undo_count--;
   snap_restore(&g_undo_ring[g_undo_head]);
+  undo_break();
 }
 
 static void do_redo(void) {
   if (g_redo_count == 0)
     return;
-
-  /* Manually save the current state to the Undo ring
-        (We cannot use undo_push() because it wipes the redo ring) */
-  int len = gb_len(&g_buf);
-  UndoSnap *u = &g_undo_ring[g_undo_head % UNDO_MAX];
-  snap_free(u);
-  u->buf = (char *)malloc(len + 1);
-  if (u->buf) {
-    for (int i = 0; i < len; i++)
-      u->buf[i] = gb_get(&g_buf, i);
-    u->buf[len] = '\0';
-    u->len = len;
-    u->cursor = cursor_pos;
-    u->s_anchor = sel_anchor;
-    u->s_active = sel_active;
-    g_undo_head = (g_undo_head + 1) % UNDO_MAX;
-    if (g_undo_count < UNDO_MAX)
-      g_undo_count++;
-  }
-
-  /* Pop the target entry from the Redo ring */
+  /* Save the current state to the Undo ring.  snap_capture does not
+     wipe the redo ring, unlike undo_push. */
+  if (!snap_capture(g_undo_ring, &g_undo_head, &g_undo_count))
+    return;
   g_redo_head = (g_redo_head - 1 + UNDO_MAX) % UNDO_MAX;
   g_redo_count--;
-
-  /* Restore the targeted future state into the editor */
   snap_restore(&g_redo_ring[g_redo_head]);
+  undo_break();
+}
+
+/* Snapshot before a mutation, coalescing runs of the same kind.
+   Only INSERT and DELETE runs coalesce; everything else is its own
+   group. */
+static void undo_checkpoint(UndoKind kind) {
+  int coalesce =
+      (kind == g_undo_kind) && (kind == UK_INSERT || kind == UK_DELETE);
+  if (!coalesce)
+    undo_push();
+  g_undo_kind = kind;
 }
 
 /* ================================================================
@@ -846,19 +505,28 @@ static void do_redo(void) {
 
 static char g_search_pat[SEARCH_MAX] = "";
 static char g_replace_str[SEARCH_MAX] = "";
+static int g_search_case = 0; /* 0 = case-insensitive, 1 = case-sensitive */
 
-/* Case-insensitive substring search in the logical buffer.
+/* Substring search in the logical buffer, honouring g_search_case.
    Returns logical position of match start, or -1. */
 static int buf_find(int from, const char *pat, int patlen) {
   int buflen = gb_len(&g_buf);
-  if (patlen == 0 || from > buflen - patlen)
+  if (patlen == 0)
     return -1;
+  if (from < 0)
+    from = 0;
   for (int i = from; i <= buflen - patlen; i++) {
     int ok = 1;
-    for (int j = 0; j < patlen && ok; j++)
-      if (tolower((unsigned char)gb_get(&g_buf, i + j)) !=
-          tolower((unsigned char)pat[j]))
+    for (int j = 0; j < patlen && ok; j++) {
+      char a = gb_get(&g_buf, i + j);
+      char b = pat[j];
+      if (g_search_case) {
+        if (a != b)
+          ok = 0;
+      } else if (tolower((unsigned char)a) != tolower((unsigned char)b)) {
         ok = 0;
+      }
+    }
     if (ok)
       return i;
   }
@@ -885,16 +553,22 @@ static void search_draw_status(const char *msg) {
   gfx_flip();
 }
 
-/* Interactive search loop.
-   find_next = 1 to start from cursor+1 (so repeated Enter keeps moving).
+static void search_status_hint(const char *action) {
+  char msg[96];
+  snprintf(msg, sizeof(msg), "%s   Tab:case[%s]  Esc:done", action,
+           g_search_case ? "Aa" : "aa");
+  search_draw_status(msg);
+}
+
+/* Interactive search loop.  Enter jumps to the next match (wrapping),
+   Tab toggles case sensitivity, Esc ends.
    Returns 1 if something was found+selected, 0 if not found / cancelled. */
 static int editor_search_loop(void) {
   int patlen = (int)strlen(g_search_pat);
   if (patlen == 0)
     return 0;
 
-  int start = cursor_pos + 1;
-  int found = buf_find(start, g_search_pat, patlen);
+  int found = buf_find(cursor_pos + 1, g_search_pat, patlen);
   if (found < 0)
     found = buf_find(0, g_search_pat, patlen); /* wrap */
   if (found < 0) {
@@ -904,6 +578,7 @@ static int editor_search_loop(void) {
   }
   search_select(found, found + patlen);
   render_all();
+  search_status_hint("Enter:next");
 
   while (any_key_pressed())
     msleep(20);
@@ -918,6 +593,21 @@ static int editor_search_loop(void) {
       sel_clear();
       break;
     }
+    if (isKeyPressed(KEY_NSPIRE_TAB)) {
+      while (any_key_pressed())
+        msleep(20);
+      g_search_case = !g_search_case;
+      /* Re-anchor the search on the current match under the new mode. */
+      int here = buf_find(cursor_pos - patlen, g_search_pat, patlen);
+      if (here < 0)
+        here = buf_find(0, g_search_pat, patlen);
+      if (here >= 0) {
+        search_select(here, here + patlen);
+        render_all();
+      }
+      search_status_hint("Enter:next");
+      continue;
+    }
     if (isKeyPressed(KEY_NSPIRE_ENTER) || isKeyPressed(KEY_NSPIRE_CLICK)) {
       while (any_key_pressed())
         msleep(20);
@@ -925,12 +615,15 @@ static int editor_search_loop(void) {
       if (next < 0)
         next = buf_find(0, g_search_pat, patlen);
       if (next < 0) {
+        sel_clear();
+        render_all();
         search_draw_status("No more matches.");
         msleep(600);
         break;
       }
       search_select(next, next + patlen);
       render_all();
+      search_status_hint("Enter:next");
     } else {
       msleep(20);
     }
@@ -941,22 +634,65 @@ static int editor_search_loop(void) {
 static void editor_search(void) {
   char tmp[SEARCH_MAX];
   strncpy(tmp, g_search_pat, SEARCH_MAX);
+  tmp[SEARCH_MAX - 1] = '\0';
   if (!gfx_input_filename("Search", "Find:", tmp, SEARCH_MAX))
     return;
   strncpy(g_search_pat, tmp, SEARCH_MAX);
+  g_search_pat[SEARCH_MAX - 1] = '\0';
   editor_search_loop();
+}
+
+/* Replace the patlen bytes at pos with g_replace_str.  Assumes the gap
+   ops are done by the caller's snapshot policy.  Returns the number of
+   replacement bytes actually written. */
+static int do_one_replace(int pos, int patlen, const char *rep, int replen) {
+  gb_move(&g_buf, pos);
+  for (int i = 0; i < patlen; i++)
+    gb_delete(&g_buf);
+  int inserted = 0;
+  for (int i = 0; i < replen; i++) {
+    if (!gb_insert(&g_buf, rep[i]))
+      break;
+    inserted++;
+  }
+  rebuild_lines(&g_buf);
+  g_modified = 1;
+  return inserted;
+}
+
+/* Replace every match in the file as a single undo step. */
+static int replace_all(int patlen, int replen) {
+  undo_checkpoint(UK_OTHER);
+  int from = 0, count = 0;
+  for (;;) {
+    int pos = buf_find(from, g_search_pat, patlen);
+    if (pos < 0)
+      break;
+    int inserted = do_one_replace(pos, patlen, g_replace_str, replen);
+    from = pos + inserted;
+    count++;
+    if (g_gb_oom)
+      break;
+  }
+  cursor_pos = 0;
+  cursor_sync_pos();
+  return count;
 }
 
 static void editor_search_replace(void) {
   char tmp_pat[SEARCH_MAX], tmp_rep[SEARCH_MAX];
   strncpy(tmp_pat, g_search_pat, SEARCH_MAX);
+  tmp_pat[SEARCH_MAX - 1] = '\0';
   strncpy(tmp_rep, g_replace_str, SEARCH_MAX);
+  tmp_rep[SEARCH_MAX - 1] = '\0';
   if (!gfx_input_filename("Search", "Find:", tmp_pat, SEARCH_MAX))
     return;
   if (!gfx_input_filename("Replace", "Replace with:", tmp_rep, SEARCH_MAX))
     return;
   strncpy(g_search_pat, tmp_pat, SEARCH_MAX);
+  g_search_pat[SEARCH_MAX - 1] = '\0';
   strncpy(g_replace_str, tmp_rep, SEARCH_MAX);
+  g_replace_str[SEARCH_MAX - 1] = '\0';
 
   int patlen = (int)strlen(g_search_pat);
   int replen = (int)strlen(g_replace_str);
@@ -964,20 +700,30 @@ static void editor_search_replace(void) {
     return;
 
   int replaced = 0;
-  int search_from = 0; /* always advance forward, never re-scan replaced text */
+
+  /* Interactive stepping from the cursor, wrapping once through the top. */
+  int origin = cursor_pos;
+  int wrapped = 0;
+  int from = origin;
 
   while (any_key_pressed())
     msleep(20);
 
   for (;;) {
-    int pos = buf_find(search_from, g_search_pat, patlen);
-    if (pos < 0)
-      break;
+    int pos = buf_find(from, g_search_pat, patlen);
+    if (pos < 0 || (wrapped && pos >= origin)) {
+      if (!wrapped) {
+        wrapped = 1;
+        from = 0;
+        continue;
+      }
+      break; /* whole file scanned */
+    }
 
     search_select(pos, pos + patlen);
     scroll_to_cursor();
     render_all();
-    search_draw_status("Enter:replace  Tab:skip  Esc:done");
+    search_status_hint("Enter:replace  Tab:skip  A:all");
 
     while (!any_key_pressed()) {
       msleep(16);
@@ -987,30 +733,31 @@ static void editor_search_replace(void) {
     if (isKeyPressed(KEY_NSPIRE_ESC)) {
       while (any_key_pressed())
         msleep(20);
-      sel_clear();
+      break;
+    } else if (isKeyPressed(KEY_NSPIRE_A)) {
+      while (any_key_pressed())
+        msleep(20);
+      replaced += replace_all(patlen, replen);
       break;
     } else if (isKeyPressed(KEY_NSPIRE_ENTER) ||
                isKeyPressed(KEY_NSPIRE_CLICK)) {
       while (any_key_pressed())
         msleep(20);
-      undo_push();
-      gb_move(&g_buf, pos);
-      for (int i = 0; i < patlen; i++)
-        gb_delete(&g_buf);
-      for (int i = 0; i < replen; i++)
-        gb_insert(&g_buf, g_replace_str[i]);
-      cursor_pos = pos + replen;
-      rebuild_lines(&g_buf);
+      undo_checkpoint(UK_OTHER);
+      int inserted = do_one_replace(pos, patlen, g_replace_str, replen);
+      cursor_pos = pos + inserted;
       cursor_sync_pos();
-      g_modified = 1;
       sel_clear();
       replaced++;
-      search_from = pos + replen;
+      /* A replacement shifts everything after pos by this delta. */
+      int delta = inserted - patlen;
+      if (wrapped)
+        origin += delta;
+      from = pos + inserted;
     } else if (isKeyPressed(KEY_NSPIRE_TAB)) {
       while (any_key_pressed())
         msleep(20);
-      sel_clear();
-      search_from = pos + patlen;
+      from = pos + patlen;
     } else {
       msleep(20);
       continue;
@@ -1019,6 +766,7 @@ static void editor_search_replace(void) {
   }
 
   sel_clear();
+  render_all();
   char msg[48];
   snprintf(msg, sizeof(msg), "Replaced %d occurrence(s).", replaced);
   const char *body[1] = {msg};
@@ -1080,7 +828,10 @@ static void render_editor_core(void) {
         continue;
 
       extract_line(row);
-      for (int col = 0; col < ll; col++) {
+      /* extract_line truncates to the scratch buffer size; never read
+         line_scratch beyond what was actually extracted. */
+      int avail = (int)strlen(line_scratch);
+      for (int col = 0; col < avail; col++) {
         int buf_pos = row_start + col;
         if (buf_pos < lo || buf_pos >= hi)
           continue;
@@ -1125,8 +876,9 @@ static void render_editor_core(void) {
       fname = fname ? fname + 1 : g_filepath;
     }
 
-    snprintf(status, sizeof(status), " %s%s  Ln %d/%d  Col %d", fname,
-             g_modified ? "*" : "", cursor_row + 1, num_lines, cursor_col + 1);
+    snprintf(status, sizeof(status), " %s%s%s  Ln %d/%d  Col %d  %s", fname,
+             g_modified ? "*" : "", g_readonly ? " [RO]" : "", cursor_row + 1,
+             num_lines, cursor_col + 1, g_crlf ? "CRLF" : "LF");
     gfx_drawstr_clipped(0, sy + 1, status,
                         g_modified ? C_MODIFIED : C_STATUS_FG, C_STATUS_BG,
                         GFX_W);
@@ -1142,45 +894,7 @@ static void render_all(void) {
  * Keyboard input
  * ================================================================ */
 
-#define KEYMAP_SIZE 55
-
-typedef struct {
-  t_key key;
-  char normal;
-  char shifted;
-  char ctrl;
-} KeyMap;
-
-static const KeyMap keymap[KEYMAP_SIZE] = {
-    {KEY_NSPIRE_A, 'a', 'A', 0},           {KEY_NSPIRE_B, 'b', 'B', 0},
-    {KEY_NSPIRE_C, 'c', 'C', 0},           {KEY_NSPIRE_D, 'd', 'D', 0},
-    {KEY_NSPIRE_E, 'e', 'E', 0},           {KEY_NSPIRE_F, 'f', 'F', 0},
-    {KEY_NSPIRE_G, 'g', 'G', 0},           {KEY_NSPIRE_H, 'h', 'H', 0},
-    {KEY_NSPIRE_I, 'i', 'I', 0},           {KEY_NSPIRE_J, 'j', 'J', 0},
-    {KEY_NSPIRE_K, 'k', 'K', 0},           {KEY_NSPIRE_L, 'l', 'L', 0},
-    {KEY_NSPIRE_M, 'm', 'M', 0},           {KEY_NSPIRE_N, 'n', 'N', 0},
-    {KEY_NSPIRE_O, 'o', 'O', 0},           {KEY_NSPIRE_P, 'p', 'P', 0},
-    {KEY_NSPIRE_Q, 'q', 'Q', 0},           {KEY_NSPIRE_R, 'r', 'R', 0},
-    {KEY_NSPIRE_S, 's', 'S', 0},           {KEY_NSPIRE_T, 't', 'T', 0},
-    {KEY_NSPIRE_U, 'u', 'U', 0},           {KEY_NSPIRE_V, 'v', 'V', 0},
-    {KEY_NSPIRE_W, 'w', 'W', 0},           {KEY_NSPIRE_X, 'x', 'X', 0},
-    {KEY_NSPIRE_Y, 'y', 'Y', 0},           {KEY_NSPIRE_Z, 'z', 'Z', 0},
-    {KEY_NSPIRE_0, '0', ')', 0},           {KEY_NSPIRE_1, '1', '!', 0},
-    {KEY_NSPIRE_2, '2', '@', 0},           {KEY_NSPIRE_3, '3', '#', 0},
-    {KEY_NSPIRE_4, '4', '$', 0},           {KEY_NSPIRE_5, '5', '%', 0},
-    {KEY_NSPIRE_6, '6', '^', 0},           {KEY_NSPIRE_7, '7', '&', 0},
-    {KEY_NSPIRE_8, '8', '*', 0},           {KEY_NSPIRE_9, '9', '(', 0},
-    {KEY_NSPIRE_COMMA, ',', '<', 0},       {KEY_NSPIRE_PERIOD, '.', ':', 0},
-    {KEY_NSPIRE_COLON, ':', ';', 0},       {KEY_NSPIRE_DIVIDE, '/', '?', 0},
-    {KEY_NSPIRE_MINUS, '-', ';', 0},       {KEY_NSPIRE_PLUS, '+', '=', 0},
-    {KEY_NSPIRE_LP, '(', '[', '{'},        {KEY_NSPIRE_RP, ')', ']', '}'},
-    {KEY_NSPIRE_SPACE, ' ', ' ', 0},       {KEY_NSPIRE_EXP, '^', '~', 0},
-    {KEY_NSPIRE_BAR, '|', '\\', 0},        {KEY_NSPIRE_QUOTE, '"', '"', 0},
-    {KEY_NSPIRE_APOSTROPHE, '\'', '`', 0}, {KEY_NSPIRE_MULTIPLY, '*', '*', 0},
-    {KEY_NSPIRE_EQU, '=', '+', 0},         {KEY_NSPIRE_NEGATIVE, ';', '~', 0},
-    {KEY_NSPIRE_GTHAN, '>', ',', 0},       {KEY_NSPIRE_LTHAN, '<', '{', 0},
-    {KEY_NSPIRE_QUES, '?', '?', 0},
-};
+/* Character key table lives in gfx.c (shared with the input dialogs). */
 
 #define ACT_NONE (-1)
 #define ACT_ENTER (-2)
@@ -1233,11 +947,35 @@ static const KeyMap keymap[KEYMAP_SIZE] = {
 #define ACT_SYSCALL_CATALOG (-47)
 #define ACT_BS_WORD (-48)
 #define ACT_DEL_WORD (-49)
+#define ACT_UNTAB (-50)
 
-static int last_action = ACT_NONE;
-static int repeat_timer = 0;
-#define REPEAT_DELAY 18
-#define REPEAT_RATE 4
+/* Actions that modify the buffer (or open a picker that inserts). */
+static int act_is_edit(int act) {
+  if (act > 0)
+    return 1; /* printable character insert */
+  switch (act) {
+  case ACT_ENTER:
+  case ACT_BS:
+  case ACT_DEL:
+  case ACT_BS_WORD:
+  case ACT_DEL_WORD:
+  case ACT_TAB:
+  case ACT_UNTAB:
+  case ACT_CUT:
+  case ACT_PASTE:
+  case ACT_UNDO:
+  case ACT_REDO:
+  case ACT_REPLACE:
+  case ACT_CHARMAP:
+  case ACT_CATALOG:
+  case ACT_SYSCALL_CATALOG:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+static GfxRepeat g_key_repeat = {ACT_NONE, 0};
 
 static int poll_key(void) {
   int shift = isKeyPressed(KEY_NSPIRE_SHIFT);
@@ -1248,7 +986,7 @@ static int poll_key(void) {
   if (isKeyPressed(KEY_NSPIRE_ESC))
     return ACT_ESC;
   if (isKeyPressed(KEY_NSPIRE_TAB))
-    return ACT_TAB;
+    return shift ? ACT_UNTAB : ACT_TAB;
 
   if (isKeyPressed(KEY_NSPIRE_LEFT)) {
     if (shift && ctrl)
@@ -1296,6 +1034,13 @@ static int poll_key(void) {
   }
   if (isKeyPressed(KEY_NSPIRE_MENU) && ctrl)
     return ACT_FILE_BOT;
+
+  /* The Nspire has no End key: Doc jumps to end of line. */
+  if (isKeyPressed(KEY_NSPIRE_DOC)) {
+    if (shift)
+      return ACT_SEL_END;
+    return ACT_END;
+  }
 
   if (isKeyPressed(KEY_NSPIRE_DEL)) {
     if (ctrl && shift)
@@ -1348,14 +1093,15 @@ static int poll_key(void) {
     return ACT_CATALOG;
   }
 
-  for (int i = 0; i < KEYMAP_SIZE; i++) {
-    if (!isKeyPressed(keymap[i].key))
+  for (int i = 0; i < gfx_char_keymap_size; i++) {
+    if (!isKeyPressed(gfx_char_keymap[i].key))
       continue;
     if (ctrl)
-      return keymap[i].ctrl ? (unsigned char)keymap[i].ctrl : ACT_NONE;
+      return gfx_char_keymap[i].ctrl ? (unsigned char)gfx_char_keymap[i].ctrl
+                                     : ACT_NONE;
     if (shift)
-      return (unsigned char)keymap[i].shifted;
-    return (unsigned char)keymap[i].normal;
+      return (unsigned char)gfx_char_keymap[i].shifted;
+    return (unsigned char)gfx_char_keymap[i].normal;
   }
   return ACT_NONE;
 }
@@ -1365,20 +1111,23 @@ static int poll_key(void) {
  * ================================================================ */
 
 static void do_insert_char(char c) {
-  undo_push();
+  int wordy = (isalnum((unsigned char)c) || c == '_');
+  undo_checkpoint(UK_INSERT);
   if (sel_active_flag())
     sel_delete_region();
 
   gb_move(&g_buf, cursor_pos);
-  gb_insert(&g_buf, c);
-  cursor_pos++;
+  if (gb_insert(&g_buf, c))
+    cursor_pos++;
   rebuild_lines(&g_buf);
   cursor_sync_pos();
   g_modified = 1;
+  if (!wordy)
+    undo_break(); /* whitespace / punctuation ends the typing group */
 }
 
 static void do_enter(void) {
-  undo_push();
+  undo_checkpoint(UK_OTHER);
   if (sel_active_flag())
     sel_delete_region();
 
@@ -1400,14 +1149,15 @@ static void do_enter(void) {
   }
 
   gb_move(&g_buf, cursor_pos);
-  gb_insert(&g_buf, '\n');
-  cursor_pos++;
+  if (gb_insert(&g_buf, '\n'))
+    cursor_pos++;
 
   int i;
   for (i = 0; i < indent; i++) {
     /* Safe to read from line_start + i because it is strictly before the
      * insertion point */
-    gb_insert(&g_buf, gb_get(&g_buf, line_start + i));
+    if (!gb_insert(&g_buf, gb_get(&g_buf, line_start + i)))
+      break;
     cursor_pos++;
   }
 
@@ -1418,13 +1168,13 @@ static void do_enter(void) {
 
 static void do_backspace(void) {
   if (sel_active_flag()) {
-    undo_push();
+    undo_checkpoint(UK_OTHER);
     sel_delete_region();
     return;
   }
   if (cursor_pos == 0)
     return;
-  undo_push();
+  undo_checkpoint(UK_DELETE);
   gb_move(&g_buf, cursor_pos);
   gb_backspace(&g_buf);
   cursor_pos--;
@@ -1435,13 +1185,13 @@ static void do_backspace(void) {
 
 static void do_delete(void) {
   if (sel_active_flag()) {
-    undo_push();
+    undo_checkpoint(UK_OTHER);
     sel_delete_region();
     return;
   }
   if (cursor_pos >= gb_len(&g_buf))
     return;
-  undo_push();
+  undo_checkpoint(UK_DELETE);
   gb_move(&g_buf, cursor_pos);
   gb_delete(&g_buf);
   rebuild_lines(&g_buf);
@@ -1449,18 +1199,108 @@ static void do_delete(void) {
   g_modified = 1;
 }
 
+/* Indent (outdent=0) or outdent (outdent=1) every line touched by the
+   current selection by one tab width, keeping the whole block selected. */
+static void indent_selection(int outdent) {
+  int tw = g_settings.tab_width;
+  int lo = sel_lo(), hi = sel_hi();
+
+  int r0 = 0, r1 = 0;
+  for (int r = 0; r < num_lines; r++) {
+    if (line_starts[r] <= lo)
+      r0 = r;
+    if (line_starts[r] <= hi)
+      r1 = r;
+  }
+  /* If the selection ends exactly at a line start, that trailing line is
+     not really included. */
+  if (r1 > r0 && line_starts[r1] == hi)
+    r1--;
+
+  undo_checkpoint(UK_OTHER);
+  for (int r = r0; r <= r1; r++) {
+    int start = line_starts[r];
+    if (outdent) {
+      int ll = line_len(&g_buf, r);
+      int rem = 0;
+      if (ll > 0 && gb_get(&g_buf, start) == '\t') {
+        rem = 1;
+      } else {
+        while (rem < tw && rem < ll && gb_get(&g_buf, start + rem) == ' ')
+          rem++;
+      }
+      if (rem > 0) {
+        gb_move(&g_buf, start);
+        for (int i = 0; i < rem; i++)
+          gb_delete(&g_buf);
+      }
+    } else {
+      gb_move(&g_buf, start);
+      for (int i = 0; i < tw; i++)
+        gb_insert(&g_buf, ' ');
+    }
+    rebuild_lines(&g_buf);
+  }
+
+  /* Re-select the whole affected block. */
+  sel_anchor = line_starts[r0];
+  sel_active = line_starts[r1] + line_len(&g_buf, r1);
+  cursor_pos = sel_active;
+  cursor_sync_pos();
+  g_modified = 1;
+}
+
 static void do_tab(void) {
-  undo_push();
-  if (sel_active_flag())
-    sel_delete_region();
-  for (int i = 0; i < g_settings.tab_width; i++) {
-    gb_move(&g_buf, cursor_pos);
-    gb_insert(&g_buf, ' ');
+  if (sel_active_flag()) {
+    indent_selection(0);
+    return;
+  }
+  undo_checkpoint(UK_OTHER);
+  /* Align to the next tab stop rather than always inserting tab_width. */
+  int tw = g_settings.tab_width;
+  int n = tw - (cursor_col % tw);
+  if (n <= 0)
+    n = tw;
+  gb_move(&g_buf, cursor_pos);
+  for (int i = 0; i < n; i++) {
+    if (!gb_insert(&g_buf, ' '))
+      break;
     cursor_pos++;
   }
   rebuild_lines(&g_buf);
   cursor_sync_pos();
   g_modified = 1;
+}
+
+static void do_untab(void) {
+  if (sel_active_flag()) {
+    indent_selection(1);
+    return;
+  }
+  /* Outdent the current line. */
+  undo_checkpoint(UK_OTHER);
+  int tw = g_settings.tab_width;
+  int start = line_starts[cursor_row];
+  int ll = line_len(&g_buf, cursor_row);
+  int rem = 0;
+  if (ll > 0 && gb_get(&g_buf, start) == '\t') {
+    rem = 1;
+  } else {
+    while (rem < tw && rem < ll && gb_get(&g_buf, start + rem) == ' ')
+      rem++;
+  }
+  if (rem > 0) {
+    gb_move(&g_buf, start);
+    for (int i = 0; i < rem; i++)
+      gb_delete(&g_buf);
+    rebuild_lines(&g_buf);
+    if (cursor_col >= rem)
+      cursor_col -= rem;
+    else
+      cursor_col = 0;
+    cursor_sync_rowcol();
+    g_modified = 1;
+  }
 }
 
 static void do_left(void) {
@@ -1490,17 +1330,33 @@ static void do_right(void) {
 }
 
 static void do_up(void) {
-  sel_clear();
+  /* Collapse a selection to its top edge first, like Left does. */
+  if (sel_active_flag()) {
+    cursor_pos = sel_lo();
+    sel_clear();
+    cursor_sync_pos();
+    cursor_goal_col = cursor_col;
+    return;
+  }
   if (cursor_row > 0) {
     cursor_row--;
+    cursor_col = cursor_goal_col;
     cursor_sync_rowcol();
   }
 }
 
 static void do_down(void) {
-  sel_clear();
+  /* Collapse a selection to its bottom edge first, like Right does. */
+  if (sel_active_flag()) {
+    cursor_pos = sel_hi();
+    sel_clear();
+    cursor_sync_pos();
+    cursor_goal_col = cursor_col;
+    return;
+  }
   if (cursor_row < num_lines - 1) {
     cursor_row++;
+    cursor_col = cursor_goal_col;
     cursor_sync_rowcol();
   }
 }
@@ -1522,6 +1378,7 @@ static void do_pgup(void) {
   cursor_row -= ROWS_VIS;
   if (cursor_row < 0)
     cursor_row = 0;
+  cursor_col = cursor_goal_col;
   cursor_sync_rowcol();
 }
 
@@ -1530,6 +1387,7 @@ static void do_pgdn(void) {
   cursor_row += ROWS_VIS;
   if (cursor_row >= num_lines)
     cursor_row = num_lines - 1;
+  cursor_col = cursor_goal_col;
   cursor_sync_rowcol();
 }
 
@@ -1573,13 +1431,13 @@ static void do_word_right(void) {
 
 static void do_bs_word(void) {
   if (sel_active_flag()) {
-    undo_push();
+    undo_checkpoint(UK_OTHER);
     sel_delete_region();
     return;
   }
   if (cursor_pos == 0)
     return;
-  undo_push();
+  undo_checkpoint(UK_OTHER);
   int old_pos = cursor_pos;
 
   /* Find the start of the previous word */
@@ -1608,14 +1466,14 @@ static void do_bs_word(void) {
 
 static void do_del_word(void) {
   if (sel_active_flag()) {
-    undo_push();
+    undo_checkpoint(UK_OTHER);
     sel_delete_region();
     return;
   }
   int len = gb_len(&g_buf);
   if (cursor_pos >= len)
     return;
-  undo_push();
+  undo_checkpoint(UK_OTHER);
   int target_pos = cursor_pos;
 
   /* Find the end of the next word */
@@ -1677,6 +1535,7 @@ static void do_sel_up(void) {
   int old = cursor_pos;
   if (cursor_row > 0) {
     cursor_row--;
+    cursor_col = cursor_goal_col;
     cursor_sync_rowcol();
   }
   sel_extend(old);
@@ -1685,6 +1544,7 @@ static void do_sel_down(void) {
   int old = cursor_pos;
   if (cursor_row < num_lines - 1) {
     cursor_row++;
+    cursor_col = cursor_goal_col;
     cursor_sync_rowcol();
   }
   sel_extend(old);
@@ -1905,223 +1765,6 @@ static char charmap_pick(void) {
  * Returns the selected mnemonic string, or NULL if cancelled.
  * ================================================================ */
 
-/* ================================================================
- * ARM Mnemonic database
- * Each entry carries: lowercase name, argument signature, description.
- * ================================================================ */
-typedef struct {
-  const char *name;  /* lowercase, inserted on Enter   */
-  const char *args;  /* short signature shown on row   */
-  const char *desc;  /* full description for popup     */
-  const char *flags; /* CPSR flag effects (N,Z,C,V)    */
-} MnemInfo;
-
-static const MnemInfo db_move[] = {
-    {"mov", "Rd, Op2", "Move: Rd = Op2.",
-     "With 'S': updates N,Z, C from shifter, V unchanged."},
-    {"mvn", "Rd, Op2", "Move NOT: Rd = ~Op2.",
-     "With 'S': updates N,Z, C from shifter, V unchanged."},
-    {"mrs", "Rd, cpsr|spsr", "Move PSR to Register: Rd = CPSR or SPSR.",
-     "No flags modified."},
-    {"msr", "cpsr|spsr_<flg>, Op",
-     "Move Register to PSR: CPSR/SPSR = Rm or #imm.",
-     "Updates CPSR flags directly if fields include 'f'."},
-};
-static const MnemInfo db_arith[] = {
-    {"add", "Rd, Rn, Op2", "Add: Rd = Rn + Op2.", "With 'S': updates N,Z,C,V."},
-    {"adc", "Rd, Rn, Op2", "Add with Carry: Rd = Rn + Op2 + C.",
-     "With 'S': updates N,Z,C,V."},
-    {"sub", "Rd, Rn, Op2", "Subtract: Rd = Rn - Op2.",
-     "With 'S': updates N,Z,C,V."},
-    {"sbc", "Rd, Rn, Op2", "Subtract with Carry: Rd = Rn - Op2 - NOT(C).",
-     "With 'S': updates N,Z,C,V."},
-    {"rsb", "Rd, Rn, Op2", "Reverse Subtract: Rd = Op2 - Rn.",
-     "With 'S': updates N,Z,C,V."},
-    {"rsc", "Rd, Rn, Op2",
-     "Reverse Subtract with Carry: Rd = Op2 - Rn - NOT(C).",
-     "With 'S': updates N,Z,C,V."},
-    {"mul", "Rd, Rm, Rs", "Multiply (32-bit): Rd = Rm * Rs.",
-     "With 'S': updates N,Z. C,V unpredictable."},
-    {"mla", "Rd, Rm, Rs, Rn", "Multiply Accumulate: Rd = (Rm * Rs) + Rn.",
-     "With 'S': updates N,Z. C,V unpredictable."},
-    {"umull", "RdLo, RdHi, Rm, Rs",
-     "Unsigned Long Multiply: {RdHi,RdLo} = Rm * Rs.",
-     "With 'S': updates N,Z. C,V unpredictable."},
-    {"umlal", "RdLo, RdHi, Rm, Rs",
-     "Unsigned Long Multiply Accum: {RdHi,RdLo} += Rm * Rs.",
-     "With 'S': updates N,Z. C,V unpredictable."},
-    {"smull", "RdLo, RdHi, Rm, Rs",
-     "Signed Long Multiply: {RdHi,RdLo} = Rm * Rs.",
-     "With 'S': updates N,Z. C,V unpredictable."},
-    {"smlal", "RdLo, RdHi, Rm, Rs",
-     "Signed Long Multiply Accum: {RdHi,RdLo} += Rm * Rs.",
-     "With 'S': updates N,Z. C,V unpredictable."},
-    {"clz", "Rd, Rm", "Count Leading Zeros: Rd = number of 0s at MSB of Rm.",
-     "No flags modified."},
-};
-static const MnemInfo db_logic[] = {
-    {"and", "Rd, Rn, Op2", "Bitwise AND: Rd = Rn & Op2.",
-     "With 'S': updates N,Z, C from shifter, V unchanged."},
-    {"orr", "Rd, Rn, Op2", "Bitwise OR: Rd = Rn | Op2.",
-     "With 'S': updates N,Z, C from shifter, V unchanged."},
-    {"eor", "Rd, Rn, Op2", "Bitwise Exclusive OR: Rd = Rn ^ Op2.",
-     "With 'S': updates N,Z, C from shifter, V unchanged."},
-    {"bic", "Rd, Rn, Op2", "Bit Clear: Rd = Rn & ~Op2.",
-     "With 'S': updates N,Z, C from shifter, V unchanged."},
-};
-static const MnemInfo db_cmp[] = {
-    {"cmp", "Rn, Op2", "Compare: computes Rn - Op2.",
-     "Always updates N,Z,C,V."},
-    {"cmn", "Rn, Op2", "Compare Negative: computes Rn + Op2.",
-     "Always updates N,Z,C,V."},
-    {"tst", "Rn, Op2", "Test: computes Rn & Op2.",
-     "Always updates N,Z, C from shifter, V unchanged."},
-    {"teq", "Rn, Op2", "Test Equivalence: computes Rn ^ Op2.",
-     "Always updates N,Z, C from shifter, V unchanged."},
-};
-static const MnemInfo db_branch[] = {
-    {"b", "label", "Branch: PC = label.", "No flags modified."},
-    {"bl", "label", "Branch with Link: LR = PC + 4, PC = label.",
-     "No flags modified."},
-    {"bx", "Rm", "Branch and Exchange: PC = Rm, switch to Thumb if Rm[0]=1.",
-     "Updates CPSR T-bit if switching modes."},
-};
-static const MnemInfo db_ldr[] = {
-    {"ldr", "Rd, [Rn, Op]", "Load Word: Rd = [mem32].", "No flags modified."},
-    {"ldrb", "Rd, [Rn, Op]", "Load Byte: Rd = ZeroExt([mem8]).",
-     "No flags modified."},
-    {"ldrh", "Rd, [Rn, Op]", "Load Halfword: Rd = ZeroExt([mem16]).",
-     "No flags modified."},
-    {"ldrsb", "Rd, [Rn, Op]", "Load Signed Byte: Rd = SignExt([mem8]).",
-     "No flags modified."},
-    {"ldrsh", "Rd, [Rn, Op]", "Load Signed Halfword: Rd = SignExt([mem16]).",
-     "No flags modified."},
-    {"ldrt", "Rd, [Rn]", "Load Word Unprivileged: Rd = [mem32].",
-     "No flags modified."},
-    {"ldrbt", "Rd, [Rn]", "Load Byte Unprivileged: Rd = ZeroExt([mem8]).",
-     "No flags modified."},
-};
-static const MnemInfo db_str[] = {
-    {"str", "Rd, [Rn, Op]", "Store Word: [mem32] = Rd.", "No flags modified."},
-    {"strb", "Rd, [Rn, Op]", "Store Byte: [mem8] = Rd[7:0].",
-     "No flags modified."},
-    {"strh", "Rd, [Rn, Op]", "Store Halfword: [mem16] = Rd[15:0].",
-     "No flags modified."},
-    {"strt", "Rd, [Rn]", "Store Word Unprivileged: [mem32] = Rd.",
-     "No flags modified."},
-    {"strbt", "Rd, [Rn]", "Store Byte Unprivileged: [mem8] = Rd[7:0].",
-     "No flags modified."},
-};
-static const MnemInfo db_ldm[] = {
-    {"ldm", "Rn{!}, reglist",
-     "Load Multiple: load registers from [Rn] (default IA).",
-     "No flags modified (unless PC loaded with ^: restores CPSR)."},
-    {"ldmia", "Rn{!}, reglist", "Load Multiple, Increment After (same as LDM).",
-     "No flags modified."},
-    {"ldmib", "Rn{!}, reglist", "Load Multiple, Increment Before.",
-     "No flags modified."},
-    {"ldmda", "Rn{!}, reglist", "Load Multiple, Decrement After.",
-     "No flags modified."},
-    {"ldmdb", "Rn{!}, reglist", "Load Multiple, Decrement Before.",
-     "No flags modified."},
-    {"ldmfd", "Rn{!}, reglist",
-     "Load Multiple, Full Descending (alias for LDMIA).", "No flags modified."},
-    {"ldmed", "Rn{!}, reglist",
-     "Load Multiple, Empty Descending (alias for LDMIB).",
-     "No flags modified."},
-    {"ldmfa", "Rn{!}, reglist",
-     "Load Multiple, Full Ascending (alias for LDMDA).", "No flags modified."},
-    {"ldmea", "Rn{!}, reglist",
-     "Load Multiple, Empty Ascending (alias for LDMDB).", "No flags modified."},
-};
-static const MnemInfo db_stm[] = {
-    {"stm", "Rn{!}, reglist",
-     "Store Multiple: store registers to [Rn] (default IA).",
-     "No flags modified."},
-    {"stmia", "Rn{!}, reglist",
-     "Store Multiple, Increment After (same as STM).", "No flags modified."},
-    {"stmib", "Rn{!}, reglist", "Store Multiple, Increment Before.",
-     "No flags modified."},
-    {"stmda", "Rn{!}, reglist", "Store Multiple, Decrement After.",
-     "No flags modified."},
-    {"stmdb", "Rn{!}, reglist", "Store Multiple, Decrement Before.",
-     "No flags modified."},
-    {"stmfd", "Rn{!}, reglist",
-     "Store Multiple, Full Descending (alias for STMDB).",
-     "No flags modified."},
-    {"stmed", "Rn{!}, reglist",
-     "Store Multiple, Empty Descending (alias for STMDA).",
-     "No flags modified."},
-    {"stmfa", "Rn{!}, reglist",
-     "Store Multiple, Full Ascending (alias for STMIB).", "No flags modified."},
-    {"stmea", "Rn{!}, reglist",
-     "Store Multiple, Empty Ascending (alias for STMIA).",
-     "No flags modified."},
-};
-static const MnemInfo db_cop[] = {
-    {"mcr", "cp, op, Rd, CRn, CRm, op2",
-     "Move to Coprocessor from ARM Register.", "No ARM flags modified."},
-    {"mrc", "cp, op, Rd, CRn, CRm, op2",
-     "Move to ARM Register from Coprocessor.",
-     "If Rd=R15, updates ARM N,Z,C,V flags."},
-    {"swp", "Rd, Rm, [Rn]", "Swap Word: atomic memory read and write.",
-     "No flags modified."},
-    {"swpb", "Rd, Rm, [Rn]", "Swap Byte: atomic memory read and write.",
-     "No flags modified."},
-};
-static const MnemInfo db_misc[] = {
-    {"swi", "#imm", "Software Interrupt (legacy): triggers SVC exception.",
-     "No flags modified."},
-    {"svc", "#imm", "Supervisor Call: triggers SVC exception.",
-     "No flags modified."},
-    {"adr", "Rd, label", "Load PC-relative address into Rd.",
-     "No flags modified."},
-};
-static const MnemInfo db_shifts[] = {
-    {"lsl", "Rm, #n|Rs", "Logical Shift Left: Rd = Rm << Op.",
-     "Used as Op2: updates C. With 'S': updates N,Z,C."},
-    {"lsr", "Rm, #n|Rs", "Logical Shift Right: Rd = Rm >> Op.",
-     "Used as Op2: updates C. With 'S': updates N,Z,C."},
-    {"asr", "Rm, #n|Rs",
-     "Arithmetic Shift Right: Rd = Rm >> Op (sign-extended).",
-     "Used as Op2: updates C. With 'S': updates N,Z,C."},
-    {"ror", "Rm, #n|Rs", "Rotate Right: Rd = Rm rotated by Op.",
-     "Used as Op2: updates C. With 'S': updates N,Z,C."},
-    {"rrx", "Rm", "Rotate Right Extended: Rd = (C << 31) | (Rm >> 1).",
-     "Used as Op2: updates C. With 'S': updates N,Z,C."},
-};
-
-typedef struct {
-  const char *name;
-  const MnemInfo *mnems;
-  int count;
-  int expanded;
-} CatalogCat;
-
-#define NCATS 12
-static CatalogCat g_cats[NCATS];
-static int g_cats_init = 0;
-
-#define ASIZE(a) ((int)(sizeof(a) / sizeof((a)[0])))
-
-static void catalog_init_cats(void) {
-  if (g_cats_init)
-    return;
-  int i = 0;
-  g_cats[i++] = (CatalogCat){"Data Transfer", db_move, ASIZE(db_move), 1};
-  g_cats[i++] = (CatalogCat){"Arithmetic", db_arith, ASIZE(db_arith), 1};
-  g_cats[i++] = (CatalogCat){"Logic", db_logic, ASIZE(db_logic), 1};
-  g_cats[i++] = (CatalogCat){"Comparison", db_cmp, ASIZE(db_cmp), 1};
-  g_cats[i++] = (CatalogCat){"Branch", db_branch, ASIZE(db_branch), 1};
-  g_cats[i++] = (CatalogCat){"Load (single)", db_ldr, ASIZE(db_ldr), 1};
-  g_cats[i++] = (CatalogCat){"Store (single)", db_str, ASIZE(db_str), 1};
-  g_cats[i++] = (CatalogCat){"Load (multiple)", db_ldm, ASIZE(db_ldm), 0};
-  g_cats[i++] = (CatalogCat){"Store (multiple)", db_stm, ASIZE(db_stm), 0};
-  g_cats[i++] = (CatalogCat){"Coprocessor", db_cop, ASIZE(db_cop), 0};
-  g_cats[i++] = (CatalogCat){"Miscellaneous", db_misc, ASIZE(db_misc), 1};
-  g_cats[i++] = (CatalogCat){"Shift Operators", db_shifts, ASIZE(db_shifts), 1};
-  g_cats_init = 1;
-}
 
 #define CAT_MAX_ROWS 256
 
@@ -2404,694 +2047,6 @@ static const char *catalog_pick(void) {
   }
 }
 
-/* ================================================================
- * Ndless Syscall Catalog
- * ================================================================ */
-typedef struct {
-  const char *name;
-  int num;
-  const char *args;
-  const char *desc;
-} SyscallInfo;
-
-/* ================================================================
- * Ndless Syscall Catalog (Complete List)
- * ================================================================ */
-static const SyscallInfo db_syscalls[] = {
-    /* File I/O & Nucleus RTOS */
-    {"fopen", 0, "const char *path, const char *mode",
-     "Opens a file (Nucleus)."},
-    {"fread", 1, "void *ptr, size_t size, size_t count, NUC_FILE *stream",
-     "Reads data from a file."},
-    {"fwrite", 2, "void *ptr, size_t size, size_t count, NUC_FILE *stream",
-     "Writes data to a file."},
-    {"fclose", 3, "NUC_FILE *stream", "Closes an open file."},
-    {"fgets", 4, "char *str, int n, NUC_FILE *stream",
-     "Reads a string from a file."},
-    {"printf", 10, "const char *format, ...", "Prints formatted output."},
-    {"sprintf", 11, "char *str, const char *format, ...",
-     "Formats and stores characters."},
-    {"fprintf", 12, "FILE *stream, const char *format, ...",
-     "Prints formatted output to a file."},
-    {"TCT_Local_Control_Interrupts", 14, "int mask",
-     "Sets the interrupt mask."},
-    {"mkdir", 15, "const char *path, mode_t mode", "Creates a directory."},
-    {"rmdir", 16, "const char *path", "Removes a directory."},
-    {"chdir", 17, "const char *path", "Changes current working directory."},
-    {"stat", 18, "const char *path, struct nuc_stat *buf", "Gets file status."},
-    {"unlink", 19, "const char *path", "Deletes a file."},
-    {"rename", 20, "const char *oldname, const char *newname",
-     "Renames a file."},
-    {"TCC_Terminate_Task", 21, "NU_TASK *task", "Terminates a Nucleus task."},
-    {"puts", 22, "const char *str", "Writes a string to stdout."},
-    {"NU_Get_First", 23, "struct dstat *statobj, const char *pattern",
-     "Finds first file matching pattern."},
-    {"NU_Get_Next", 24, "struct dstat *statobj",
-     "Finds next file matching pattern."},
-    {"NU_Done", 25, "struct dstat *statobj", "Frees dstat structure elements."},
-    {"show_dialog_box2_", 30,
-     "int p1, const char *t, const char *m, const char **b",
-     "Shows a basic dialog box."},
-    {"_vsprintf", 32, "char *str, const char *format, va_list ap",
-     "Formatted output to string."},
-    {"fseek", 33, "NUC_FILE *stream, long offset, int whence",
-     "Sets file position indicator."},
-    {"NU_Current_Dir", 34, "const char *drive, char *path",
-     "Gets current working directory."},
-    {"read_unaligned_longword", 35, "const void *ptr",
-     "Reads 32-bit unaligned word."},
-    {"read_unaligned_word", 36, "const void *ptr",
-     "Reads 16-bit unaligned word."},
-    {"fgetc", 52, "FILE *stream", "Gets next character from file."},
-    {"NU_Set_Current_Dir", 53, "const char *name",
-     "Sets current working directory."},
-    {"fputc", 54, "int char, FILE *stream", "Writes character to file."},
-    {"freopen", 60, "const char *path, const char *mode, FILE *stream",
-     "Reopens a file stream."},
-    {"errno_addr", 61, "void", "Returns pointer to errno."},
-    {"ungetc", 65, "int char, FILE *stream",
-     "Pushes character back to stream."},
-    {"fflush", 69, "FILE *stream", "Flushes output buffer."},
-    {"remove", 70, "const char *filename", "Deletes a file."},
-    {"stdin", 71, "void", "Standard input stream."},
-    {"stdout", 72, "void", "Standard output stream."},
-    {"stderr", 73, "void", "Standard error stream."},
-    {"ferror", 74, "FILE *stream", "Tests error indicator on stream."},
-    {"TCC_Current_Task_Pointer", 88, "void",
-     "Returns pointer to current Nucleus task."},
-    {"ftell", 89, "NUC_FILE *stream", "Returns current file position."},
-    {"NU_Open", 90, "char *path, uint32_t flags, uint32_t mode",
-     "Opens a Nucleus file descriptor."},
-    {"NU_Close", 91, "PCFD fd", "Closes a Nucleus file descriptor."},
-    {"NU_Truncate", 92, "PCFD fd, long int size",
-     "Truncates a Nucleus file descriptor."},
-    {"_show_msgbox_2b", 93,
-     "int p1, const char *t, const char *m, const char *b1, ...",
-     "Message box with 2 buttons."},
-    {"_show_msgbox_3b", 94,
-     "int p1, const char *t, const char *m, const char *b1, ...",
-     "Message box with 3 buttons."},
-    {"opendir", 95, "const char *path", "Opens a directory stream."},
-    {"readdir", 96, "NUC_DIR *dirp", "Reads directory entry."},
-    {"closedir", 97, "NUC_DIR *dirp", "Closes directory stream."},
-
-    /* Strings, Memory & CTYPE */
-    {"malloc", 5, "size_t size", "Allocates memory."},
-    {"free", 6, "void *ptr", "Frees memory."},
-    {"memset", 7, "void *str, int c, size_t n", "Fills memory."},
-    {"memcpy", 8, "void *dest, const void *src, size_t n", "Copies memory."},
-    {"memcmp", 9, "const void *str1, const void *str2, size_t n",
-     "Compares memory."},
-    {"strcmp", 26, "const char *str1, const char *str2", "Compares strings."},
-    {"strcpy", 27, "char *dest, const char *src", "Copies string."},
-    {"strncat", 28, "char *dest, const char *src, size_t n",
-     "Concatenates string (max n)."},
-    {"strlen", 29, "const char *str", "Gets string length."},
-    {"strrchr", 31, "const char *str, int c", "Finds last occurrence of char."},
-    {"strncpy", 37, "char *dest, const char *src, size_t n",
-     "Copies string (max n)."},
-    {"isalpha", 38, "int c", "Checks if character is alphabetic."},
-    {"isascii", 39, "int c", "Checks if character is ASCII."},
-    {"isdigit", 40, "int c", "Checks if character is a digit."},
-    {"islower", 41, "int c", "Checks if character is lowercase."},
-    {"isprint", 42, "int c", "Checks if character is printable."},
-    {"isspace", 43, "int c", "Checks if character is whitespace."},
-    {"isupper", 44, "int c", "Checks if character is uppercase."},
-    {"isxdigit", 45, "int c", "Checks if character is hex digit."},
-    {"tolower", 46, "int c", "Converts character to lowercase."},
-    {"atoi", 47, "const char *str", "Converts string to integer."},
-    {"atof", 48, "const char *str", "Converts string to double."},
-    {"calloc", 49, "size_t nitems, size_t size",
-     "Allocates zero-initialized memory."},
-    {"realloc", 50, "void *ptr, size_t size", "Reallocates memory."},
-    {"strpbrk", 51, "const char *str1, const char *str2",
-     "Finds first matching character."},
-    {"memmove", 55, "void *dest, const void *src, size_t n",
-     "Moves memory block securely."},
-    {"memrev", 56, "void *str, size_t n", "Reverses a memory block."},
-    {"strchr", 57, "const char *str, int c", "Finds first occurrence of char."},
-    {"strncmp", 58, "const char *str1, const char *str2, size_t n",
-     "Compares strings (max n)."},
-    {"toupper", 62, "int c", "Converts character to uppercase."},
-    {"strtod", 63, "const char *str, char **endptr",
-     "Converts string to double."},
-    {"strtol", 64, "const char *str, char **endptr, int base",
-     "Converts string to long integer."},
-    {"strerror", 66, "int errnum", "Gets string describing error number."},
-    {"strcat", 67, "char *dest, const char *src", "Concatenates strings."},
-    {"strstr", 68, "const char *haystack, const char *needle",
-     "Finds substring."},
-    {"strtok", 200, "char *str, const char *delim", "Tokenizes a string."},
-    {"rand", 206, "void", "Returns a pseudo-random integer."},
-    {"srand", 207, "unsigned int seed", "Seeds the random number generator."},
-    {"strtoul", 208, "const char *str, char **endptr, int base",
-     "Converts string to unsigned long."},
-    {"sscanf", 266, "const char *str, const char *format, ...",
-     "Reads formatted input from string."},
-    {"snprintf", 332, "char *str, size_t size, const char *format, ...",
-     "Safe formatted output to string."},
-    {"_vprintf", 333, "const char *format, va_list ap",
-     "Formatted output to stdout."},
-    {"_vfprintf", 334, "FILE *stream, const char *format, va_list ap",
-     "Formatted output to file."},
-    {"_vsnprintf", 335,
-     "char *str, size_t size, const char *format, va_list ap",
-     "Safe formatted output to string."},
-
-    /* Zlib Compression */
-    {"adler32", 77, "uLong adler, const Bytef *buf, uInt len",
-     "Computes Adler-32 checksum."},
-    {"crc32", 78, "uLong crc, const Bytef *buf, uInt len",
-     "Computes CRC-32 checksum."},
-    {"crc32_combine", 79, "uLong crc1, uLong crc2, z_off_t len2",
-     "Combines two CRC-32 checksums."},
-    {"zlibVersion", 80, "void", "Returns zlib version string."},
-    {"zlibCompileFlags", 81, "void", "Returns zlib compile flags."},
-    {"deflateInit2_", 82, "z_streamp strm, int level, int method, ...",
-     "Initializes compression."},
-    {"deflate", 83, "z_streamp strm, int flush", "Compresses data."},
-    {"deflateEnd", 84, "z_streamp strm", "Ends compression."},
-    {"inflateInit2_", 85, "z_streamp strm, int windowBits, ...",
-     "Initializes decompression."},
-    {"inflate", 86, "z_streamp strm, int flush", "Decompresses data."},
-    {"inflateEnd", 87, "z_streamp strm", "Ends decompression."},
-
-    /* Hardware, Touchpad & Events */
-    {"touchpad_read", 75, "unsigned char p1, unsigned char p2, void *p3",
-     "Reads touchpad state."},
-    {"touchpad_write", 76, "unsigned char p1, unsigned char p2, void *p3",
-     "Writes touchpad state."},
-    {"keypad_type", 59, "void", "Returns the hardware keypad type."},
-    {"get_event", 261, "struct s_ns_event *event", "Gets next system event."},
-    {"send_key_event", 262,
-     "struct s_ns_event *event, unsigned short key, BOOL, BOOL",
-     "Sends a key event to OS."},
-    {"send_click_event", 263,
-     "struct s_ns_event *event, unsigned short, BOOL, BOOL",
-     "Sends a click event to OS."},
-    {"send_pad_event", 264,
-     "struct s_ns_event *event, unsigned short, BOOL, BOOL",
-     "Sends a touchpad event to OS."},
-    {"getcwd", 265, "char *buf, size_t size",
-     "Gets current working directory."},
-    {"read_nand", 336,
-     "void *dest, int size, int offset, int u, int max, void *cb",
-     "Reads raw NAND memory."},
-    {"write_nand", 337, "void *src, int size, unsigned int offset",
-     "Writes raw NAND memory."},
-    {"nand_erase_range", 338, "int start, int end",
-     "Erases a block of NAND memory."},
-
-    /* Lua C API */
-    {"luaL_register", 98,
-     "lua_State *L, const char *libname, const luaL_Reg *l",
-     "Registers C functions to Lua."},
-    {"luaL_checklstring", 99, "lua_State *L, int arg, size_t *l",
-     "Checks for string argument."},
-    {"luaL_error", 100, "lua_State *L, const char *fmt, ...",
-     "Raises Lua error."},
-    {"luaI_openlib", 101,
-     "lua_State *L, const char *libname, const luaL_Reg *l, int nup",
-     "Opens a Lua library."},
-    {"luaL_getmetafield", 102, "lua_State *L, int obj, const char *e",
-     "Pushes metafield onto stack."},
-    {"luaL_callmeta", 103, "lua_State *L, int obj, const char *e",
-     "Calls a metamethod."},
-    {"luaL_typerror", 104, "lua_State *L, int arg, const char *tname",
-     "Generates a type error."},
-    {"luaL_argerror", 105, "lua_State *L, int arg, const char *extramsg",
-     "Generates an arg error."},
-    {"luaL_optlstring", 106,
-     "lua_State *L, int arg, const char *def, size_t *l",
-     "Gets optional string arg."},
-    {"luaL_checknumber", 107, "lua_State *L, int arg",
-     "Checks for number arg."},
-    {"luaL_optnumber", 108, "lua_State *L, int arg, lua_Number def",
-     "Gets optional number arg."},
-    {"luaL_checkinteger", 109, "lua_State *L, int arg",
-     "Checks for integer arg."},
-    {"luaL_optinteger", 110, "lua_State *L, int arg, lua_Integer def",
-     "Gets optional integer arg."},
-    {"luaL_checkstack", 111, "lua_State *L, int sz, const char *msg",
-     "Grows stack size safely."},
-    {"luaL_checktype", 112, "lua_State *L, int arg, int t",
-     "Checks type of argument."},
-    {"luaL_checkany", 113, "lua_State *L, int arg",
-     "Checks if argument exists."},
-    {"luaL_newmetatable", 114, "lua_State *L, const char *tname",
-     "Creates a metatable."},
-    {"luaL_checkudata", 115, "lua_State *L, int arg, const char *tname",
-     "Checks userdata type."},
-    {"luaL_where", 116, "lua_State *L, int lvl",
-     "Pushes code location string."},
-    {"luaL_checkoption", 117,
-     "lua_State *L, int arg, const char *def, const char *const lst[]",
-     "Checks string against list."},
-    {"luaL_ref", 118, "lua_State *L, int t", "Creates a reference in table."},
-    {"luaL_unref", 119, "lua_State *L, int t, int ref",
-     "Releases a reference."},
-    {"luaL_loadfile", 120, "lua_State *L, const char *filename",
-     "Loads a Lua file as chunk."},
-    {"luaL_loadbuffer", 121,
-     "lua_State *L, const char *buff, size_t sz, const char *name",
-     "Loads buffer as chunk."},
-    {"luaL_loadstring", 122, "lua_State *L, const char *s",
-     "Loads string as chunk."},
-    {"luaL_newstate", 123, "void", "Creates new Lua state."},
-    {"luaL_gsub", 124,
-     "lua_State *L, const char *s, const char *p, const char *r",
-     "String substitution."},
-    {"luaL_findtable", 125,
-     "lua_State *L, int idx, const char *fname, int szhint",
-     "Finds/creates table."},
-    {"luaL_buffinit", 126, "lua_State *L, luaL_Buffer *B",
-     "Initializes string buffer."},
-    {"luaL_prepbuffer", 127, "luaL_Buffer *B", "Returns buffer memory ptr."},
-    {"luaL_addlstring", 128, "luaL_Buffer *B, const char *s, size_t l",
-     "Adds string to buffer."},
-    {"luaL_addstring", 129, "luaL_Buffer *B, const char *s",
-     "Adds C string to buffer."},
-    {"luaL_addvalue", 130, "luaL_Buffer *B", "Adds stack top to buffer."},
-    {"luaL_pushresult", 131, "luaL_Buffer *B", "Pushes buffer onto stack."},
-    {"lua_newstate", 132, "lua_Alloc f, void *ud",
-     "Creates state with custom allocator."},
-    {"lua_close", 133, "lua_State *L", "Destroys all Lua objects."},
-    {"lua_newthread", 134, "lua_State *L", "Creates a new thread/coroutine."},
-    {"lua_atpanic", 135, "lua_State *L, lua_CFunction panicf",
-     "Sets panic function."},
-    {"lua_gettop", 136, "lua_State *L", "Gets top index of stack."},
-    {"lua_settop", 137, "lua_State *L, int idx", "Sets top index of stack."},
-    {"lua_pushvalue", 138, "lua_State *L, int idx", "Copies value to top."},
-    {"lua_remove", 139, "lua_State *L, int idx", "Removes element at index."},
-    {"lua_insert", 140, "lua_State *L, int idx", "Moves top element to index."},
-    {"lua_replace", 141, "lua_State *L, int idx", "Replaces element at index."},
-    {"lua_checkstack", 142, "lua_State *L, int extra", "Ensures stack size."},
-    {"lua_xmove", 143, "lua_State *from, lua_State *to, int n",
-     "Moves values between threads."},
-    {"lua_isnumber", 144, "lua_State *L, int idx",
-     "Checks if value is number."},
-    {"lua_isstring", 145, "lua_State *L, int idx",
-     "Checks if value is string."},
-    {"lua_iscfunction", 146, "lua_State *L, int idx",
-     "Checks if value is C function."},
-    {"lua_isuserdata", 147, "lua_State *L, int idx",
-     "Checks if value is userdata."},
-    {"lua_type", 148, "lua_State *L, int idx", "Returns type of value."},
-    {"lua_typename", 149, "lua_State *L, int tp", "Returns type name."},
-    {"lua_equal", 150, "lua_State *L, int idx1, int idx2",
-     "Checks if values are equal."},
-    {"lua_rawequal", 151, "lua_State *L, int idx1, int idx2",
-     "Checks if values are raw equal."},
-    {"lua_lessthan", 152, "lua_State *L, int idx1, int idx2",
-     "Checks if value 1 < value 2."},
-    {"lua_tonumber", 153, "lua_State *L, int idx", "Converts value to number."},
-    {"lua_tointeger", 154, "lua_State *L, int idx",
-     "Converts value to integer."},
-    {"lua_toboolean", 155, "lua_State *L, int idx",
-     "Converts value to boolean."},
-    {"lua_tolstring", 156, "lua_State *L, int idx, size_t *len",
-     "Converts value to string."},
-    {"lua_objlen", 157, "lua_State *L, int idx", "Returns length of object."},
-    {"lua_tocfunction", 158, "lua_State *L, int idx",
-     "Converts value to C function."},
-    {"lua_touserdata", 159, "lua_State *L, int idx",
-     "Converts value to userdata."},
-    {"lua_tothread", 160, "lua_State *L, int idx", "Converts value to thread."},
-    {"lua_topointer", 161, "lua_State *L, int idx",
-     "Converts value to void pointer."},
-    {"lua_pushnil", 162, "lua_State *L", "Pushes nil."},
-    {"lua_pushnumber", 163, "lua_State *L, lua_Number n", "Pushes number."},
-    {"lua_pushinteger", 164, "lua_State *L, lua_Integer n", "Pushes integer."},
-    {"lua_pushlstring", 165, "lua_State *L, const char *s, size_t len",
-     "Pushes string by length."},
-    {"lua_pushstring", 166, "lua_State *L, const char *s", "Pushes C string."},
-    {"lua_pushfstring", 168, "lua_State *L, const char *fmt, ...",
-     "Pushes formatted string."},
-    {"lua_pushcclosure", 169, "lua_State *L, lua_CFunction fn, int n",
-     "Pushes C closure."},
-    {"lua_pushboolean", 170, "lua_State *L, int b", "Pushes boolean."},
-    {"lua_gettable", 171, "lua_State *L, int idx", "Pushes t[k]."},
-    {"lua_getfield", 172, "lua_State *L, int idx, const char *k",
-     "Pushes t[k] string key."},
-    {"lua_rawget", 173, "lua_State *L, int idx", "Pushes t[k] raw."},
-    {"lua_rawgeti", 174, "lua_State *L, int idx, int n",
-     "Pushes t[n] raw integer."},
-    {"lua_createtable", 175, "lua_State *L, int narr, int nrec",
-     "Creates preallocated table."},
-    {"lua_newuserdata", 176, "lua_State *L, size_t size",
-     "Allocates userdata."},
-    {"lua_getmetatable", 177, "lua_State *L, int idx",
-     "Pushes metatable of value."},
-    {"lua_getfenv", 178, "lua_State *L, int idx", "Pushes environment table."},
-    {"lua_settable", 179, "lua_State *L, int idx", "Sets t[k] = v."},
-    {"lua_setfield", 180, "lua_State *L, int idx, const char *k",
-     "Sets t[k] = v string key."},
-    {"lua_rawset", 181, "lua_State *L, int idx", "Sets t[k] = v raw."},
-    {"lua_rawseti", 182, "lua_State *L, int idx, int n",
-     "Sets t[n] = v raw integer."},
-    {"lua_setmetatable", 183, "lua_State *L, int idx",
-     "Sets metatable of value."},
-    {"lua_setfenv", 184, "lua_State *L, int idx", "Sets environment table."},
-    {"lua_call", 185, "lua_State *L, int nargs, int nresults",
-     "Calls a function."},
-    {"lua_pcall", 186, "lua_State *L, int nargs, int nresults, int errfunc",
-     "Calls function safely."},
-    {"lua_cpcall", 187, "lua_State *L, lua_CFunction func, void *ud",
-     "Calls C function safely."},
-    {"lua_load", 188,
-     "lua_State *L, lua_Reader reader, void *dt, const char *cn",
-     "Loads Lua chunk."},
-    {"lua_dump", 189, "lua_State *L, lua_Writer writer, void *data",
-     "Dumps chunk as bytecode."},
-    {"lua_yield", 190, "lua_State *L, int nresults", "Yields coroutine."},
-    {"lua_resume", 191, "lua_State *L, int narg", "Resumes coroutine."},
-    {"lua_status", 192, "lua_State *L", "Returns thread status."},
-    {"lua_gc", 193, "lua_State *L, int what, int data",
-     "Controls garbage collector."},
-    {"lua_error", 194, "lua_State *L", "Generates a Lua error."},
-    {"lua_next", 195, "lua_State *L, int idx",
-     "Pops key, pushes next key-value."},
-    {"lua_concat", 196, "lua_State *L, int n",
-     "Concatenates n values on stack."},
-    {"lua_getstack", 197, "lua_State *L, int level, lua_Debug *ar",
-     "Gets info about call stack."},
-
-    /* UTF-16 String Extension API */
-    {"ascii2utf16", 13, "void *buf, const char *str, int max_size",
-     "Converts ASCII to UTF16."},
-    {"utf162ascii", 201, "char *buf, const uint16_t *str, int max_size",
-     "Converts UTF16 to ASCII."},
-    {"utf16_strlen", 202, "const uint16_t *str",
-     "Returns the length of a UTF16 string."},
-    {"string_new", 209, "void", "Returns a new empty String structure."},
-    {"string_free", 210, "String str", "Frees the String structure."},
-    {"string_to_ascii", 211, "String str",
-     "Returns String converted to ASCII."},
-    {"string_lower", 212, "String str", "Lowers all characters in String."},
-    {"string_charAt", 213, "String str, int pos",
-     "Returns the character at pos."},
-    {"string_concat_utf16", 214, "String str, const char *utf16",
-     "Concatenates a utf16 string."},
-    {"string_set_ascii", 215, "String str, const char *ascii",
-     "Erases content with an ASCII string."},
-    {"string_set_utf16", 216, "String str, const char *utf16",
-     "Erases content with a utf16 string."},
-    {"string_indexOf_utf16", 217, "String str, int start, const char *pattern",
-     "Returns the index of a pattern."},
-    {"string_last_indexOf_utf16", 218,
-     "String str, int start, const char *pattern",
-     "Returns last index of pattern."},
-    {"string_compareTo_utf16", 219, "String str, const char *pattern",
-     "Compares String to utf16 string."},
-    {"string_substring", 220, "String dst, String src, int start, int end",
-     "Extracts a substring."},
-    {"string_erase", 221, "String str, int n", "Erases first n characters."},
-    {"string_truncate", 222, "String str, int n",
-     "Truncates String to n characters."},
-    {"string_substring_utf16", 223, "String str, const char *pat, int *ptr",
-     "Returns string up to pattern."},
-    {"string_insert_replace_utf16", 224,
-     "String str, const char *pat, int start, int end",
-     "Replaces a substring."},
-    {"string_insert_utf16", 225, "String str, const char *pat, int pos",
-     "Inserts utf16 at pos."},
-    {"string_sprintf_utf16", 226, "String str, const char *fmt, ...",
-     "Formatted print to UTF16 String."},
-
-    /* Graphic Context (GC) API */
-    {"gui_gc_global_GC_ptr", 298, "void", "Pointer to OS allocated Gc."},
-    {"gui_gc_free", 299, "Gc gc", "Frees the given Graphic Context."},
-    {"gui_gc_copy", 300, "Gc gc, int w, int h",
-     "Allocates a new Gc copying parameters (not buffer)."},
-    {"gui_gc_begin", 301, "Gc gc", "Initializes graphic port before drawing."},
-    {"gui_gc_finish", 302, "Gc gc", "Cleans up graphic port parameters."},
-    {"gui_gc_clipRect", 303, "Gc gc, int x, int y, int w, int h, int op",
-     "Constrains drawing to region."},
-    {"gui_gc_setColorRGB", 304, "Gc gc, int r, int g, int b",
-     "Changes the pen color (RGB)."},
-    {"gui_gc_setColor", 305, "Gc gc, int color",
-     "Changes pen color (0xRRGGBB)."},
-    {"gui_gc_setAlpha", 306, "Gc gc, int alpha", "Sets pen alpha mode."},
-    {"gui_gc_setFont", 307, "Gc gc, gui_gc_Font font",
-     "Changes the active font."},
-    {"gui_gc_getFont", 308, "Gc gc", "Returns the current font."},
-    {"gui_gc_setPen", 309, "Gc gc, gui_gc_PenSize size, gui_gc_PenMode mode",
-     "Changes the pen size and mode."},
-    {"gui_gc_setRegion", 310,
-     "Gc gc, int xs, int ys, int ws, int hs, int x, int y, int w, int h",
-     "Sets region viewport."},
-    {"gui_gc_drawArc", 311,
-     "Gc gc, int x, int y, int w, int h, int start, int end", "Draws an arc."},
-    {"gui_gc_drawIcon", 312, "Gc gc, int res, int icon, int x, int y",
-     "Draws OS predefined icon."},
-    {"gui_gc_drawSprite", 313, "Gc gc, gui_gc_Sprite *spr, int x, int y",
-     "Draws a sprite array."},
-    {"gui_gc_drawLine", 314, "Gc gc, int x1, int y1, int x2, int y2",
-     "Draws a line."},
-    {"gui_gc_drawRect", 315, "Gc gc, int x, int y, int w, int h",
-     "Draws an empty rectangle."},
-    {"gui_gc_drawString", 316,
-     "Gc gc, char *utf16, int x, int y, gui_gc_StringMode flags",
-     "Draws a UTF16 string."},
-    {"gui_gc_drawPoly", 317, "Gc gc, unsigned int *points, unsigned int count",
-     "Draws a polygon shape."},
-    {"gui_gc_fillArc", 318,
-     "Gc gc, int x, int y, int w, int h, int start, int end", "Fills an arc."},
-    {"gui_gc_fillPoly", 319, "Gc gc, unsigned int *points, unsigned int count",
-     "Fills a polygon shape."},
-    {"gui_gc_fillRect", 320, "Gc gc, int x, int y, int w, int h",
-     "Fills a rectangle."},
-    {"gui_gc_fillGradient", 321,
-     "Gc gc, int x, int y1, int w, int y2, int c1, int c2, int vert",
-     "Fills a gradient."},
-    {"gui_gc_drawImage", 322, "Gc gc, char *TI_Image, int x, int y",
-     "Draws an image in TI.Image format."},
-    {"gui_gc_getStringWidth", 323,
-     "Gc gc, gui_gc_Font font, char *utf16, int start, int len",
-     "Gets string pixel width."},
-    {"gui_gc_getCharWidth", 324, "Gc gc, gui_gc_Font font, short utf16_char",
-     "Gets width of character."},
-    {"gui_gc_getStringSmallHeight", 325,
-     "Gc gc, gui_gc_Font font, char *utf16, int start, int len",
-     "Gets small height of string."},
-    {"gui_gc_getCharHeight", 326, "Gc gc, gui_gc_Font font, short utf16_char",
-     "Gets the height of a character."},
-    {"gui_gc_getStringHeight", 327,
-     "Gc gc, gui_gc_Font font, char *utf16, int start, int len",
-     "Gets full height of string."},
-    {"gui_gc_getFontHeight", 328, "Gc gc, gui_gc_Font font",
-     "Gets max height of font."},
-    {"gui_gc_getIconSize", 329, "Gc gc, int res, int icon, int *w, int *h",
-     "Gets dimensions of OS icon."},
-    {"gui_gc_blit_gc", 330,
-     "Gc src, int xs, int ys, int ws, int hs, Gc dst, int xd, int yd, int wd, "
-     "int hd",
-     "Blits and stretches from one Gc to another."},
-    {"gui_gc_blit_buffer", 331,
-     "Gc gc, char *buffer, int xb, int yb, int wb, int hb",
-     "Blits from a raw buffer to a Gc."},
-
-    /* Miscellaneous OS Services & Menus */
-    {"refresh_homescr", 198, "void", "Refreshes the TI-Nspire homescreen."},
-    {"refresh_docbrowser", 199, "int p1", "Refreshes the Document Browser."},
-    {"_show_1NumericInput", 203,
-     "int p1, const char *title, const char *sub, const char *lbl, int *val, "
-     "...",
-     "Shows a 1-numeric input dialog."},
-    {"_show_2NumericInput", 204,
-     "int p1, const char *title, const char *sub, const char *lbl1, int *val1, "
-     "...",
-     "Shows a 2-numeric input dialog."},
-    {"_show_msgUserInput", 205,
-     "int p1, String *str, const char *title, const char *sub",
-     "Shows a text input dialog."},
-    {"calc_cmd", 339,
-     "void *p1, void *p2, const uint16_t *expr, void *p4, void *p5",
-     "Evaluates a math expression."},
-    {"get_res_string", 340, "int res, int strid",
-     "Gets OS translated resource string."},
-    {"disp_str", 341, "const char *str, int *x, int y",
-     "Displays a basic string to LCD."},
-    {"TI_MS_MathExprToStr", 342, "void *p1, void *p2, uint16_t **str",
-     "Converts math expression object to string."},
-    {"get_documents_dir", 297, "void", "Returns path to /documents."},
-
-    /* USB Host Driver API (usbd_) */
-    {"usbd_open_pipe", 227,
-     "usbd_interface_handle ih, uint8_t a, uint8_t e, usbd_pipe_handle *p",
-     "Opens USB pipe."},
-    {"usbd_close_pipe", 228, "usbd_pipe_handle p", "Closes USB pipe."},
-    {"usbd_transfer", 229, "usbd_xfer_handle xfer", "Initiates USB transfer."},
-    {"usbd_alloc_xfer", 230, "usbd_device_handle dev",
-     "Allocates USB transfer struct."},
-    {"usbd_free_xfer", 231, "usbd_xfer_handle xfer",
-     "Frees USB transfer struct."},
-    {"usbd_setup_xfer", 232,
-     "usbd_xfer_handle xfer, usbd_pipe_handle p, usbd_private_handle priv, ...",
-     "Setups standard transfer."},
-    {"usbd_setup_isoc_xfer", 233,
-     "usbd_xfer_handle xfer, usbd_pipe_handle p, usbd_private_handle priv, ...",
-     "Setups isochronous transfer."},
-    {"usbd_get_xfer_status", 234,
-     "usbd_xfer_handle xfer, usbd_private_handle *p, void **b, uint32_t *len, "
-     "usbd_status *s",
-     "Gets transfer status."},
-    {"usbd_interface2endpoint_descriptor", 235,
-     "usbd_interface_handle ih, uint8_t e", "Gets endpoint desc."},
-    {"usbd_abort_pipe", 236, "usbd_pipe_handle p",
-     "Aborts pending transfers on pipe."},
-    {"usbd_clear_endpoint_stall", 237, "usbd_pipe_handle p",
-     "Clears stall condition on endpoint."},
-    {"usbd_endpoint_count", 238, "usbd_interface_handle ih, uint8_t *c",
-     "Gets number of endpoints."},
-    {"usbd_interface_count", 239, "usbd_device_handle dev, uint8_t *c",
-     "Gets number of interfaces."},
-    {"usbd_interface2device_handle", 240,
-     "usbd_interface_handle ih, usbd_device_handle *dev",
-     "Gets device from interface."},
-    {"usbd_device2interface_handle", 241,
-     "usbd_device_handle dev, uint8_t iface, usbd_interface_handle *ih",
-     "Gets interface from device."},
-    {"usbd_pipe2device_handle", 242, "usbd_pipe_handle p",
-     "Gets device from pipe."},
-    {"usbd_sync_transfer", 243, "usbd_xfer_handle xfer",
-     "Executes synchronous transfer."},
-    {"usbd_open_pipe_intr", 244,
-     "usbd_interface_handle ih, uint8_t a, uint8_t e, usbd_pipe_handle *p, ...",
-     "Opens interrupt pipe."},
-    {"usbd_do_request", 245,
-     "usbd_device_handle dev, usb_device_request_t *req, void *data",
-     "Executes control request."},
-    {"usbd_do_request_flags", 246,
-     "usbd_device_handle dev, usb_device_request_t *req, void *data, uint16_t "
-     "f, int *act",
-     "Executes control request with flags."},
-    {"usbd_do_request_flags_pipe", 247,
-     "usbd_device_handle dev, usbd_pipe_handle p, usb_device_request_t *req, "
-     "...",
-     "Executes request on specific pipe."},
-    {"usbd_get_interface_descriptor", 248, "usbd_interface_handle ih",
-     "Gets interface descriptor."},
-    {"usbd_get_config_descriptor", 249, "usbd_device_handle dev",
-     "Gets config descriptor."},
-    {"usbd_get_device_descriptor", 250, "usbd_device_handle dev",
-     "Gets device descriptor."},
-    {"usbd_set_interface", 251, "usbd_interface_handle ih, int alt",
-     "Sets interface alternate setting."},
-    {"usbd_get_interface", 252, "usbd_interface_handle ih, uint8_t *alt",
-     "Gets interface alternate setting."},
-    {"usbd_find_idesc", 253, "usb_config_descriptor_t *cd, int i, int a",
-     "Finds interface descriptor inside config."},
-    {"usbd_errstr", 254, "usbd_status err", "Returns USB error string."},
-    {"usbd_devinfo", 255, "usbd_device_handle dev, int b, char *str",
-     "Gets device info string."},
-    {"usbd_get_quirks", 256, "usbd_device_handle dev",
-     "Gets USB device quirks."},
-    {"usbd_get_endpoint_descriptor", 257, "usbd_interface_handle ih, uint8_t e",
-     "Gets endpoint descriptor by index."},
-    {"usb_register_driver", 258,
-     "int p1, int(*p2[])(device_t), const char* p3, int p4, unsigned int p5",
-     "Registers USB class driver."},
-    {"device_get_softc", 259, "device_t dev", "Gets softc of device."},
-    {"device_get_ivars", 260, "device_t dev", "Gets ivars of device."},
-
-    /* NavNet Protocol API */
-    {"TI_NN_SendKeyPress", 267, "void", "Sends key press via NavNet."},
-    {"TI_NN_IsNodeResponsive", 268, "void", "Checks if remote node responds."},
-    {"TI_NN_NodeEnumDone", 269, "nn_oh_t oh", "Terminates node enumeration."},
-    {"TI_NN_NodeEnumNext", 270, "nn_oh_t oh, nn_nh_t *nh",
-     "Gets next node in enumeration."},
-    {"TI_NN_GetConnMaxPktSize", 271, "nn_ch_t ch",
-     "Gets max packet size for connection."},
-    {"TI_NN_Read", 272,
-     "nn_ch_t ch, uint32_t timeout_ms, void *buf, uint32_t buf_size, uint32_t "
-     "*recv_size",
-     "Reads packet from NavNet."},
-    {"TI_NN_Write", 273, "nn_ch_t ch, void *buf, uint32_t data_size",
-     "Writes packet to NavNet."},
-    {"TI_NN_StartService", 274,
-     "uint32_t id, void *data, void(*cb)(nn_ch_t,void*)",
-     "Exposes a NavNet service."},
-    {"TI_NN_StopService", 275, "uint32_t service_id",
-     "Stops exposing a service."},
-    {"TI_NN_Connect", 276, "nn_nh_t nh, uint32_t service_id, nn_ch_t *ch",
-     "Connects to a remote NavNet service."},
-    {"TI_NN_Disconnect", 277, "nn_ch_t ch", "Disconnects from remote service."},
-    {"TI_NN_NodeEnumInit", 278, "nn_oh_t oh",
-     "Initiates NavNet node enumeration."},
-    {"TI_NN_UnregisterNotifyCallback", 279, "void",
-     "Unregisters NavNet event callback."},
-    {"TI_NN_RegisterNotifyCallback", 280, "uint32_t flags, void (*cb)(void)",
-     "Registers for NavNet events."},
-    {"TI_NN_InstallOS", 281, "void", "Initiates remote OS install."},
-    {"TI_NN_GetNodeInfo", 282, "void", "Gets information about remote node."},
-    {"TI_NN_DestroyOperationHandle", 283, "nn_oh_t oh",
-     "Destroys NavNet operation handle."},
-    {"TI_NN_CreateOperationHandle", 284, "void",
-     "Creates NavNet operation handle."},
-    {"TI_NN_GetNodeScreen", 285, "void", "Captures remote node screen."},
-    {"TI_NN_CopyFile", 286, "void", "Copies remote file."},
-    {"TI_NN_Rename", 287, "void", "Renames remote file/folder."},
-    {"TI_NN_RmDir", 288, "void", "Removes remote directory."},
-    {"TI_NN_MkDir", 289, "void", "Creates remote directory."},
-    {"TI_NN_DeleteFile", 290, "void", "Deletes remote file."},
-    {"TI_NN_GetFileAttributes", 291, "void", "Gets remote file attributes."},
-    {"TI_NN_PutFile", 292,
-     "nn_nh_t nh, nn_oh_t oh, const char *local, const char *remote",
-     "Transfers file via NavNet."},
-    {"TI_NN_DirEnumDone", 293, "void",
-     "Terminates remote directory enumeration."},
-    {"TI_NN_DirEnumNext", 294, "void", "Gets next remote directory entry."},
-    {"TI_NN_DirEnumInit", 295, "void",
-     "Initiates remote directory enumeration."},
-    {"TI_NN_GetFile", 296, "void", "Receives file via NavNet."},
-
-    /* Ndless OS Extensions (Requires 0x200000 bitmask) */
-    {"nl_osvalue", 0x200000, "const int values[], unsigned size",
-     "Returns OS-dependent array value."},
-    {"nl_relocdatab", 0x200001, "void",
-     "Returns base address of .data relocations."},
-    {"nl_hwtype", 0x200002, "void",
-     "Returns the hardware type ID (0=Clickpad, 1=Touchpad, etc)."},
-    {"nl_isstartup", 0x200003, "void",
-     "Returns TRUE if program is running at OS startup."},
-    {"nl_lua_getstate", 0x200004, "void",
-     "Returns global Lua state of current document."},
-    {"nl_set_resident", 0x200005, "void",
-     "Marks program to not free memory on exit."},
-    {"nl_ndless_rev", 0x200006, "void",
-     "Returns the current Ndless revision number."},
-    {"nl_no_scr_redraw", 0x200007, "void",
-     "Prevents screen restore on program exit."},
-    {"nl_loaded_by_3rd_party_loader", 0x200008, "void",
-     "Returns TRUE if loaded by 3rd party loader."},
-    {"nl_hwsubtype", 0x200009, "void",
-     "Returns hardware sub-type (CX/CX-II vs Older)."},
-    {"nl_exec", 0x20000A, "const char *prgm_path, int argsn, char *args[]",
-     "Executes another .tns program."},
-    {"nl_osid", 0x20000B, "void", "Returns exact OS version identifier."},
-    {"_nl_hassyscall", 0x20000C, "int syscall_num",
-     "Checks if a specific syscall is available."},
-    {"nl_lcd_blit", 0x20000D, "void",
-     "Blits Ndless internal FB to hardware LCD."},
-    {"nl_lcd_type", 0x20000E, "void", "Returns the physical LCD panel type."},
-    {"nl_lcd_init", 0x20000F, "void",
-     "Re-initializes hardware LCD parameters."},
-
-    /* Emulator Integration (Requires 0x400000 bitmask) */
-    {"NDLSEMU_DEBUG_ALLOC", 0x400000, "void *ptr, size_t size",
-     "Notifies emulator of memory allocation."},
-    {"NDLSEMU_DEBUG_FREE", 0x400001, "void *ptr",
-     "Notifies emulator of memory free."}};
-#define NSYSCALLS ((int)(sizeof(db_syscalls) / sizeof(db_syscalls[0])))
-
-static const char *get_syscall_name(long num) {
-  for (int i = 0; i < NSYSCALLS; i++) {
-    if (db_syscalls[i].num == num)
-      return db_syscalls[i].name;
-  }
-  return NULL;
-}
 
 static void draw_scrolled_text(int x_min, int x_max, int y, const char *str,
                                int *col_idx, int hscroll, uint16_t fg,
@@ -3231,7 +2186,7 @@ static void syscall_draw(int sel, int scroll, int hscroll, int max_hscroll,
     int ri = scroll + vi;
     int row_y = CAT_LIST_Y + vi * CAT_ROW_H;
 
-    if (ri >= NSYSCALLS)
+    if (ri >= g_nsyscalls)
       continue;
 
     int is_sel = (ri == sel);
@@ -3260,12 +2215,12 @@ static void syscall_draw(int sel, int scroll, int hscroll, int max_hscroll,
     }
   }
 
-  if (NSYSCALLS > CAT_ROWS_VIS) {
+  if (g_nsyscalls > CAT_ROWS_VIS) {
     int bar_total = CAT_LIST_H;
-    int bar_h = bar_total * CAT_ROWS_VIS / NSYSCALLS;
+    int bar_h = bar_total * CAT_ROWS_VIS / g_nsyscalls;
     if (bar_h < 4)
       bar_h = 4;
-    int ms = NSYSCALLS - CAT_ROWS_VIS;
+    int ms = g_nsyscalls - CAT_ROWS_VIS;
     int bar_y = CAT_LIST_Y + (bar_total - bar_h) * scroll / (ms > 0 ? ms : 1);
     gfx_fillrect(CAT_WIN_X + CAT_WIN_W - 4, CAT_LIST_Y, 3, bar_total,
                  g_default_theme.item_bg);
@@ -3301,7 +2256,7 @@ static const SyscallInfo *syscall_pick(void) {
   int sel = 0, scroll = 0, hscroll = 0;
 
   int max_arg_len = 0;
-  for (int i = 0; i < NSYSCALLS; i++) {
+  for (int i = 0; i < g_nsyscalls; i++) {
     int len = (int)strlen(db_syscalls[i].args);
     if (len > max_arg_len)
       max_arg_len = len;
@@ -3355,17 +2310,17 @@ static const SyscallInfo *syscall_pick(void) {
       if (ctrl) {
         /* Page down */
         sel += CAT_ROWS_VIS;
-        if (sel > NSYSCALLS - 1)
-          sel = NSYSCALLS - 1;
+        if (sel > g_nsyscalls - 1)
+          sel = g_nsyscalls - 1;
         scroll += CAT_ROWS_VIS;
-        if (scroll > NSYSCALLS - CAT_ROWS_VIS)
-          scroll = NSYSCALLS - CAT_ROWS_VIS;
+        if (scroll > g_nsyscalls - CAT_ROWS_VIS)
+          scroll = g_nsyscalls - CAT_ROWS_VIS;
         if (scroll < 0)
           scroll = 0;
         if (sel >= scroll + CAT_ROWS_VIS)
           scroll = sel - CAT_ROWS_VIS + 1;
       } else {
-        if (sel < NSYSCALLS - 1) {
+        if (sel < g_nsyscalls - 1) {
           sel++;
           if (sel >= scroll + CAT_ROWS_VIS)
             scroll = sel - CAT_ROWS_VIS + 1;
@@ -3426,67 +2381,6 @@ static void editor_syscall_catalog(void) {
  *   - CPSR flag effects
  * ================================================================ */
 
-/* Look up a mnemonic name (any case, with optional condition-code suffix)
-   in the full database.  Returns the MnemInfo, or NULL if not found.    */
-static const MnemInfo *cheatsheet_lookup(const char *word, int wlen) {
-  catalog_init_cats();
-  for (int c = 0; c < NCATS; c++) {
-    for (int m = 0; m < g_cats[c].count; m++) {
-      const MnemInfo *mi = &g_cats[c].mnems[m];
-      int nl = (int)strlen(mi->name);
-      if (nl == wlen && strncaseeq(mi->name, word, wlen))
-        return mi;
-    }
-  }
-  /* Try stripping a 2-char condition-code suffix (e.g. MOVEQ -> MOV) */
-  static const char *cc[] = {"EQ", "NE", "CS", "CC", "MI", "PL",
-                             "VS", "VC", "HI", "LS", "GE", "LT",
-                             "GT", "LE", "AL", "HS", "LO", NULL};
-  if (wlen > 2) {
-    for (int i = 0; cc[i]; i++) {
-      if (strncaseeq(word + wlen - 2, cc[i], 2)) {
-        int base_len = wlen - 2;
-        for (int c = 0; c < NCATS; c++) {
-          for (int m = 0; m < g_cats[c].count; m++) {
-            const MnemInfo *mi = &g_cats[c].mnems[m];
-            int nl = (int)strlen(mi->name);
-            if (nl == base_len && strncaseeq(mi->name, word, base_len))
-              return mi;
-          }
-        }
-      }
-    }
-  }
-  /* Also try stripping 'S' suffix (e.g. ADDS -> ADD) */
-  if (wlen > 1 && (word[wlen - 1] == 'S' || word[wlen - 1] == 's')) {
-    int base_len = wlen - 1;
-    for (int c = 0; c < NCATS; c++) {
-      for (int m = 0; m < g_cats[c].count; m++) {
-        const MnemInfo *mi = &g_cats[c].mnems[m];
-        int nl = (int)strlen(mi->name);
-        if (nl == base_len && strncaseeq(mi->name, word, base_len))
-          return mi;
-      }
-    }
-    /* Condition code + S (e.g. ADDEQS) */
-    if (wlen > 3) {
-      for (int i = 0; cc[i]; i++) {
-        if (strncaseeq(word + wlen - 3, cc[i], 2)) {
-          int base_len2 = wlen - 3;
-          for (int c = 0; c < NCATS; c++) {
-            for (int m = 0; m < g_cats[c].count; m++) {
-              const MnemInfo *mi = &g_cats[c].mnems[m];
-              int nl = (int)strlen(mi->name);
-              if (nl == base_len2 && strncaseeq(mi->name, word, base_len2))
-                return mi;
-            }
-          }
-        }
-      }
-    }
-  }
-  return NULL;
-}
 
 /* Wrap text at word boundaries and draw into the popup body area.
    Returns the number of lines consumed.                           */
@@ -3529,47 +2423,12 @@ static void editor_cheatsheet(void) {
   int len = (int)strlen(line);
 
   /* Check for SWI/SVC instructions on the current line */
-  int is_syscall = 0;
   long sys_num = -1;
-  int scan_i = 0;
-
-  while (scan_i < len) {
-    while (scan_i < len && (line[scan_i] == ' ' || line[scan_i] == '\t'))
-      scan_i++;
-    if (scan_i >= len || line[scan_i] == ';')
-      break;
-
-    int start = scan_i;
-    while (scan_i < len &&
-           (isalnum((unsigned char)line[scan_i]) || line[scan_i] == '_'))
-      scan_i++;
-    int tok_len = scan_i - start;
-
-    if (tok_len == 3 && (strncaseeq(line + start, "swi", 3) ||
-                         strncaseeq(line + start, "svc", 3))) {
-      while (scan_i < len && (line[scan_i] == ' ' || line[scan_i] == '\t'))
-        scan_i++;
-
-      /* Skip optional '#' prefix */
-      if (scan_i < len && line[scan_i] == '#')
-        scan_i++;
-
-      if (scan_i < len) {
-        char *end;
-        sys_num = strtol(line + scan_i, &end, 0); /* Handles dec and hex */
-        if (end != line + scan_i)
-          is_syscall = 1;
-      }
-      break;
-    }
-    while (scan_i < len && line[scan_i] != ' ' && line[scan_i] != '\t' &&
-           line[scan_i] != ';')
-      scan_i++;
-  }
+  int is_syscall = syntax_scan_swi(line, len, &sys_num);
 
   /* Show syscall description if found */
   if (is_syscall) {
-    for (int s = 0; s < NSYSCALLS; s++) {
+    for (int s = 0; s < g_nsyscalls; s++) {
       if (db_syscalls[s].num == sys_num) {
         syscall_show_desc(&db_syscalls[s]);
         return;
@@ -3702,329 +2561,21 @@ static void editor_cheatsheet(void) {
     msleep(20);
 }
 
-/* ================================================================
- * File browser
- *
- * filebrowser_pick_file(start_dir, out, outsz)
- *   Shows a scrollable directory navigator.  The user navigates into
- *   subdirectories with Enter / click, and selects a file with Enter.
- *   Returns 1 with the full path in `out`, or 0 on cancel.
- *
- * filebrowser_pick_dir(start_dir, out, outsz)
- *   Same, but Enter on a directory *selects* it rather than entering.
- *   Used by Save As to pick the destination folder.
- *
- * Both share the same drawing and navigation core.
- * ================================================================ */
-
-#define FB_MAX_ENTRIES 256
-#define FB_NAME_MAX 64
-#define FB_ROW_H 10
-#define FB_ROWS_VIS 18
-#define FB_WIN_W (GFX_W - 20)
-#define FB_WIN_X 10
-#define FB_WIN_Y 4
-#define FB_TITLE_H 12
-#define FB_HINT_H 11
-#define FB_LIST_H (FB_ROWS_VIS * FB_ROW_H)
-#define FB_WIN_H (FB_TITLE_H + FB_LIST_H + FB_HINT_H + 4)
-#define FB_LIST_Y (FB_WIN_Y + 1 + FB_TITLE_H)
-
-typedef struct {
-  char name[FB_NAME_MAX];
-  int is_dir;
-} FBEntry;
-
-static FBEntry fb_entries[FB_MAX_ENTRIES];
-static int fb_nentries;
-
-/* strcmp comparator for FBEntry: dirs first, then files, both alpha */
-static int fb_cmp(const void *a, const void *b) {
-  const FBEntry *ea = (const FBEntry *)a;
-  const FBEntry *eb = (const FBEntry *)b;
-  if (ea->is_dir != eb->is_dir)
-    return eb->is_dir - ea->is_dir;
-  return strcmp(ea->name, eb->name);
-}
-
-static int fb_load_dir(const char *path, int pick_dir, int filter_asm) {
-  fb_nentries = 0;
-  DIR *d = opendir(path);
-  if (!d)
-    return 0;
-
-  struct dirent *de;
-  while ((de = readdir(d)) != NULL && fb_nentries < FB_MAX_ENTRIES) {
-    if (de->d_name[0] == '.')
-      continue;
-
-    char full[512];
-    snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
-    struct stat st;
-    int is_dir = 0;
-    if (stat(full, &st) == 0) {
-      is_dir = S_ISDIR(st.st_mode);
-    }
-
-    if (pick_dir && !is_dir) {
-      continue;
-    }
-
-    if (!is_dir && !pick_dir && filter_asm) {
-      int nlen = (int)strlen(de->d_name);
-      int elen = (int)strlen(g_settings.asm_extension);
-      if (nlen < elen + 5)
-        continue; /* must be at least . + ext + .tns */
-
-      const char *suffix = de->d_name + nlen - (elen + 5);
-      if (suffix[0] != '.')
-        continue;
-      if (strncasecmp(suffix + 1, g_settings.asm_extension, elen) != 0)
-        continue;
-      if (strcasecmp(suffix + 1 + elen, ".tns") != 0)
-        continue;
-    }
-
-    FBEntry *e = &fb_entries[fb_nentries];
-    strncpy(e->name, de->d_name, FB_NAME_MAX - 1);
-    e->name[FB_NAME_MAX - 1] = '\0';
-    e->is_dir = is_dir;
-
-    fb_nentries++;
-  }
-  closedir(d);
-
-  qsort(fb_entries, fb_nentries, sizeof(FBEntry), fb_cmp);
-  return 1;
-}
-
-static void fb_draw(const char *cwd, int sel, int scroll, int pick_dir,
-                    int has_parent, int filter_asm) {
-  uint16_t BG = g_default_theme.bg;
-  uint16_t FG = g_default_theme.fg;
-  uint16_t SEL_BG = g_default_theme.accent;
-  uint16_t SEL_FG = g_default_theme.accent_text;
-  uint16_t DIR_FG = g_default_theme.accent;
-  uint16_t DIM_FG = g_default_theme.border_light;
-  uint16_t BD = g_default_theme.border_light;
-
-  gfx_fillrect(FB_WIN_X + 3, FB_WIN_Y + 3, FB_WIN_W, FB_WIN_H,
-               g_default_theme.border_dark);
-  gfx_borderrect(FB_WIN_X, FB_WIN_Y, FB_WIN_W, FB_WIN_H, BG, BD);
-
-  gfx_fillrect(FB_WIN_X + 1, FB_WIN_Y + 1, FB_WIN_W - 2, FB_TITLE_H,
-               g_default_theme.title_bg);
-
-  char disp_path[512];
-  const char *clean_cwd = cwd;
-  while (clean_cwd[0] == '/' && clean_cwd[1] == '/')
-    clean_cwd++;
-  snprintf(disp_path, sizeof(disp_path), "/%s", clean_cwd);
-
-  gfx_drawstr_clipped(
-      FB_WIN_X + 4, FB_WIN_Y + 1 + (FB_TITLE_H - GFX_FONT_H) / 2, disp_path,
-      g_default_theme.title_fg, g_default_theme.title_bg, FB_WIN_W - 8);
-
-  gfx_fillrect(FB_WIN_X + 1, FB_LIST_Y, FB_WIN_W - 2, FB_LIST_H, BG);
-
-  int base = 0;
-  if (has_parent) {
-    int ry = FB_LIST_Y;
-    int is_sel = (sel == -1);
-    uint16_t rbg = is_sel ? SEL_BG : BG;
-    uint16_t rfg = is_sel ? SEL_FG : DIR_FG;
-    gfx_fillrect(FB_WIN_X + 1, ry, FB_WIN_W - 2, FB_ROW_H, rbg);
-    gfx_drawstr_clipped(FB_WIN_X + 4, ry + 1, "../  (parent)", rfg, rbg,
-                        FB_WIN_W - 8);
-    base = 1;
-  }
-
-  for (int vi = 0; vi < FB_ROWS_VIS - base; vi++) {
-    int ri = scroll + vi;
-    int ry = FB_LIST_Y + (vi + base) * FB_ROW_H;
-    if (ri >= fb_nentries) {
-      gfx_fillrect(FB_WIN_X + 1, ry, FB_WIN_W - 2, FB_ROW_H, BG);
-      continue;
-    }
-    int is_sel = (sel == ri);
-    uint16_t rbg = is_sel ? SEL_BG : BG;
-    uint16_t rfg = is_sel ? SEL_FG : (fb_entries[ri].is_dir ? DIR_FG : FG);
-
-    gfx_fillrect(FB_WIN_X + 1, ry, FB_WIN_W - 2, FB_ROW_H, rbg);
-    gfx_drawstr_clipped(FB_WIN_X + 4, ry + 1, fb_entries[ri].name, rfg, rbg,
-                        FB_WIN_W - 8);
-  }
-
-  if (fb_nentries > FB_ROWS_VIS - base) {
-    int bt = FB_LIST_H - base * FB_ROW_H;
-    int vis = FB_ROWS_VIS - base;
-    int bh = bt * vis / fb_nentries;
-    if (bh < 4)
-      bh = 4;
-    int ms = fb_nentries - vis;
-    int by =
-        FB_LIST_Y + base * FB_ROW_H + (bt - bh) * scroll / (ms > 0 ? ms : 1);
-    gfx_fillrect(FB_WIN_X + FB_WIN_W - 5, FB_LIST_Y + base * FB_ROW_H, 3, bt,
-                 g_default_theme.item_bg);
-    gfx_fillrect(FB_WIN_X + FB_WIN_W - 5, by, 3, bh, BD);
-  }
-
-  int hy = FB_WIN_Y + FB_WIN_H - FB_HINT_H - 1;
-  gfx_hline(FB_WIN_X + 1, hy, FB_WIN_W - 2, BD);
-  gfx_fillrect(FB_WIN_X + 1, hy + 1, FB_WIN_W - 2, FB_HINT_H - 1, BG);
-
-  char hint_buf[128];
-  const char *hint;
-  if (pick_dir) {
-    hint = "Tab:save here  Enter:open  Esc:cancel";
-  } else if (filter_asm) {
-    hint = "Tab:all files  Enter:open  Esc:cancel";
-  } else {
-    snprintf(hint_buf, sizeof(hint_buf), "Tab:*.%s.tns  Enter:open  Esc:cancel",
-             g_settings.asm_extension);
-    hint = hint_buf;
-  }
-  gfx_drawstr_clipped(FB_WIN_X + 4, hy + 2, hint, DIM_FG, BG, FB_WIN_W - 8);
-
-  gfx_flip();
-}
-
-/* Internal core: pick_dir=0 -> pick file, pick_dir=1 -> pick directory.
-   Returns 1 and fills `out` on success, 0 on cancel.                   */
-static int fb_run(const char *start, char *out, int outsz, int pick_dir) {
-  char cwd[512];
-  strncpy(cwd, start, sizeof(cwd) - 1);
-  cwd[sizeof(cwd) - 1] = '\0';
-
-  int filter_asm = 1;
-
-  fb_load_dir(cwd, pick_dir, filter_asm);
-
-  int has_parent = (strcmp(cwd, "/") != 0);
-  int vis_rows = FB_ROWS_VIS - (has_parent ? 1 : 0);
-
-  int sel = has_parent ? -1 : 0;
-  int scroll = 0;
-
-  while (any_key_pressed())
-    msleep(20);
-  fb_draw(cwd, sel, scroll, pick_dir, has_parent, filter_asm);
-
-  for (;;) {
-    NavAction nav = gfx_poll_nav();
-    if (nav == NAV_NONE) {
-      msleep(16);
-      idle();
-      continue;
-    }
-
-    if (nav == NAV_ESC) {
-      while (any_key_pressed())
-        msleep(20);
-      return 0;
-
-    } else if (nav == NAV_TAB) {
-      if (pick_dir) {
-        while (any_key_pressed())
-          msleep(20);
-        strncpy(out, cwd, outsz - 1);
-        out[outsz - 1] = '\0';
-        return 1;
-      } else {
-        filter_asm = !filter_asm;
-        fb_load_dir(cwd, pick_dir, filter_asm);
-        has_parent = (strcmp(cwd, "/") != 0);
-        vis_rows = FB_ROWS_VIS - (has_parent ? 1 : 0);
-        sel = has_parent ? -1 : 0;
-        scroll = 0;
-      }
-
-    } else if (nav == NAV_UP) {
-      if (sel == 0 && has_parent)
-        sel = -1;
-      else if (sel > 0)
-        sel--;
-      if (sel >= 0 && sel < scroll)
-        scroll = sel;
-
-    } else if (nav == NAV_DOWN) {
-      if (sel == -1) {
-        if (fb_nentries > 0)
-          sel = 0;
-      } else if (sel < fb_nentries - 1) {
-        sel++;
-      }
-      if (sel >= scroll + vis_rows)
-        scroll = sel - vis_rows + 1;
-
-    } else if (nav == NAV_ENTER) {
-      while (any_key_pressed())
-        msleep(20);
-
-      if (sel == -1) {
-        char *slash = strrchr(cwd, '/');
-        if (slash && slash != cwd)
-          *slash = '\0';
-        else
-          strncpy(cwd, "/", sizeof(cwd) - 1);
-        fb_load_dir(cwd, pick_dir, filter_asm);
-        has_parent = (strcmp(cwd, "/") != 0);
-        vis_rows = FB_ROWS_VIS - (has_parent ? 1 : 0);
-        sel = has_parent ? -1 : 0;
-        scroll = 0;
-        fb_draw(cwd, sel, scroll, pick_dir, has_parent, filter_asm);
-        continue;
-      }
-
-      if (sel < 0 || sel >= fb_nentries)
-        continue;
-
-      if (fb_entries[sel].is_dir) {
-        if (strcmp(cwd, "/") == 0) {
-          snprintf(cwd, sizeof(cwd), "/%s", fb_entries[sel].name);
-        } else {
-          snprintf(cwd + strlen(cwd), sizeof(cwd) - strlen(cwd), "/%s",
-                   fb_entries[sel].name);
-        }
-        fb_load_dir(cwd, pick_dir, filter_asm);
-        has_parent = (strcmp(cwd, "/") != 0);
-        vis_rows = FB_ROWS_VIS - (has_parent ? 1 : 0);
-        sel = has_parent ? -1 : 0;
-        scroll = 0;
-
-      } else if (!pick_dir) {
-        if (strcmp(cwd, "/") == 0)
-          snprintf(out, outsz, "/%s", fb_entries[sel].name);
-        else
-          snprintf(out, outsz, "%s/%s", cwd, fb_entries[sel].name);
-        return 1;
-      }
-    }
-    fb_draw(cwd, sel, scroll, pick_dir, has_parent, filter_asm);
-  }
-}
-
-/* Public wrappers */
-static int filebrowser_pick_file(const char *start, char *out, int outsz) {
-  return fb_run(start, out, outsz, 0);
-}
-static int filebrowser_pick_dir(const char *start, char *out, int outsz) {
-  return fb_run(start, out, outsz, 1);
-}
 
 /* ================================================================
  * File operations: Open and Save As
  *
- * Forward declaration needed because prompt_unsaved is defined later.
+ * Forward declarations needed because these are defined later.
  * ================================================================ */
 static int prompt_unsaved(void);
+static int editor_do_save(void);
 
 static void editor_open_file(void) {
   if (g_modified) {
     int choice = prompt_unsaved();
     if (choice == 1) {
-      save_file(g_filepath);
-      g_modified = 0;
+      if (!editor_do_save())
+        return; /* save failed or was cancelled - keep current buffer */
     } else if (choice == 0)
       return; /* cancel */
   }
@@ -4039,7 +2590,7 @@ static void editor_open_file(void) {
     strncpy(start_dir, "/documents", sizeof(start_dir) - 1);
 
   char newpath[1024] = "";
-  if (!filebrowser_pick_file(start_dir, newpath, sizeof(newpath)))
+  if (!browser_pick_file(start_dir, 1, newpath, sizeof(newpath)))
     return;
 
   strncpy(g_filepath, newpath, sizeof(g_filepath) - 1);
@@ -4062,10 +2613,12 @@ static void editor_open_file(void) {
   g_redo_head = 0;
   g_redo_count = 0;
   g_modified = 0;
+  g_readonly = !path_is_asm_source(g_filepath);
 }
 
-/* Save As: pick a directory, then enter a filename; saves as dir/name.tns */
-static void editor_save_as(void) {
+/* Save As: pick a directory, then enter a filename; saves as dir/name.tns.
+   Returns 1 if the file was written, 0 on cancel or failure. */
+static int editor_save_as(void) {
   char start_dir[512];
   strncpy(start_dir, g_filepath, sizeof(start_dir) - 1);
   start_dir[sizeof(start_dir) - 1] = '\0';
@@ -4076,26 +2629,28 @@ static void editor_save_as(void) {
     strncpy(start_dir, "/documents", sizeof(start_dir) - 1);
 
   char destdir[1024] = "";
-  if (!filebrowser_pick_dir(start_dir, destdir, sizeof(destdir)))
-    return;
+  if (!browser_pick_dir(start_dir, destdir, sizeof(destdir)))
+    return 0;
 
   char fname[128] = "";
   {
     const char *base = strrchr(g_filepath, '/');
     base = base ? base + 1 : g_filepath;
     strncpy(fname, base, sizeof(fname) - 1);
-    char *dot = strstr(fname, ".tns");
-    if (dot)
-      *dot = '\0';
+    fname[sizeof(fname) - 1] = '\0';
+    /* Strip a trailing ".tns" suffix only (not any embedded ".tns"). */
+    int fl = (int)strlen(fname);
+    if (fl >= 4 && strcmp(fname + fl - 4, ".tns") == 0)
+      fname[fl - 4] = '\0';
   }
   if (!gfx_input_filename("Save As", "Filename (no extension):", fname,
                           sizeof(fname)))
-    return;
+    return 0;
 
   if (fname[0] == '\0') {
     const char *body[] = {"Filename cannot be empty."};
     gfx_window_alert("Save As", body, 1, "OK");
-    return;
+    return 0;
   }
 
   char newpath[2048];
@@ -4116,11 +2671,29 @@ static void editor_save_as(void) {
     strncpy(g_filepath, newpath, sizeof(g_filepath) - 1);
     g_filepath[sizeof(g_filepath) - 1] = '\0';
     g_modified = 0;
-  } else {
-    const char *body[] = {"Could not write to the specified path.",
-                          "Check that the directory exists and is writable."};
-    gfx_window_alert("Save As Failed", body, 2, "OK");
+    g_saved = 1;
+    return 1;
   }
+  const char *body[] = {"Could not write to the specified path.",
+                        "Check that the directory exists and is writable."};
+  gfx_window_alert("Save As Failed", body, 2, "OK");
+  return 0;
+}
+
+/* Save the buffer, routing Untitled buffers through Save As and
+   reporting write failures.  Returns 1 if the file is on disk. */
+static int editor_do_save(void) {
+  if (g_filepath[0] == '\0')
+    return editor_save_as();
+  if (!save_file(g_filepath)) {
+    const char *body[] = {"Could not write the file.",
+                          "Check that the location is writable."};
+    gfx_window_alert("Save Failed", body, 2, "OK");
+    return 0;
+  }
+  g_modified = 0;
+  g_saved = 1;
+  return 1;
 }
 
 /* ================================================================
@@ -4165,7 +2738,9 @@ typedef struct {
 static LabelEntry g_labels[MAX_LABELS];
 static int g_nlabels;
 
-/* Rebuild label table from the gap buffer. */
+/* Rebuild label table from the gap buffer.  nasm rule: a label is a
+   valid identifier in column 0 (letter first, then alnum/underscore),
+   no trailing colon. */
 static void labels_scan(void) {
   g_nlabels = 0;
   for (int row = 0; row < num_lines && g_nlabels < MAX_LABELS; row++) {
@@ -4174,7 +2749,7 @@ static void labels_scan(void) {
     if (ll == 0)
       continue;
     char first = gb_get(&g_buf, start);
-    if (!isalpha((unsigned char)first) && first != '_')
+    if (!isalpha((unsigned char)first))
       continue;
     int i = 0;
     while (i < ll && (isalnum((unsigned char)gb_get(&g_buf, start + i)) ||
@@ -4187,8 +2762,8 @@ static void labels_scan(void) {
     for (int k = 0; k < wlen; k++)
       tmp[k] = gb_get(&g_buf, start + k);
     tmp[wlen] = '\0';
-    if (is_reg(tmp, wlen) || is_mnem(tmp, wlen) || is_shift(tmp, wlen) ||
-        is_directive(tmp, wlen))
+    if (syn_is_reg(tmp, wlen) || syn_is_mnem(tmp, wlen) ||
+        syn_is_shift(tmp, wlen) || syn_is_directive(tmp, wlen))
       continue;
     memcpy(g_labels[g_nlabels].name, tmp, wlen + 1);
     g_labels[g_nlabels].line = row;
@@ -4375,27 +2950,6 @@ static int editor_label_browser(void) {
  * or the label does not exist, an appropriate error popup is shown.
  * ================================================================ */
 
-/* Return 1 if the word (case-insensitive, length wlen) is a branch base. */
-static int is_branch_base(const char *w, int wlen) {
-  static const char *bases[] = {"BLX", "BL", "BX", "B", NULL};
-  for (int i = 0; bases[i]; i++) {
-    int bl = (int)strlen(bases[i]);
-    if (wlen >= bl && strncaseeq(w, bases[i], bl)) {
-      int rem = wlen - bl;
-      if (rem == 0)
-        return 1;
-      if (rem == 2) {
-        static const char *cc[] = {"EQ", "NE", "CS", "CC", "MI", "PL",
-                                   "VS", "VC", "HI", "LS", "GE", "LT",
-                                   "GT", "LE", "AL", "HS", "LO", NULL};
-        for (int j = 0; cc[j]; j++)
-          if (strncaseeq(w + bl, cc[j], 2))
-            return 1;
-      }
-    }
-  }
-  return 0;
-}
 
 static void editor_jump_to_label(void) {
   extract_line(cursor_row);
@@ -4413,7 +2967,7 @@ static void editor_jump_to_label(void) {
 
   if (mlen == 0 || !is_branch_base(line + mstart, mlen)) {
     static const char *body[] = {"This line is not a branch instruction.",
-                                 "Place the cursor on a B/BL/BX/BLX line."};
+                                 "Place the cursor on a B/BL/BX line."};
     gfx_window_alert("Not a Branch", body, 2, "OK");
     return;
   }
@@ -4440,9 +2994,9 @@ static void editor_jump_to_label(void) {
   strncpy(opbuf, line + ostart, olen);
   opbuf[olen] = '\0';
 
-  if (is_reg(opbuf, olen)) {
+  if (syn_is_reg(opbuf, olen)) {
     static const char *body[] = {"This branch uses a register operand,",
-                                 "not a label — cannot jump to definition."};
+                                 "not a label, cannot jump to definition."};
     gfx_window_alert("Register Branch", body, 2, "OK");
     return;
   }
@@ -4473,8 +3027,11 @@ typedef struct {
   int nitems;
 } MenuDef;
 
+/* Updated to reflect the current line-ending mode before the menu opens. */
+static char menu_le_label[28] = "Line Ending: LF";
 static const char *menu_file_items[] = {
-    "Save (Ctrl+S)", "Save As (Ctrl+Shift+S)", "Open (Ctrl+O)", "---", "Close"};
+    "Save (Ctrl+S)", "Save As (Ctrl+Shift+S)", "Open (Ctrl+O)", "---",
+    menu_le_label,   "---",                    "Close"};
 static const char *menu_edit_items[] = {
     "Undo (Ctrl+Z)",       "Redo (Ctrl+Y)", "---",
     "Cut (Ctrl+X)",        "Copy (Ctrl+C)", "Paste (Ctrl+V)",
@@ -4489,7 +3046,7 @@ static const char *menu_settings_items[] = {"Preferences"};
 static const char *menu_assemble_items[] = {"Assemble (Ctrl+B)"};
 
 static const MenuDef g_menus[] = {
-    {"File", menu_file_items, 5},         {"Edit", menu_edit_items, 10},
+    {"File", menu_file_items, 7},         {"Edit", menu_edit_items, 10},
     {"Navigate", menu_nav_items, 4},      {"View", menu_view_items, 4},
     {"Assemble", menu_assemble_items, 1}, {"Settings", menu_settings_items, 1},
 };
@@ -4597,14 +3154,24 @@ static void editor_assemble(void) {
     return;
   }
 
+  {
+    struct stat st;
+    if (stat(g_settings.nasm_path, &st) != 0) {
+      static const char *body[] = {
+          "The configured nasm executable was not found.",
+          "Check the path in Settings > Preferences."};
+      gfx_window_alert("Assemble", body, 2, "OK");
+      return;
+    }
+  }
+
   if (g_filepath[0] == '\0') {
     static const char *body[] = {"The file has not been saved yet.",
                                  "Save it now before assembling."};
     int choice = gfx_window_confirm2("Assemble", body, 2, "Save Now", "Cancel");
     if (choice != 0)
       return;
-    editor_save_as();
-    if (g_filepath[0] == '\0')
+    if (!editor_save_as())
       return; /* User cancelled the Save As dialog */
   } else if (g_modified) {
     static const char *body[] = {"The file has unsaved changes.",
@@ -4613,8 +3180,8 @@ static void editor_assemble(void) {
         gfx_window_confirm2("Assemble", body, 2, "Save & Assemble", "Cancel");
     if (choice != 0)
       return;
-    save_file(g_filepath);
-    g_modified = 0;
+    if (!editor_do_save())
+      return;
   }
 
   /*
@@ -4639,8 +3206,9 @@ static void editor_assemble(void) {
   int argsn = 0;
   args[argsn++] = g_filepath; /* always first: the source file */
 
+  /* Keep two slots free for the trailing "--fb <addr>" pair. */
   char *tok = strtok(args_copy, " \t");
-  while (tok && argsn < NASM_MAX_ARGS - 1) {
+  while (tok && argsn < NASM_MAX_ARGS - 2) {
     args[argsn++] = tok;
     tok = strtok(NULL, " \t");
   }
@@ -4655,18 +3223,32 @@ static void editor_assemble(void) {
   nl_exec(g_settings.nasm_path, argsn, args);
   /*
    * nl_exec returns after the child exits (or immediately if it could not
-   * be launched).
+   * be launched).  The child may have re-initialised or restored the LCD
+   * mode, so claim the screen back before drawing anything.
    */
+  gfx_reinit();
 #undef NASM_MAX_ARGS
+}
+
+/* True for menu entries that modify the buffer, so read-only files can
+   gate them behind a confirmation. */
+static int menu_action_edits(int top, int sub) {
+  if (top == 1) /* Edit: Undo, Redo, Cut, Paste, Replace */
+    return sub == 0 || sub == 1 || sub == 3 || sub == 5 || sub == 9;
+  if (top == 3) /* View: catalog / syscall insertion */
+    return sub == 0 || sub == 1;
+  return 0;
 }
 
 /* Menu action dispatch.
    Returns 1 if handled (close menu + redraw), 2 if close editor requested. */
 static int menu_dispatch(int top, int sub) {
+  if (menu_action_edits(top, sub) && !editor_confirm_rw())
+    return 1;
+
   if (top == 0) {
     if (sub == 0) {
-      save_file(g_filepath);
-      g_modified = 0;
+      editor_do_save();
       return 1;
     }
     if (sub == 1) {
@@ -4677,7 +3259,12 @@ static int menu_dispatch(int top, int sub) {
       editor_open_file();
       return 1;
     }
-    if (sub == 4)
+    if (sub == 4) { /* Toggle line endings */
+      g_crlf = !g_crlf;
+      g_modified = 1;
+      return 1;
+    }
+    if (sub == 6)
       return 2;
   }
 
@@ -4691,7 +3278,6 @@ static int menu_dispatch(int top, int sub) {
       return 1;
     }
     if (sub == 3) {
-      undo_push();
       clipboard_copy(1);
       return 1;
     }
@@ -4781,6 +3367,9 @@ static int menu_run(void) {
   int sub_sel = 0;
   int in_sub = 0;
   int result = 0;
+
+  snprintf(menu_le_label, sizeof(menu_le_label), "Line Ending: %s",
+           g_crlf ? "CRLF" : "LF");
 
   while (any_key_pressed())
     msleep(20);
@@ -4873,27 +3462,46 @@ static int prompt_unsaved(void) {
 /* ================================================================
  * Key-repeat helper
  * ================================================================ */
+
+/* Only text entry and cursor movement auto-repeat when a key is held;
+   commands (save, undo, search, catalog, ...) fire once per press. */
+static int action_is_repeatable(int act) {
+  if (act > 0)
+    return 1; /* printable character */
+  switch (act) {
+  case ACT_ENTER:
+  case ACT_BS:
+  case ACT_DEL:
+  case ACT_TAB:
+  case ACT_UNTAB:
+  case ACT_LEFT:
+  case ACT_RIGHT:
+  case ACT_UP:
+  case ACT_DOWN:
+  case ACT_HOME:
+  case ACT_END:
+  case ACT_PGUP:
+  case ACT_PGDN:
+  case ACT_WORD_LEFT:
+  case ACT_WORD_RIGHT:
+  case ACT_SEL_LEFT:
+  case ACT_SEL_RIGHT:
+  case ACT_SEL_UP:
+  case ACT_SEL_DOWN:
+  case ACT_SEL_HOME:
+  case ACT_SEL_END:
+  case ACT_SEL_WORD_LEFT:
+  case ACT_SEL_WORD_RIGHT:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 static int key_repeat_poll(void) {
-  int action = poll_key();
-
-  if (action == ACT_NONE) {
-    last_action = ACT_NONE;
-    repeat_timer = 0;
-    return ACT_NONE;
-  }
-
-  if (action != last_action) {
-    last_action = action;
-    repeat_timer = 0;
-    return action;
-  }
-
-  repeat_timer++;
-  if (repeat_timer < REPEAT_DELAY)
-    return ACT_NONE;
-  if ((repeat_timer - REPEAT_DELAY) % REPEAT_RATE != 0)
-    return ACT_NONE;
-  return action;
+  int act = poll_key();
+  int one_shot = !action_is_repeatable(act);
+  return gfx_repeat_gate(&g_key_repeat, act, ACT_NONE, one_shot);
 }
 
 /* ================================================================
@@ -4904,13 +3512,17 @@ int editor_open(const char *path) {
     strncpy(g_filepath, path, sizeof(g_filepath) - 1);
     g_filepath[sizeof(g_filepath) - 1] = '\0';
     load_file(path);
+    g_readonly = !path_is_asm_source(g_filepath);
   } else {
     g_filepath[0] = '\0';
     gb_init(&g_buf);
     rebuild_lines(&g_buf);
+    g_readonly = 0;
   }
 
   g_modified = 0;
+  g_saved = 0;
+  g_gb_oom = 0;
 
   cursor_pos = 0;
   cursor_row = 0;
@@ -4931,24 +3543,33 @@ int editor_open(const char *path) {
 
   render_all();
 
+  if (g_lines_truncated) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "File exceeds %d lines; extra lines are",
+             MAX_LINES);
+    const char *body[] = {msg, "shown but cannot be navigated separately."};
+    gfx_window_alert("Large File", body, 2, "OK");
+  }
+
   while (any_key_pressed())
     msleep(20);
 
-  int saved = 0;
   int running = 1;
 
   while (running) {
-    if (isKeyPressed(KEY_NSPIRE_MENU)) {
+    /* Plain Menu opens the menu bar; Ctrl+Menu is the jump-to-bottom
+       shortcut handled by poll_key. */
+    if (isKeyPressed(KEY_NSPIRE_MENU) && !isKeyPressed(KEY_NSPIRE_CTRL)) {
       int close = menu_run();
       if (close) {
         if (g_modified) {
           int choice = prompt_unsaved();
           if (choice == 1) {
-            save_file(g_filepath);
-            saved = 1;
-          }
-          if (choice != 0)
+            if (editor_do_save())
+              running = 0;
+          } else if (choice == 2) {
             running = 0;
+          }
         } else {
           running = 0;
         }
@@ -4964,23 +3585,24 @@ int editor_open(const char *path) {
       continue;
     }
 
+    /* Gate the first edit of a read-only file behind a confirmation. */
+    if (act_is_edit(act) && !editor_confirm_rw()) {
+      render_all();
+      continue;
+    }
+
+    /* Any non-edit action (movement, save, search...) ends the current
+       undo-coalescing group. */
+    if (!act_is_edit(act))
+      undo_break();
+
     switch (act) {
     case ACT_ESC:
       if (g_modified) {
         int choice = prompt_unsaved();
         if (choice == 1) { /* Save */
-          if (g_filepath[0] == '\0') {
-            editor_save_as();
-            if (!g_modified) {
-              saved = 1;
-              running = 0;
-            }
-          } else {
-            save_file(g_filepath);
-            g_modified = 0;
-            saved = 1;
+          if (editor_do_save())
             running = 0;
-          }
         } else if (choice == 2) { /* Discard */
           running = 0;
         }
@@ -4993,13 +3615,7 @@ int editor_open(const char *path) {
       editor_open_file();
       break;
     case ACT_SAVE:
-      if (g_filepath[0] == '\0') {
-        editor_save_as();
-      } else {
-        save_file(g_filepath);
-        g_modified = 0;
-        saved = 1;
-      }
+      editor_do_save();
       break;
     case ACT_SAVE_AS:
       editor_save_as();
@@ -5029,6 +3645,9 @@ int editor_open(const char *path) {
       break;
     case ACT_TAB:
       do_tab();
+      break;
+    case ACT_UNTAB:
+      do_untab();
       break;
     case ACT_LEFT:
       do_left();
@@ -5100,7 +3719,6 @@ int editor_open(const char *path) {
       clipboard_copy(0);
       break;
     case ACT_CUT:
-      undo_push();
       clipboard_copy(1);
       break;
     case ACT_PASTE:
@@ -5161,6 +3779,19 @@ int editor_open(const char *path) {
       break;
     }
 
+    if (g_gb_oom) {
+      g_gb_oom = 0;
+      static const char *body[] = {"Out of memory: the last edit was",
+                                   "dropped.  Save your work now."};
+      gfx_window_alert("Memory", body, 2, "OK");
+    }
+
+    /* Vertical moves keep the goal column; every other action (edits,
+       horizontal moves, jumps) re-anchors it to the current column. */
+    if (act != ACT_UP && act != ACT_DOWN && act != ACT_PGUP &&
+        act != ACT_PGDN && act != ACT_SEL_UP && act != ACT_SEL_DOWN)
+      cursor_goal_col = cursor_col;
+
     if (running) {
       scroll_to_cursor();
       render_all();
@@ -5168,5 +3799,13 @@ int editor_open(const char *path) {
   }
 
   gb_free(&g_buf);
-  return saved;
+  /* Release the undo/redo snapshots (up to 32 buffer copies) rather than
+     holding them while the user is back in the main menu. */
+  for (int i = 0; i < UNDO_MAX; i++) {
+    snap_free(&g_undo_ring[i]);
+    snap_free(&g_redo_ring[i]);
+  }
+  g_undo_head = g_undo_count = 0;
+  g_redo_head = g_redo_count = 0;
+  return g_saved;
 }

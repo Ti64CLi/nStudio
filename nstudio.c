@@ -8,8 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "browser.h"
 #include "editor.h"
-#include "filebrowser.h"
 #include "gfx.h"
 #include "settings.h"
 
@@ -20,10 +20,9 @@
 static void action_new_file(void) { editor_open(""); }
 
 static void action_open_file(void) {
-  const char *path = filebrowser_select();
-  if (!path) {
+  char path[512];
+  if (!browser_pick_file("/documents", 1, path, sizeof(path)))
     return;
-  }
   editor_open(path);
 }
 
@@ -70,8 +69,6 @@ int main(int argc, char *argv[]) {
       settings_ui_open();
       break;
     }
-
-    gfx_init();
   }
 
   gfx_deinit();

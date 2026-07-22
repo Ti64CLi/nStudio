@@ -4,7 +4,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-#include "filebrowser.h"
+#include "browser.h"
 #include "gfx.h"
 #include "settings.h"
 
@@ -628,8 +628,9 @@ void settings_ui_open(void) {
                               "Please select it manually."};
         gfx_window_alert("Auto-detect", body, 2, "OK");
 
-        const char *picked = filebrowser_select();
-        if (picked && picked[0]) {
+        /* Filter off: nasm.tns would be hidden by the asm-source filter */
+        char picked[512];
+        if (browser_pick_file("/documents", 0, picked, sizeof(picked))) {
           strncpy(g_settings.nasm_path, picked, 255);
           g_settings.nasm_path[255] = '\0';
         }
