@@ -49,6 +49,14 @@ void gfx_deinit(void) {
     gfx_initialised = 0;
   }
 }
+/* Unconditionally reclaim the LCD after a child program (e.g. nasm via
+   nl_exec) may have changed the screen mode.  Unlike gfx_init, this
+   ignores the initialised flag. */
+void gfx_reinit(void) {
+  lcd_init(SCR_320x240_565);
+  gfx_clear_clip();
+  gfx_initialised = 1;
+}
 void gfx_flip(void) { lcd_blit(fb, SCR_320x240_565); }
 
 /* --------------------------------------------------------------*/
@@ -259,13 +267,6 @@ int gfx_drawstr(int x, int y, const char *s, uint16_t fg, uint16_t bg) {
   return x;
 }
 
-int gfx_drawstr_n(int x, int y, const char *s, int n, uint16_t fg,
-                  uint16_t bg) {
-  for (int i = 0; i < n && *s; i++)
-    x += gfx_drawchar(x, y, *s++, fg, bg);
-  return x;
-}
-
 void gfx_drawstr_clipped(int x, int y, const char *s, uint16_t fg, uint16_t bg,
                          int maxw) {
   int cx = x;
@@ -325,22 +326,24 @@ void gfx_window_alert(const char *title, const char **lines, int nlines,
   int wx = (GFX_W - win_w) / 2;
   int wy = (GFX_H - win_h) / 2;
 
-  gfx_fillrect(wx + 3, wy + 3, win_w, win_h, GFX_COL_GREY);
+  gfx_fillrect(wx + 3, wy + 3, win_w, win_h, g_default_theme.border_dark);
 
-  gfx_borderrect(wx, wy, win_w, win_h, GFX_COL_LIGHT_GREY, GFX_COL_DARK_BLUE);
+  gfx_borderrect(wx, wy, win_w, win_h, g_default_theme.border_light,
+                 g_default_theme.border_dark);
 
   gfx_fillrect(wx + WIN_BORDER, wy + WIN_BORDER, win_w - WIN_BORDER * 2,
-               WIN_TITLE_H, GFX_COL_DARK_BLUE);
+               WIN_TITLE_H, g_default_theme.title_bg);
   if (title) {
     gfx_drawstr_clipped(
         wx + WIN_H_PAD, wy + WIN_BORDER + (WIN_TITLE_H - GFX_FONT_H) / 2, title,
-        GFX_COL_WHITE, GFX_COL_DARK_BLUE, win_w - WIN_H_PAD * 2);
+        g_default_theme.title_fg, g_default_theme.title_bg,
+        win_w - WIN_H_PAD * 2);
   }
 
   int body_top = wy + WIN_BORDER + WIN_TITLE_H;
   int body_area_h = win_h - WIN_BORDER - WIN_TITLE_H - WIN_BTN_H - WIN_BORDER;
   gfx_fillrect(wx + WIN_BORDER, body_top, win_w - WIN_BORDER * 2, body_area_h,
-               GFX_COL_BLACK);
+               g_default_theme.bg);
 
   int inner_w = win_w - WIN_BORDER * 2 - WIN_H_PAD * 2;
   for (i = 0; i < nlines; i++) {
@@ -348,14 +351,15 @@ void gfx_window_alert(const char *title, const char **lines, int nlines,
       continue;
     int ty = body_top + WIN_BODY_PAD + i * (GFX_FONT_H + 2);
     gfx_drawstr_clipped(wx + WIN_BORDER + WIN_H_PAD, ty, lines[i],
-                        GFX_COL_WHITE, GFX_COL_BLACK, inner_w);
+                        g_default_theme.fg, g_default_theme.bg, inner_w);
   }
 
   int sep_y = wy + win_h - WIN_BTN_H - WIN_BORDER;
-  gfx_hline(wx + WIN_BORDER, sep_y, win_w - WIN_BORDER * 2, GFX_COL_DARK_BLUE);
+  gfx_hline(wx + WIN_BORDER, sep_y, win_w - WIN_BORDER * 2,
+            g_default_theme.border_light);
 
   gfx_fillrect(wx + WIN_BORDER, sep_y + 1, win_w - WIN_BORDER * 2,
-               WIN_BTN_H - 1, GFX_COL_BLACK);
+               WIN_BTN_H - 1, g_default_theme.bg);
 
   int btn_label_w = (int)strlen(ok_label) * GFX_CHAR_W;
   int btn_w = btn_label_w + 8;
@@ -363,8 +367,10 @@ void gfx_window_alert(const char *title, const char **lines, int nlines,
   int btn_x = wx + (win_w - btn_w) / 2;
   int btn_y = sep_y + (WIN_BTN_H - btn_h) / 2;
 
-  gfx_borderrect(btn_x, btn_y, btn_w, btn_h, GFX_COL_GREEN, GFX_COL_WHITE);
-  gfx_drawstr(btn_x + 4, btn_y + 2, ok_label, GFX_COL_BLACK, GFX_COL_GREEN);
+  gfx_borderrect(btn_x, btn_y, btn_w, btn_h, g_default_theme.accent,
+                 g_default_theme.border_light);
+  gfx_drawstr(btn_x + 4, btn_y + 2, ok_label, g_default_theme.accent_text,
+              g_default_theme.accent);
 
   gfx_flip();
 
@@ -383,228 +389,6 @@ void gfx_window_alert(const char *title, const char **lines, int nlines,
 
     msleep(20);
     idle();
-  }
-}
-
-void gfx_window_scrolltext(const char *title, const char **lines, int nlines,
-                           const char *ok_label) {
-  if (!ok_label)
-    ok_label = "OK";
-
-  int title_chars = title ? (int)strlen(title) : 0;
-  int max_len = 0;
-  for (int i = 0; i < nlines; i++) {
-    if (lines[i]) {
-      int len = (int)strlen(lines[i]);
-      if (len > max_len)
-        max_len = len;
-    }
-  }
-  int ok_chars = (int)strlen(ok_label);
-
-  int content_w = max_len * GFX_CHAR_W;
-  if (title_chars * GFX_CHAR_W > content_w)
-    content_w = title_chars * GFX_CHAR_W;
-  if (ok_chars * GFX_CHAR_W + 8 > content_w)
-    content_w = ok_chars * GFX_CHAR_W + 8;
-
-  int line_spacing = GFX_FONT_H + 2;
-
-  int win_w = content_w + WIN_H_PAD * 2 + WIN_BORDER * 2;
-  if (win_w < WIN_MIN_W)
-    win_w = WIN_MIN_W;
-
-  int need_h_scroll = 0;
-  if (win_w > WIN_MAX_W) {
-    win_w = WIN_MAX_W;
-    need_h_scroll = 1;
-  }
-
-  int body_h = nlines * line_spacing;
-  if (need_h_scroll)
-    body_h += 6;
-
-  int win_h = WIN_TITLE_H + WIN_BODY_PAD * 2 + body_h + WIN_BTN_H + WIN_BORDER;
-  int need_v_scroll = 0;
-
-  if (win_h > WIN_MAX_H) {
-    win_h = WIN_MAX_H;
-    need_v_scroll = 1;
-
-    if (!need_h_scroll &&
-        (content_w > win_w - WIN_BORDER * 2 - WIN_H_PAD * 2 - 6)) {
-      need_h_scroll = 1;
-    }
-  }
-
-  int wx = (GFX_W - win_w) / 2;
-  int wy = (GFX_H - win_h) / 2;
-  int body_top = wy + WIN_BORDER + WIN_TITLE_H;
-  int body_area_h = win_h - WIN_BORDER - WIN_TITLE_H - WIN_BTN_H - WIN_BORDER;
-  int sep_y = wy + win_h - WIN_BTN_H - WIN_BORDER;
-
-  int inner_w = win_w - WIN_BORDER * 2 - WIN_H_PAD * 2;
-  if (need_v_scroll)
-    inner_w -= 6;
-
-  int visible_body_h = body_area_h - WIN_BODY_PAD * 2;
-  if (need_h_scroll)
-    visible_body_h -= 6;
-
-  int max_visible_y = visible_body_h / line_spacing;
-  if (max_visible_y < 1)
-    max_visible_y = 1;
-  int max_visible_x = inner_w / GFX_CHAR_W;
-
-  int btn_label_w = ok_chars * GFX_CHAR_W;
-  int btn_w = btn_label_w + 8;
-  int btn_h = GFX_FONT_H + 4;
-  int btn_x = wx + (win_w - btn_w) / 2;
-  int btn_y = sep_y + (WIN_BTN_H - btn_h) / 2;
-
-  int scroll_y = 0;
-  int scroll_x = 0;
-
-  while (any_key_pressed()) {
-    msleep(20);
-  }
-
-  for (;;) {
-    gfx_fillrect(wx + 3, wy + 3, win_w, win_h, GFX_COL_GREY);
-    gfx_borderrect(wx, wy, win_w, win_h, GFX_COL_LIGHT_GREY, GFX_COL_DARK_BLUE);
-
-    gfx_fillrect(wx + WIN_BORDER, wy + WIN_BORDER, win_w - WIN_BORDER * 2,
-                 WIN_TITLE_H, GFX_COL_DARK_BLUE);
-    if (title) {
-      gfx_drawstr_clipped(
-          wx + WIN_H_PAD, wy + WIN_BORDER + (WIN_TITLE_H - GFX_FONT_H) / 2,
-          title, GFX_COL_WHITE, GFX_COL_DARK_BLUE, win_w - WIN_H_PAD * 2);
-    }
-
-    gfx_fillrect(wx + WIN_BORDER, body_top, win_w - WIN_BORDER * 2, body_area_h,
-                 GFX_COL_BLACK);
-
-    for (int i = 0; i < max_visible_y; i++) {
-      int idx = scroll_y + i;
-      if (idx >= nlines)
-        break;
-      if (!lines[idx])
-        continue;
-
-      int ty = body_top + WIN_BODY_PAD + i * line_spacing;
-      int len = (int)strlen(lines[idx]);
-
-      const char *disp = "";
-      if (len > scroll_x) {
-        disp = lines[idx] + scroll_x;
-      }
-
-      gfx_drawstr_clipped(wx + WIN_BORDER + WIN_H_PAD, ty, disp, GFX_COL_WHITE,
-                          GFX_COL_BLACK, inner_w);
-    }
-
-    if (need_v_scroll && nlines > max_visible_y) {
-      int sb_x = wx + win_w - WIN_BORDER - 4;
-      int sb_y = body_top + WIN_BODY_PAD;
-      int sb_total_h = max_visible_y * line_spacing;
-
-      int bar_h = (sb_total_h * max_visible_y) / nlines;
-      if (bar_h < 4)
-        bar_h = 4;
-
-      int bar_y =
-          sb_y + ((sb_total_h - bar_h) * scroll_y) / (nlines - max_visible_y);
-
-      gfx_fillrect(sb_x, sb_y, 2, sb_total_h, GFX_COL_GREY);
-      gfx_fillrect(sb_x, bar_y, 2, bar_h, GFX_COL_WHITE);
-    }
-
-    if (need_h_scroll && max_len > max_visible_x) {
-      int sb_x = wx + WIN_BORDER + WIN_H_PAD;
-      int sb_y = body_top + body_area_h - 4;
-      int sb_total_w = inner_w;
-
-      int bar_w = (sb_total_w * max_visible_x) / max_len;
-      if (bar_w < 4)
-        bar_w = 4;
-
-      int bar_x =
-          sb_x + ((sb_total_w - bar_w) * scroll_x) / (max_len - max_visible_x);
-
-      gfx_fillrect(sb_x, sb_y, sb_total_w, 2, GFX_COL_GREY);
-      gfx_fillrect(bar_x, sb_y, bar_w, 2, GFX_COL_WHITE);
-    }
-
-    gfx_hline(wx + WIN_BORDER, sep_y, win_w - WIN_BORDER * 2,
-              GFX_COL_DARK_BLUE);
-    gfx_fillrect(wx + WIN_BORDER, sep_y + 1, win_w - WIN_BORDER * 2,
-                 WIN_BTN_H - 1, GFX_COL_BLACK);
-    gfx_borderrect(btn_x, btn_y, btn_w, btn_h, GFX_COL_GREEN, GFX_COL_WHITE);
-    gfx_drawstr(btn_x + 4, btn_y + 2, ok_label, GFX_COL_BLACK, GFX_COL_GREEN);
-
-    gfx_flip();
-
-    if (isKeyPressed(KEY_NSPIRE_UP) || isKeyPressed(KEY_NSPIRE_8)) {
-      if (scroll_y > 0)
-        scroll_y--;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_UPRIGHT) || isKeyPressed(KEY_NSPIRE_9)) {
-      if (scroll_y > 0)
-        scroll_y--;
-      if (need_h_scroll && scroll_x < max_len - max_visible_x)
-        scroll_x++;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_RIGHT) || isKeyPressed(KEY_NSPIRE_6)) {
-      if (need_h_scroll && scroll_x < max_len - max_visible_x)
-        scroll_x++;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_RIGHTDOWN) ||
-               isKeyPressed(KEY_NSPIRE_3)) {
-      if (need_v_scroll && scroll_y < nlines - max_visible_y)
-        scroll_y++;
-      if (need_h_scroll && scroll_x < max_len - max_visible_x)
-        scroll_x++;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_DOWN) || isKeyPressed(KEY_NSPIRE_2)) {
-      if (need_v_scroll && scroll_y < nlines - max_visible_y)
-        scroll_y++;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_DOWNLEFT) ||
-               isKeyPressed(KEY_NSPIRE_1)) {
-      if (need_v_scroll && scroll_y < nlines - max_visible_y)
-        scroll_y++;
-      if (scroll_x > 0)
-        scroll_x--;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_LEFT) || isKeyPressed(KEY_NSPIRE_4)) {
-      if (scroll_x > 0)
-        scroll_x--;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_LEFTUP) || isKeyPressed(KEY_NSPIRE_7)) {
-      if (scroll_y > 0)
-        scroll_y--;
-      if (scroll_x > 0)
-        scroll_x--;
-
-      msleep(40);
-    } else if (isKeyPressed(KEY_NSPIRE_ENTER) ||
-               isKeyPressed(KEY_NSPIRE_SPACE) || isKeyPressed(KEY_NSPIRE_ESC) ||
-               isKeyPressed(KEY_NSPIRE_CLICK)) {
-      while (any_key_pressed())
-        msleep(20);
-
-      break;
-    } else {
-      msleep(20);
-      idle();
-    }
   }
 }
 
@@ -717,39 +501,48 @@ int gfx_menu(const char *title, const char *subtitle, const char **items,
 }
 
 /* ================================================================
- * gfx_input_filename  -  single-line filename input dialog
+ * Shared character keymap (editor + text-input dialogs)
+ *
+ * CX/CX II are touchpad-only, so keys whose touchpad position is a
+ * dummy (KEY_NSPIRE_QUES / GTHAN / LTHAN) are omitted - they can never
+ * be detected on this hardware.  The physical "?!" key on the CX is
+ * KEY_NSPIRE_QUESEXCL.
  * ================================================================ */
-
-#define INPUT_KEYMAP_SIZE 40
-
-typedef struct {
-  t_key key;
-  char normal;
-  char shifted;
-} InputKey;
-
-static const InputKey input_keymap[INPUT_KEYMAP_SIZE] = {
-    {KEY_NSPIRE_A, 'a', 'A'},      {KEY_NSPIRE_B, 'b', 'B'},
-    {KEY_NSPIRE_C, 'c', 'C'},      {KEY_NSPIRE_D, 'd', 'D'},
-    {KEY_NSPIRE_E, 'e', 'E'},      {KEY_NSPIRE_F, 'f', 'F'},
-    {KEY_NSPIRE_G, 'g', 'G'},      {KEY_NSPIRE_H, 'h', 'H'},
-    {KEY_NSPIRE_I, 'i', 'I'},      {KEY_NSPIRE_J, 'j', 'J'},
-    {KEY_NSPIRE_K, 'k', 'K'},      {KEY_NSPIRE_L, 'l', 'L'},
-    {KEY_NSPIRE_M, 'm', 'M'},      {KEY_NSPIRE_N, 'n', 'N'},
-    {KEY_NSPIRE_O, 'o', 'O'},      {KEY_NSPIRE_P, 'p', 'P'},
-    {KEY_NSPIRE_Q, 'q', 'Q'},      {KEY_NSPIRE_R, 'r', 'R'},
-    {KEY_NSPIRE_S, 's', 'S'},      {KEY_NSPIRE_T, 't', 'T'},
-    {KEY_NSPIRE_U, 'u', 'U'},      {KEY_NSPIRE_V, 'v', 'V'},
-    {KEY_NSPIRE_W, 'w', 'W'},      {KEY_NSPIRE_X, 'x', 'X'},
-    {KEY_NSPIRE_Y, 'y', 'Y'},      {KEY_NSPIRE_Z, 'z', 'Z'},
-    {KEY_NSPIRE_0, '0', '}'},      {KEY_NSPIRE_1, '1', '!'},
-    {KEY_NSPIRE_2, '2', '@'},      {KEY_NSPIRE_3, '3', '#'},
-    {KEY_NSPIRE_4, '4', '$'},      {KEY_NSPIRE_5, '5', '%'},
-    {KEY_NSPIRE_6, '6', '^'},      {KEY_NSPIRE_7, '7', '&'},
-    {KEY_NSPIRE_8, '8', '*'},      {KEY_NSPIRE_9, '9', '('},
-    {KEY_NSPIRE_MINUS, '-', '_'},  {KEY_NSPIRE_PERIOD, '.', '.'},
-    {KEY_NSPIRE_DIVIDE, '/', '/'}, {KEY_NSPIRE_SPACE, ' ', '_'},
+const GfxKeyMap gfx_char_keymap[] = {
+    {KEY_NSPIRE_A, 'a', 'A', 0},           {KEY_NSPIRE_B, 'b', 'B', 0},
+    {KEY_NSPIRE_C, 'c', 'C', 0},           {KEY_NSPIRE_D, 'd', 'D', 0},
+    {KEY_NSPIRE_E, 'e', 'E', 0},           {KEY_NSPIRE_F, 'f', 'F', 0},
+    {KEY_NSPIRE_G, 'g', 'G', 0},           {KEY_NSPIRE_H, 'h', 'H', 0},
+    {KEY_NSPIRE_I, 'i', 'I', 0},           {KEY_NSPIRE_J, 'j', 'J', 0},
+    {KEY_NSPIRE_K, 'k', 'K', 0},           {KEY_NSPIRE_L, 'l', 'L', 0},
+    {KEY_NSPIRE_M, 'm', 'M', 0},           {KEY_NSPIRE_N, 'n', 'N', 0},
+    {KEY_NSPIRE_O, 'o', 'O', 0},           {KEY_NSPIRE_P, 'p', 'P', 0},
+    {KEY_NSPIRE_Q, 'q', 'Q', 0},           {KEY_NSPIRE_R, 'r', 'R', 0},
+    {KEY_NSPIRE_S, 's', 'S', 0},           {KEY_NSPIRE_T, 't', 'T', 0},
+    {KEY_NSPIRE_U, 'u', 'U', 0},           {KEY_NSPIRE_V, 'v', 'V', 0},
+    {KEY_NSPIRE_W, 'w', 'W', 0},           {KEY_NSPIRE_X, 'x', 'X', 0},
+    {KEY_NSPIRE_Y, 'y', 'Y', 0},           {KEY_NSPIRE_Z, 'z', 'Z', 0},
+    {KEY_NSPIRE_0, '0', ')', 0},           {KEY_NSPIRE_1, '1', '!', 0},
+    {KEY_NSPIRE_2, '2', '@', 0},           {KEY_NSPIRE_3, '3', '#', 0},
+    {KEY_NSPIRE_4, '4', '$', 0},           {KEY_NSPIRE_5, '5', '%', 0},
+    {KEY_NSPIRE_6, '6', '^', 0},           {KEY_NSPIRE_7, '7', '&', 0},
+    {KEY_NSPIRE_8, '8', '*', 0},           {KEY_NSPIRE_9, '9', '(', 0},
+    {KEY_NSPIRE_COMMA, ',', '<', 0},       {KEY_NSPIRE_PERIOD, '.', '>', 0},
+    {KEY_NSPIRE_COLON, ':', ';', 0},       {KEY_NSPIRE_DIVIDE, '/', '?', 0},
+    {KEY_NSPIRE_MINUS, '-', '_', 0},       {KEY_NSPIRE_PLUS, '+', '=', 0},
+    {KEY_NSPIRE_LP, '(', '[', '{'},        {KEY_NSPIRE_RP, ')', ']', '}'},
+    {KEY_NSPIRE_SPACE, ' ', ' ', 0},       {KEY_NSPIRE_EXP, '^', '~', 0},
+    {KEY_NSPIRE_BAR, '|', '\\', 0},        {KEY_NSPIRE_QUOTE, '"', '"', 0},
+    {KEY_NSPIRE_APOSTROPHE, '\'', '`', 0}, {KEY_NSPIRE_MULTIPLY, '*', '*', 0},
+    {KEY_NSPIRE_EQU, '=', '+', 0},         {KEY_NSPIRE_QUESEXCL, '?', '!', 0},
 };
+
+const int gfx_char_keymap_size =
+    (int)(sizeof(gfx_char_keymap) / sizeof(gfx_char_keymap[0]));
+
+/* ================================================================
+ * gfx_input_filename  -  single-line text input dialog
+ * ================================================================ */
 
 #define INP_WIN_W 260
 #define INP_WIN_H 70
@@ -757,32 +550,33 @@ static const InputKey input_keymap[INPUT_KEYMAP_SIZE] = {
 #define INP_FIELD_H 14 /* text field box height */
 #define INP_PAD 8
 
-#define INP_REPEAT_DELAY 18
-#define INP_REPEAT_RATE 4
-
 static void input_render(const char *title, const char *prompt, const char *buf,
                          int cursor, int wx, int wy) {
-  gfx_fillrect(wx + 3, wy + 3, INP_WIN_W, INP_WIN_H, GFX_COL_GREY);
-  gfx_borderrect(wx, wy, INP_WIN_W, INP_WIN_H, GFX_COL_BLACK,
-                 GFX_COL_DARK_BLUE);
-  gfx_fillrect(wx + 1, wy + 1, INP_WIN_W - 2, INP_TITLE_H, GFX_COL_DARK_BLUE);
+  uint16_t fld_bg = g_default_theme.item_bg;
+  gfx_fillrect(wx + 3, wy + 3, INP_WIN_W, INP_WIN_H, g_default_theme.border_dark);
+  gfx_borderrect(wx, wy, INP_WIN_W, INP_WIN_H, g_default_theme.border_light,
+                 g_default_theme.border_dark);
+  gfx_fillrect(wx + 1, wy + 1, INP_WIN_W - 2, INP_TITLE_H,
+               g_default_theme.title_bg);
   gfx_drawstr_clipped(wx + INP_PAD, wy + 1 + (INP_TITLE_H - GFX_FONT_H) / 2,
-                      title, GFX_COL_WHITE, GFX_COL_DARK_BLUE,
+                      title, g_default_theme.title_fg, g_default_theme.title_bg,
                       INP_WIN_W - INP_PAD * 2);
   int body_y = wy + 1 + INP_TITLE_H;
   int body_h = INP_WIN_H - INP_TITLE_H - 2;
-  gfx_fillrect(wx + 1, body_y, INP_WIN_W - 2, body_h, GFX_COL_BLACK);
+  gfx_fillrect(wx + 1, body_y, INP_WIN_W - 2, body_h, g_default_theme.bg);
 
   int prompt_y = body_y + INP_PAD / 2;
   if (prompt) {
-    gfx_drawstr(wx + INP_PAD, prompt_y, prompt, GFX_COL_GREY, GFX_COL_BLACK);
+    gfx_drawstr(wx + INP_PAD, prompt_y, prompt, g_default_theme.border_light,
+                g_default_theme.bg);
     prompt_y += GFX_FONT_H + 3;
   }
 
   int field_x = wx + INP_PAD;
   int field_w = INP_WIN_W - INP_PAD * 2;
   int field_y = prompt_y;
-  gfx_borderrect(field_x, field_y, field_w, INP_FIELD_H, 0x1082u, GFX_COL_GREY);
+  gfx_borderrect(field_x, field_y, field_w, INP_FIELD_H, fld_bg,
+                 g_default_theme.border_light);
 
   int text_x = field_x + 2;
   int text_y = field_y + (INP_FIELD_H - GFX_FONT_H) / 2;
@@ -798,22 +592,32 @@ static void input_render(const char *title, const char *prompt, const char *buf,
     int idx = start + i;
     int cx = text_x + i * GFX_CHAR_W;
     int is_cur = (idx == cursor);
+    uint16_t cur_fg = g_default_theme.accent_text;
+    uint16_t cur_bg = g_default_theme.accent;
     if (idx < len) {
-      gfx_drawchar(cx, text_y, buf[idx], is_cur ? GFX_COL_BLACK : GFX_COL_WHITE,
-                   is_cur ? GFX_COL_WHITE : 0x1082u);
+      gfx_drawchar(cx, text_y, buf[idx], is_cur ? cur_fg : g_default_theme.fg,
+                   is_cur ? cur_bg : fld_bg);
     } else if (is_cur) {
-      gfx_drawchar(cx, text_y, ' ', GFX_COL_BLACK, GFX_COL_WHITE);
+      gfx_drawchar(cx, text_y, ' ', cur_fg, cur_bg);
     } else {
-      gfx_drawchar(cx, text_y, ' ', GFX_COL_WHITE, 0x1082u);
+      gfx_drawchar(cx, text_y, ' ', g_default_theme.fg, fld_bg);
     }
   }
 
   int hint_y = field_y + INP_FIELD_H + 3;
   gfx_drawstr_clipped(field_x, hint_y, "Enter:confirm  Esc:cancel",
-                      GFX_COL_GREY, GFX_COL_BLACK, field_w);
+                      g_default_theme.border_light, g_default_theme.bg,
+                      field_w);
 
   gfx_flip();
 }
+
+/* Movement pseudo-actions fed through the repeat gate (distinct from
+   the printable character codes and from -1 = backspace). */
+#define INP_LEFT (-2)
+#define INP_RIGHT (-3)
+#define INP_HOME (-4)
+#define INP_END (-5)
 
 int gfx_input_filename(const char *title, const char *prompt, char *out,
                        int outmax) {
@@ -822,12 +626,16 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
   int wy = (GFX_H - INP_WIN_H) / 2;
 
   char buf[256];
-  int len = 0;
-  int cursor = 0;
-  buf[0] = '\0';
+  /* Pre-seed with the caller's current value so the field is editable
+     rather than always starting blank. */
+  int len = (int)strlen(out);
+  if (len > (int)sizeof(buf) - 1)
+    len = (int)sizeof(buf) - 1;
+  memcpy(buf, out, len);
+  buf[len] = '\0';
+  int cursor = len;
 
-  int last_ch = 0;
-  int rep_timer = 0;
+  GfxRepeat rep = {0, 0};
 
   while (any_key_pressed()) {
     msleep(20);
@@ -838,7 +646,7 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
 
   for (;;) {
     int ch = 0;
-    int is_bs = 0;
+    int action = 0;
     int shift = (int)isKeyPressed(KEY_NSPIRE_SHIFT);
 
     if (isKeyPressed(KEY_NSPIRE_ENTER)) {
@@ -860,49 +668,50 @@ int gfx_input_filename(const char *title, const char *prompt, char *out,
       }
       return 0;
     }
-    if (isKeyPressed(KEY_NSPIRE_DEL)) {
-      is_bs = 1;
-    }
-    if (!is_bs) {
-      int i;
-      for (i = 0; i < INPUT_KEYMAP_SIZE; i++) {
-        if (isKeyPressed(input_keymap[i].key)) {
-          ch = shift ? (unsigned char)input_keymap[i].shifted
-                     : (unsigned char)input_keymap[i].normal;
+
+    if (isKeyPressed(KEY_NSPIRE_DEL))
+      action = -1;
+    else if (isKeyPressed(KEY_NSPIRE_LEFT))
+      action = INP_LEFT;
+    else if (isKeyPressed(KEY_NSPIRE_RIGHT))
+      action = INP_RIGHT;
+    else if (isKeyPressed(KEY_NSPIRE_HOME))
+      action = INP_HOME;
+    else if (isKeyPressed(KEY_NSPIRE_DOC))
+      action = INP_END;
+    else {
+      for (int i = 0; i < gfx_char_keymap_size; i++) {
+        if (isKeyPressed(gfx_char_keymap[i].key)) {
+          ch = shift ? (unsigned char)gfx_char_keymap[i].shifted
+                     : (unsigned char)gfx_char_keymap[i].normal;
+          action = ch;
           break;
         }
       }
     }
 
-    int action = is_bs ? -1 : ch;
-
-    if (action == 0) {
-      last_ch = 0;
-      rep_timer = 0;
+    if (gfx_repeat_gate(&rep, action, 0, 0) == 0) {
       msleep(16);
       idle();
       continue;
     }
 
-    if (action != last_ch) {
-      last_ch = action;
-      rep_timer = 0;
-    } else {
-      rep_timer++;
-      if (rep_timer < INP_REPEAT_DELAY ||
-          (rep_timer - INP_REPEAT_DELAY) % INP_REPEAT_RATE != 0) {
-        msleep(16);
-        idle();
-        continue;
-      }
-    }
-
-    if (is_bs) {
+    if (action == -1) {
       if (cursor > 0) {
         memmove(buf + cursor - 1, buf + cursor, len - cursor + 1);
         cursor--;
         len--;
       }
+    } else if (action == INP_LEFT) {
+      if (cursor > 0)
+        cursor--;
+    } else if (action == INP_RIGHT) {
+      if (cursor < len)
+        cursor++;
+    } else if (action == INP_HOME) {
+      cursor = 0;
+    } else if (action == INP_END) {
+      cursor = len;
     } else if (ch >= 32 && ch < 128 && len < outmax - 1 && len < 254) {
       memmove(buf + cursor + 1, buf + cursor, len - cursor + 1);
       buf[cursor] = (char)ch;
@@ -935,35 +744,38 @@ static int measure_buttons_w(const char **labels, const int *widths, int n,
 
 static int confirm_draw_frame(int wx, int wy, int win_w, int win_h,
                               const char *title, const char **body, int nbody) {
-  gfx_fillrect(wx + 3, wy + 3, win_w, win_h, GFX_COL_GREY);
-  gfx_borderrect(wx, wy, win_w, win_h, GFX_COL_LIGHT_GREY, GFX_COL_DARK_BLUE);
+  gfx_fillrect(wx + 3, wy + 3, win_w, win_h, g_default_theme.border_dark);
+  gfx_borderrect(wx, wy, win_w, win_h, g_default_theme.border_light,
+                 g_default_theme.border_dark);
 
   gfx_fillrect(wx + WIN_BORDER, wy + WIN_BORDER, win_w - WIN_BORDER * 2,
-               WIN_TITLE_H, GFX_COL_DARK_BLUE);
+               WIN_TITLE_H, g_default_theme.title_bg);
   if (title) {
     gfx_drawstr_clipped(
         wx + WIN_H_PAD, wy + WIN_BORDER + (WIN_TITLE_H - GFX_FONT_H) / 2, title,
-        GFX_COL_WHITE, GFX_COL_DARK_BLUE, win_w - WIN_H_PAD * 2);
+        g_default_theme.title_fg, g_default_theme.title_bg,
+        win_w - WIN_H_PAD * 2);
   }
 
   int body_top = wy + WIN_BORDER + WIN_TITLE_H;
   int body_area_h = win_h - WIN_BORDER - WIN_TITLE_H - WIN_BTN_H - WIN_BORDER;
   gfx_fillrect(wx + WIN_BORDER, body_top, win_w - WIN_BORDER * 2, body_area_h,
-               GFX_COL_BLACK);
+               g_default_theme.bg);
 
   int inner_w = win_w - WIN_BORDER * 2 - WIN_H_PAD * 2;
   for (int i = 0; i < nbody; i++) {
     if (!body[i])
       continue;
     int ty = body_top + WIN_BODY_PAD + i * (GFX_FONT_H + 2);
-    gfx_drawstr_clipped(wx + WIN_BORDER + WIN_H_PAD, ty, body[i], GFX_COL_WHITE,
-                        GFX_COL_BLACK, inner_w);
+    gfx_drawstr_clipped(wx + WIN_BORDER + WIN_H_PAD, ty, body[i],
+                        g_default_theme.fg, g_default_theme.bg, inner_w);
   }
 
   int sep_y = wy + win_h - WIN_BTN_H - WIN_BORDER;
-  gfx_hline(wx + WIN_BORDER, sep_y, win_w - WIN_BORDER * 2, GFX_COL_DARK_BLUE);
+  gfx_hline(wx + WIN_BORDER, sep_y, win_w - WIN_BORDER * 2,
+            g_default_theme.border_light);
   gfx_fillrect(wx + WIN_BORDER, sep_y + 1, win_w - WIN_BORDER * 2,
-               WIN_BTN_H - 1, GFX_COL_BLACK);
+               WIN_BTN_H - 1, g_default_theme.bg);
   return sep_y;
 }
 
@@ -979,11 +791,12 @@ static void confirm_draw_buttons(int wx, int win_w, int sep_y,
   for (int i = 0; i < n; i++) {
     int sel = (i == focus);
     gfx_borderrect(cur_x, btn_y, bw[i], btn_h,
-                   sel ? GFX_COL_GREEN : GFX_COL_BLACK,
-                   sel ? GFX_COL_WHITE : GFX_COL_GREY);
+                   sel ? g_default_theme.accent : g_default_theme.item_bg,
+                   sel ? g_default_theme.border_light
+                       : g_default_theme.border_light);
     gfx_drawstr(cur_x + 4, btn_y + 2, btns[i],
-                sel ? GFX_COL_BLACK : GFX_COL_WHITE,
-                sel ? GFX_COL_GREEN : GFX_COL_BLACK);
+                sel ? g_default_theme.accent_text : g_default_theme.fg,
+                sel ? g_default_theme.accent : g_default_theme.item_bg);
     cur_x += bw[i] + gap;
   }
 }
@@ -1121,8 +934,35 @@ static GfxTheme *resolve_theme(GfxWindow *win, GfxWidget *w) {
 }
 
 /* --------------------------------------------------------------*/
-/* Input Polling (Unified Repeating Nav)                         */
+/* Input Polling (Repeating Nav)                                 */
 /* --------------------------------------------------------------*/
+
+#define GFX_REPEAT_DELAY 18
+#define GFX_REPEAT_RATE 4
+
+/* Shared auto-repeat gate.  Feed the currently-held action (or `none`);
+   returns the action each time it should fire.  one_shot actions fire
+   only on the initial press. */
+int gfx_repeat_gate(GfxRepeat *st, int action, int none, int one_shot) {
+  if (action == none) {
+    st->last = none;
+    st->timer = 0;
+    return none;
+  }
+  if (action != st->last) {
+    st->last = action;
+    st->timer = 0;
+    return action;
+  }
+  if (one_shot)
+    return none;
+  st->timer++;
+  if (st->timer < GFX_REPEAT_DELAY)
+    return none;
+  if ((st->timer - GFX_REPEAT_DELAY) % GFX_REPEAT_RATE != 0)
+    return none;
+  return action;
+}
 
 NavAction gfx_poll_nav(void) {
   int active = NAV_NONE;
@@ -1145,33 +985,10 @@ NavAction gfx_poll_nav(void) {
   else if (isKeyPressed(KEY_NSPIRE_CAT))
     active = NAV_CAT;
 
-  static int last_active = NAV_NONE;
-  static int repeat_timer = 0;
-
-  if (active == NAV_NONE) {
-    last_active = NAV_NONE;
-    repeat_timer = 0;
-    return NAV_NONE;
-  }
-
-  if (active != last_active) {
-    last_active = active;
-    repeat_timer = 0;
-    return active;
-  }
-
-  if (active == NAV_ENTER || active == NAV_ESC || active == NAV_CAT ||
-      active == NAV_TAB) {
-    return NAV_NONE;
-  }
-
-  repeat_timer++;
-  if (repeat_timer < 18)
-    return NAV_NONE;
-  if ((repeat_timer - 18) % 4 != 0)
-    return NAV_NONE;
-
-  return active;
+  static GfxRepeat rep = {NAV_NONE, 0};
+  int one_shot = (active == NAV_ENTER || active == NAV_ESC ||
+                  active == NAV_CAT || active == NAV_TAB);
+  return (NavAction)gfx_repeat_gate(&rep, active, NAV_NONE, one_shot);
 }
 
 static int gfx_popup_dropdown(int dx, int dy, int dw, const char **opts,
@@ -1557,6 +1374,10 @@ int gfx_window_exec(GfxWindow *win) {
     if (redraw) {
       if (win->on_tick)
         win->on_tick(win);
+
+      /* Clear the whole screen first so remnants of a sub-dialog
+         (alert, file browser) that overlapped the backdrop are erased. */
+      gfx_fillrect(0, 0, GFX_W, GFX_H, wTheme->bg);
 
       gfx_fillrect(win->x + 3, win->y + 3, win->w, win->h,
                    g_default_theme.border_dark);

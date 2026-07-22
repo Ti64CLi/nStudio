@@ -1,7 +1,24 @@
 #ifndef GFX_H_INCLUDED
 #define GFX_H_INCLUDED
 
+#include <keys.h>
 #include <stdint.h>
+
+/* ------------------------------------------------------------------ */
+/* Shared character keymap                                            */
+/* Physical key -> printable character, in normal / shift / ctrl      */
+/* states.  Used by both the editor and the text-input dialogs so the */
+/* two can never diverge.  A ctrl of 0 means "no ctrl character".     */
+/* ------------------------------------------------------------------ */
+typedef struct {
+  t_key key;
+  char normal;
+  char shifted;
+  char ctrl;
+} GfxKeyMap;
+
+extern const GfxKeyMap gfx_char_keymap[];
+extern const int gfx_char_keymap_size;
 
 /* ------------------------------------------------------------------ */
 /* Screen geometry                                                    */
@@ -35,6 +52,7 @@
 uint16_t *gfx_framebuffer(void);
 void gfx_init(void);
 void gfx_deinit(void);
+void gfx_reinit(void);
 void gfx_flip(void);
 
 void gfx_set_clip(int x, int y, int w, int h);
@@ -51,7 +69,6 @@ void gfx_borderrect(int x, int y, int w, int h, uint16_t fill, uint16_t border);
 /* ------------------------------------------------------------------ */
 int gfx_drawchar(int x, int y, char ch, uint16_t fg, uint16_t bg);
 int gfx_drawstr(int x, int y, const char *s, uint16_t fg, uint16_t bg);
-int gfx_drawstr_n(int x, int y, const char *s, int n, uint16_t fg, uint16_t bg);
 void gfx_drawstr_clipped(int x, int y, const char *s, uint16_t fg, uint16_t bg,
                          int maxw);
 
@@ -60,8 +77,6 @@ void gfx_drawstr_clipped(int x, int y, const char *s, uint16_t fg, uint16_t bg,
 /* ------------------------------------------------------------------ */
 void gfx_window_alert(const char *title, const char **lines, int nlines,
                       const char *ok_label);
-void gfx_window_scrolltext(const char *title, const char **lines, int nlines,
-                           const char *ok_label);
 int gfx_window_confirm2(const char *title, const char **body, int nbody,
                         const char *btn0, const char *btn1);
 int gfx_window_confirm3(const char *title, const char **body, int nbody,
@@ -87,6 +102,15 @@ typedef enum {
 } NavAction;
 
 NavAction gfx_poll_nav(void);
+
+/* Shared auto-repeat state/gate (used by gfx_poll_nav, text inputs and
+   the editor's key loop). */
+typedef struct {
+  int last;
+  int timer;
+} GfxRepeat;
+
+int gfx_repeat_gate(GfxRepeat *st, int action, int none, int one_shot);
 
 typedef struct {
   uint16_t bg;
