@@ -1,0 +1,5 @@
+*.o
+*.d
+*.elf
+*.zehn
+nstudio.tns
