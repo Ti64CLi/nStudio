@@ -6,40 +6,73 @@
 
 ## About
 
-nStudio is a lightweight, fully-featured ARM assembly Integrated Development Environment (IDE) built specifically for the TI-Nspire CX and CX II calculators running Ndless. It allows developers to write, edit, and navigate ARM assembly code directly on the calculator itself, providing desktop-like text editing capabilities on a portable device.
+nStudio is an ARM assembly editor for the TI-Nspire CX and CX II calculators running Ndless. It lets you write, edit, and navigate ARM assembly source directly on the calculator.
 
 ## Features
 
-* **Gap-Buffer Text Editor**: Highly efficient text insertion and deletion, capable of handling large files without lag.
-* **Syntax Highlighting**: Real-time parsing and highlighting for ARM mnemonics, registers, immediates, labels, comments, directives, and string literals.
-* **Built-in File Browser**: Navigate the Ndless filesystem, open existing files, and save projects with a clean, themed directory interface.
-* **Instruction Catalog**: Integrated offline reference manual for ARM instructions, including argument signatures, descriptions, and CPSR flag effects.
-* **Navigation Tools**: Instantly jump to specific lines or browse an auto-generated list of all defined labels in your code.
-* **Theme Engine**: Switch between Dark and Light presets, or build a fully custom color scheme directly from the settings menu.
-* **Character Map**: Easily insert special symbols and operators that are not readily available on the physical keypad.
+* **Gap-buffer text editor**: Insert and delete without rewriting the whole buffer on each keystroke.
+* **Syntax highlighting**: ARM mnemonics, registers, immediates, labels, comments, directives, and string literals. Classification uses the same keyword tables as the companion [`nasm`](../nasm) assembler, so what highlights is what assembles (both pre-UAL `LDMEQFD` and UAL `LDMFDEQ`/`SUBSEQ` suffix orders are recognised). Following nasm/nAssembler syntax, a **label is any identifier in column 0 with no trailing colon**, and instructions must be indented.
+* **Editing**: Undo/redo (coalesced by word), cut/copy/paste, select all, block indent/outdent, and search / replace (with case toggle and Replace All).
+* **Line Endings**: Detects and preserves **LF** or **CRLF**; the current mode is shown in the status bar and can be toggled from the File menu.
+* **Read-only Guard**: Files that do not match your ASM source extension open read-only (shown as `[RO]`); the first edit asks before enabling editing, so binaries are never accidentally corrupted.
+* **Assemble**: Invoke the `nasm` assembler on the current file directly from the editor (Ctrl+B), if its path is configured in Settings.
+* **File browser**: Navigate the Ndless filesystem to open existing files and save your work.
+* **Instruction & syscall catalogs**: Offline reference for ARM instructions (signatures, descriptions, CPSR flag effects) and the full Ndless syscall list; insert or view details in place.
+* **Navigation**: Jump to a specific line, browse all defined labels, or jump straight to a branch target.
+* **Themes**: Dark and Light presets, or a custom color scheme. Settings are shared with the `nasm` assembler.
+* **Character map**: Insert special symbols that are not on the physical keypad.
 
 ## Controls & Shortcuts
 
-### Editor
+### Editor: movement
 
 * **Arrows**: Move cursor
 * **Ctrl + Left/Right**: Jump by word
 * **Ctrl + Up/Down**: Page up / Page down
-* **Ctrl + Shift + Up/Down**: Jump to top / bottom of file
-* **Ctrl + S**: Save
-* **Ctrl + Shift + S**: Save As
+* **Home / Doc**: Start / end of line
+* **Ctrl + Home**: Top of file
+* **Ctrl + Menu**: Bottom of file
+* **Shift + move**: Extend selection (works with all of the above)
+
+### Editor: editing
+
+* **Ctrl + Z / Ctrl + Y**: Undo / Redo
+* **Ctrl + X / Ctrl + C / Ctrl + V**: Cut / Copy / Paste
+* **Ctrl + A**: Select All
+* **Tab / Shift + Tab**: Indent / outdent (a selection indents the whole block; otherwise aligns to the next tab stop)
+* **Ctrl + Del / Ctrl + Shift + Del**: Delete previous / next word
+
+### Editor: files & tools
+
+* **Ctrl + S / Ctrl + Shift + S**: Save / Save As
 * **Ctrl + O**: Open File
+* **Ctrl + F / Ctrl + H**: Search / Replace
 * **Ctrl + G**: Go to Line
-* **Ctrl + L**: Open Label Browser
-* **Ctrl + M**: Open Menu Bar
-* **Ctrl + Catalog (Book Key)**: Open Special Character Map
+* **Ctrl + L**: Label Browser
+* **Ctrl + Enter**: Jump to the label under a `B`/`BL`/`BX` branch
+* **Ctrl + B**: Assemble with `nasm`
+* **Ctrl + Trig**: Instruction help for the mnemonic under the cursor
+* **Menu**: Open the menu bar
+* **Catalog (Book Key)**: ARM instruction catalog
+* **Shift + Catalog**: Ndless syscall catalog
+* **Ctrl + Catalog**: Special character map
+* **Esc**: Quit (prompts if there are unsaved changes)
+
+### Search / Replace
+
+* **Enter**: Next match (Search) / replace this match (Replace)
+* **Tab**: Toggle case sensitivity (Search) / skip this match (Replace)
+* **A**: Replace all remaining matches (Replace)
+* **Esc**: Finish
 
 ### File Browser
 
 * **Arrows**: Navigate files and folders
 * **Enter**: Enter folder / Open file
-* **Tab**: Toggle file filter (show all files vs `.asm.tns` files) / Confirm save destination in "Save As" mode
+* **Tab**: Toggle file filter (all files vs `.<ext>.tns`), or confirm the destination folder in "Save As"
 * **Esc**: Cancel / Close
+
+The directory path shown with a leading double slash (e.g. `//documents`) marks a filesystem root folder; this is the calculator's own convention.
 
 ### Catalog / Cheatsheet
 

@@ -7,13 +7,15 @@
  *
  * Features:
  *   - Gap-buffer backed text storage (efficient insert/delete)
- *   - ARM assembly syntax highlighting
- *   - Line numbers gutter
- *   - Horizontal + vertical scrolling
- *   - Save (ctrl+S via [ctrl] key), Quit (Esc with unsaved-changes prompt)
+ *   - ARM assembly syntax highlighting driven by the nasm assembler's
+ *     own keyword tables (labels are column-0 identifiers with no colon)
+ *   - Line numbers gutter, horizontal + vertical scrolling
+ *   - Undo/redo, clipboard, search / replace, block indent
+ *   - LF / CRLF line-ending modes
+ *   - Read-only view for non-source files
  *
  * Call editor_open(path) to launch the editor on a file.
- * Returns 1 if the file was saved, 0 if quit without saving.
+ * Returns 1 if the file was written during the session, 0 otherwise.
  *
  * gfx_init() must have been called before editor_open().
  * The editor does NOT call gfx_deinit() on exit.
