@@ -165,31 +165,75 @@ static int load_file(const char *path) {
   return 1;
 }
 
-/* Write a run of bytes, expanding '\n' to "\r\n" when in CRLF mode. */
-static void write_bytes(FILE *f, const char *p, int n) {
-  if (!g_crlf) {
-    fwrite(p, 1, n, f);
-    return;
-  }
+/* Write a run of bytes, expanding '\n' to "\r\n" when in CRLF mode.
+   Returns 1 on success, 0 if the stream reported a short write / error. */
+static int write_bytes(FILE *f, const char *p, int n) {
+  if (!g_crlf)
+    return fwrite(p, 1, (size_t)n, f) == (size_t)n;
+
   for (int i = 0; i < n; i++) {
-    if (p[i] == '\n')
-      fputc('\r', f);
-    fputc(p[i], f);
+    if (p[i] == '\n' && fputc('\r', f) == EOF)
+      return 0;
+    if (fputc((unsigned char)p[i], f) == EOF)
+      return 0;
   }
+  return 1;
 }
 
+/*
+ * Save the buffer to `path` without ever risking the file already there.
+ *
+ * The bytes are first written to a sibling temporary file, and every step is
+ * verified: each write_bytes(), ferror(), and the final fclose() (which
+ * flushes buffered data and can fail on a full disk). Only once a complete,
+ * verified temporary exists is the destination touched. If any step fails the
+ * temporary is removed and the original file is left exactly as it was, so a
+ * failed save can no longer truncate or corrupt existing work — the previous
+ * implementation opened the destination directly and could leave it half
+ * written.
+ *
+ * Nucleus rename() does not overwrite an existing destination, so the target
+ * is removed immediately before the rename (harmless when it does not yet
+ * exist). The freshly written content lives in the temporary throughout, and
+ * is deliberately left there if the final rename fails, so nothing is lost.
+ *
+ * Returns 1 only when `path` holds the fully written new content.
+ */
 static int save_file(const char *path) {
-  FILE *f = fopen(path, "wb");
+  /* Large enough for the longest path nStudio builds (Save As uses a
+     2048-byte buffer) plus the ".tmp" suffix. */
+  char tmp[2100];
+  if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+    return 0; /* path too long to form a temporary name */
+
+  FILE *f = fopen(tmp, "wb");
   if (!f)
     return 0;
+
   /* Write the two contiguous halves of the gap buffer, translating line
      endings for CRLF files. */
+  int ok = 1;
   if (g_buf.gap_lo > 0)
-    write_bytes(f, g_buf.buf, g_buf.gap_lo);
+    ok = write_bytes(f, g_buf.buf, g_buf.gap_lo);
   int after_len = g_buf.size - g_buf.gap_hi;
-  if (after_len > 0)
-    write_bytes(f, g_buf.buf + g_buf.gap_hi, after_len);
-  fclose(f);
+  if (ok && after_len > 0)
+    ok = write_bytes(f, g_buf.buf + g_buf.gap_hi, after_len);
+
+  if (ferror(f))
+    ok = 0;
+  if (fclose(f) != 0)
+    ok = 0;
+
+  if (!ok) {
+    remove(tmp); /* discard the partial file; the original is untouched */
+    return 0;
+  }
+
+  /* Move the verified temporary into place. */
+  remove(path); /* Nucleus rename() will not overwrite; clear first */
+  if (rename(tmp, path) != 0)
+    return 0; /* content is preserved in `tmp`; leave it for recovery */
+
   return 1;
 }
 
