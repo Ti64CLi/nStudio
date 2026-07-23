@@ -282,13 +282,58 @@ static int editor_confirm_rw(void) {
 /* ================================================================
  * Render
  * ================================================================ */
-static char line_scratch[1024];
+/* Scratch text for the current line.  Common lines use a fixed fast-path
+   buffer; unusually long lines spill into a dynamic buffer grown on demand
+   (up to LINE_SCRATCH_MAX), so the editor is not tied to a fixed line length.
+   line_scratch always points at whichever buffer holds the current line and
+   is never NULL.  line_dyn is retained across lines and files as a cache -
+   it is only ever allocated when a genuinely long line is encountered. */
+#define LINE_SCRATCH_STATIC 1024
+#define LINE_SCRATCH_MAX 65536 /* safety bound, far beyond any real asm line */
+
+static char line_static[LINE_SCRATCH_STATIC];
+static char *line_dyn = NULL;
+static int line_dyn_cap = 0;
+static char *line_scratch = line_static;
+
+/* Point line_scratch at a buffer sized for a line of `need` chars and return
+   the greatest length it can hold.  Normally that is `need`; it is clamped
+   only when an allocation fails or the safety bound is hit, so an over-long
+   or pathological line degrades gracefully instead of over-allocating. */
+static int line_scratch_reserve(int need) {
+  if (need > LINE_SCRATCH_MAX)
+    need = LINE_SCRATCH_MAX; /* the most we will ever hold */
+  if (need < LINE_SCRATCH_STATIC) {
+    line_scratch = line_static;
+    return LINE_SCRATCH_STATIC - 1;
+  }
+  /* need is now in [LINE_SCRATCH_STATIC, LINE_SCRATCH_MAX]; grow the dynamic
+     buffer to hold need+1 bytes, never past the safety ceiling. */
+  if (need + 1 > line_dyn_cap) {
+    int newcap = line_dyn_cap ? line_dyn_cap : LINE_SCRATCH_STATIC;
+    while (newcap < need + 1)
+      newcap *= 2;
+    if (newcap > LINE_SCRATCH_MAX + 1)
+      newcap = LINE_SCRATCH_MAX + 1;
+    char *nb = (char *)realloc(line_dyn, (size_t)newcap);
+    if (!nb) {
+      line_scratch = line_static; /* grow failed: clamp to the static buffer */
+      return LINE_SCRATCH_STATIC - 1;
+    }
+    line_dyn = nb;
+    line_dyn_cap = newcap;
+  }
+  line_scratch = line_dyn;
+  /* Never report more than `need` (the clamped line length) or the buffer. */
+  return (need < line_dyn_cap) ? need : line_dyn_cap - 1;
+}
 
 static void extract_line(int row) {
   int start = line_starts[row];
   int ll = line_len(&g_buf, row);
-  if (ll > (int)sizeof(line_scratch) - 1)
-    ll = (int)sizeof(line_scratch) - 1;
+  int maxll = line_scratch_reserve(ll);
+  if (ll > maxll)
+    ll = maxll;
 
   /* Copy directly from the gap buffer's two contiguous halves. */
   int out = 0;
