@@ -2631,11 +2631,14 @@ static void editor_open_file(void) {
   if (slash)
     *slash = '\0';
   else
-    strncpy(start_dir, "/documents", sizeof(start_dir) - 1);
+    /* Untitled buffer: reopen at the last-visited directory. */
+    strncpy(start_dir, g_settings.last_dir, sizeof(start_dir) - 1);
 
   char newpath[1024] = "";
   if (!browser_pick_file(start_dir, 1, newpath, sizeof(newpath)))
     return;
+
+  settings_remember_file_dir(newpath);
 
   strncpy(g_filepath, newpath, sizeof(g_filepath) - 1);
   g_filepath[sizeof(g_filepath) - 1] = '\0';
@@ -2670,11 +2673,15 @@ static int editor_save_as(void) {
   if (slash)
     *slash = '\0';
   else
-    strncpy(start_dir, "/documents", sizeof(start_dir) - 1);
+    /* Untitled buffer: reopen at the last-visited directory. */
+    strncpy(start_dir, g_settings.last_dir, sizeof(start_dir) - 1);
 
   char destdir[1024] = "";
   if (!browser_pick_dir(start_dir, destdir, sizeof(destdir)))
     return 0;
+
+  /* destdir is already a directory (not a file path). */
+  settings_set_last_dir(destdir);
 
   char fname[128] = "";
   {

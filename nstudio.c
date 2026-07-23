@@ -21,8 +21,9 @@ static void action_new_file(void) { editor_open(""); }
 
 static void action_open_file(void) {
   char path[512];
-  if (!browser_pick_file("/documents", 1, path, sizeof(path)))
+  if (!browser_pick_file(g_settings.last_dir, 1, path, sizeof(path)))
     return;
+  settings_remember_file_dir(path);
   editor_open(path);
 }
 

@@ -38,6 +38,8 @@ typedef struct {
   char asm_extension[32];
   char nasm_path[256]; /* Full path to the nasm executable */
   char nasm_args[128]; /* Extra arguments passed after the source file */
+  char last_dir[256];  /* Directory the file browser last visited; persisted
+                          as "nasm_last_dir" and shared with the nasm app */
 
   /* 0 = Dark, 1 = Light, 2 = Custom */
   int theme;
@@ -66,6 +68,17 @@ void settings_theme_dark(NStudioSettings *s);
 
 void settings_load(void);
 void settings_save(void);
+
+/*
+ * Remember the directory the file browser should reopen at next time, and
+ * persist it (shared with the nasm app via the "nasm_last_dir" cfg key).
+ * settings_set_last_dir stores a directory path; settings_remember_file_dir
+ * takes a file path and stores its parent directory. Both persist only when
+ * the value actually changes, so repeated opens in the same folder do not
+ * rewrite the config.
+ */
+void settings_set_last_dir(const char *dir);
+void settings_remember_file_dir(const char *filepath);
 
 uint16_t settings_col(int idx);
 void settings_apply_theme(void); /* Pushes g_settings out to g_default_theme */

@@ -65,6 +65,8 @@ void settings_defaults(NStudioSettings *s) {
   strncpy(s->asm_extension, "asm", 31);
   s->nasm_path[0] = '\0';
   strncpy(s->nasm_args, "--ask-name --no-auto-tns", 127);
+  strncpy(s->last_dir, "/documents", sizeof(s->last_dir) - 1);
+  s->last_dir[sizeof(s->last_dir) - 1] = '\0';
   settings_theme_dark(s);
 }
 
@@ -112,9 +114,10 @@ void settings_theme_light(NStudioSettings *s) {
   s->syn.normal = 0;
 }
 
-/* Config lines whose keys nStudio does not manage (e.g. nasm's
-   nasm_last_dir) are preserved verbatim and written back on save, so
-   the two apps sharing this file do not erase each other's keys. */
+/* Config lines whose keys nStudio does not manage are preserved verbatim and
+   written back on save, so keys owned by another tool sharing this file are
+   never dropped on a round trip. (The nasm_last_dir key IS managed - see
+   last_dir - so both apps keep it in sync rather than merely preserving it.) */
 static char g_extra_config[1024];
 static int g_extra_len;
 
@@ -127,7 +130,8 @@ static int is_known_key(const char *k) {
       "ui_accent_text", "ui_item_bg",   "syn_mnem",
       "syn_reg",     "syn_imm",         "syn_label",
       "syn_comment", "syn_directive",   "syn_string",
-      "syn_normal",  "nasm_path",       "nasm_args", NULL};
+      "syn_normal",  "nasm_path",       "nasm_args",
+      "nasm_last_dir", NULL};
   for (int i = 0; keys[i]; i++)
     if (!strcmp(k, keys[i]))
       return 1;
@@ -263,6 +267,8 @@ void settings_load(void) {
         copy_str(g_settings.nasm_path, v, sizeof(g_settings.nasm_path));
       else if (!strcmp(k, "nasm_args"))
         copy_str(g_settings.nasm_args, v, sizeof(g_settings.nasm_args));
+      else if (!strcmp(k, "nasm_last_dir"))
+        copy_str(g_settings.last_dir, v, sizeof(g_settings.last_dir));
     }
     fclose(f);
   }
@@ -308,12 +314,38 @@ void settings_save(void) {
   fprintf(f, "syn_normal=%d\n", g_settings.syn.normal);
   fprintf(f, "nasm_path=%s\n", g_settings.nasm_path);
   fprintf(f, "nasm_args=%s\n", g_settings.nasm_args);
+  fprintf(f, "nasm_last_dir=%s\n", g_settings.last_dir);
 
-  /* Re-emit foreign keys (e.g. nasm's nasm_last_dir) untouched. */
+  /* Re-emit any keys owned by another tool sharing this file, untouched. */
   if (g_extra_len > 0)
     fwrite(g_extra_config, 1, g_extra_len, f);
 
   fclose(f);
+}
+
+void settings_set_last_dir(const char *dir) {
+  if (!dir || !dir[0])
+    return;
+  if (strcmp(g_settings.last_dir, dir) == 0)
+    return; /* unchanged: avoid rewriting the config on every open */
+  copy_str(g_settings.last_dir, dir, sizeof(g_settings.last_dir));
+  settings_save();
+}
+
+void settings_remember_file_dir(const char *filepath) {
+  if (!filepath || !filepath[0])
+    return;
+
+  /* Derive the parent directory of the file path. */
+  char dir[512];
+  copy_str(dir, filepath, sizeof(dir));
+  char *slash = strrchr(dir, '/');
+  if (slash && slash != dir)
+    *slash = '\0';
+  else
+    strcpy(dir, "/"); /* file directly under the filesystem root */
+
+  settings_set_last_dir(dir);
 }
 
 /* ================================================================
