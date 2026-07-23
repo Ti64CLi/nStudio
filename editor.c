@@ -1154,6 +1154,63 @@ static int poll_key(void) {
  * Editor actions
  * ================================================================ */
 
+/* ================================================================
+ * Automatic bracket completion
+ *
+ * Applies only to brackets typed directly on the keyboard (routed through
+ * editor_type_char).  Programmatic insertion via the catalog, syscall and
+ * character-map pickers still goes straight through do_insert_char, so it
+ * is never auto-completed.
+ * ================================================================ */
+static char bracket_close_for(char open) {
+  switch (open) {
+  case '(':
+    return ')';
+  case '[':
+    return ']';
+  case '{':
+    return '}';
+  default:
+    return 0;
+  }
+}
+
+static int is_close_bracket(char c) {
+  return c == ')' || c == ']' || c == '}';
+}
+
+/* True when (open, close) form an empty pair the cursor sits between. */
+static int is_auto_pair(char open, char close) {
+  return close != 0 && bracket_close_for(open) == close;
+}
+
+/* Auto-close an opener only when the character it would sit in front of is
+   a natural boundary, so typing "(" before a word does not wedge a ")" into
+   the middle of it. */
+static int autopair_context_ok(void) {
+  int len = gb_len(&g_buf);
+  if (cursor_pos >= len)
+    return 1; /* end of line / buffer */
+  char n = gb_get(&g_buf, cursor_pos);
+  return n == ' ' || n == '\t' || n == '\n' || n == '\r' ||
+         is_close_bracket(n) || n == ',' || n == ';';
+}
+
+/* Insert an "open close" pair and leave the cursor between them, as a
+   single undo step. */
+static void insert_pair(char open, char close) {
+  undo_checkpoint(UK_OTHER);
+  gb_move(&g_buf, cursor_pos);
+  if (gb_insert(&g_buf, open)) {
+    cursor_pos++;
+    gb_move(&g_buf, cursor_pos);
+    gb_insert(&g_buf, close); /* cursor stays in front of the closer */
+  }
+  rebuild_lines(&g_buf);
+  cursor_sync_pos();
+  g_modified = 1;
+}
+
 static void do_insert_char(char c) {
   int wordy = (isalnum((unsigned char)c) || c == '_');
   undo_checkpoint(UK_INSERT);
@@ -1168,6 +1225,31 @@ static void do_insert_char(char c) {
   g_modified = 1;
   if (!wordy)
     undo_break(); /* whitespace / punctuation ends the typing group */
+}
+
+/* Handle a directly typed printable character: apply bracket auto-completion
+   where it feels natural, otherwise fall back to a plain insert.  Only
+   keyboard typing routes through here. */
+static void editor_type_char(char c) {
+  /* Typing a closer where the same closer already sits: step over it rather
+     than doubling it (makes auto-closed pairs painless to finish). */
+  if (is_close_bracket(c) && !sel_active_flag() && cursor_pos < gb_len(&g_buf) &&
+      gb_get(&g_buf, cursor_pos) == c) {
+    cursor_pos++;
+    cursor_sync_pos();
+    undo_break(); /* a cursor move ends the current typing group */
+    return;
+  }
+
+  /* Auto-close an opener in a safe context.  Never while a selection is
+     active, so the existing type-over-selection behaviour is preserved. */
+  char close = bracket_close_for(c);
+  if (close && !sel_active_flag() && autopair_context_ok()) {
+    insert_pair(c, close);
+    return;
+  }
+
+  do_insert_char(c);
 }
 
 static void do_enter(void) {
@@ -1218,6 +1300,21 @@ static void do_backspace(void) {
   }
   if (cursor_pos == 0)
     return;
+
+  /* Backspacing the opener of an empty auto-pair removes the closer too. */
+  if (cursor_pos < gb_len(&g_buf) &&
+      is_auto_pair(gb_get(&g_buf, cursor_pos - 1), gb_get(&g_buf, cursor_pos))) {
+    undo_checkpoint(UK_OTHER);
+    gb_move(&g_buf, cursor_pos);
+    gb_delete(&g_buf);    /* the closer, at the cursor */
+    gb_backspace(&g_buf); /* the opener, before the cursor */
+    cursor_pos--;
+    rebuild_lines(&g_buf);
+    cursor_sync_pos();
+    g_modified = 1;
+    return;
+  }
+
   undo_checkpoint(UK_DELETE);
   gb_move(&g_buf, cursor_pos);
   gb_backspace(&g_buf);
@@ -3826,7 +3923,7 @@ int editor_open(const char *path) {
 
     default:
       if (act > 0 && act < 128)
-        do_insert_char((char)act);
+        editor_type_char((char)act);
       break;
     }
 
