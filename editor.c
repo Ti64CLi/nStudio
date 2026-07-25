@@ -1018,7 +1018,11 @@ static void render_all(void) {
 #define ACT_DEL_WORD (-49)
 #define ACT_UNTAB (-50)
 
-/* Actions that modify the buffer (or open a picker that inserts). */
+/* Whether an action counts as a buffer edit for undo-coalescing: a run of
+   same-kind edits shares one undo group and any non-edit action ends the
+   group (see the main loop).  This is intentionally broader than
+   act_needs_write below - it also covers undo/redo and the pickers - because
+   it is about grouping, not permission. */
 static int act_is_edit(int act) {
   if (act > 0)
     return 1; /* printable character insert */
@@ -1041,6 +1045,26 @@ static int act_is_edit(int act) {
     return 1;
   default:
     return 0;
+  }
+}
+
+/* Actions that unconditionally mutate the buffer and therefore require write
+   permission up front (the read-only prompt).  Defined as the edit set minus
+   two groups that must not prompt eagerly, so the two lists cannot drift:
+     - undo/redo: no-ops when there is nothing to revert (and if there is, the
+       edits that created it already enabled editing);
+     - the char map / instruction / syscall pickers: view-only until something
+       is chosen, so they gate at the actual point of insertion instead. */
+static int act_needs_write(int act) {
+  switch (act) {
+  case ACT_UNDO:
+  case ACT_REDO:
+  case ACT_CHARMAP:
+  case ACT_CATALOG:
+  case ACT_SYSCALL_CATALOG:
+    return 0;
+  default:
+    return act_is_edit(act);
   }
 }
 
@@ -2522,7 +2546,9 @@ static const SyscallInfo *syscall_pick(void) {
 
 static void editor_syscall_catalog(void) {
   const SyscallInfo *sc = syscall_pick();
-  if (sc) {
+  /* The picker is view-only; gate just the insertion so a read-only file can
+     be browsed and only prompts right before text is inserted. */
+  if (sc && editor_confirm_rw()) {
     char buf[32];
     /* Format Ndless extensions natively as hex for readability */
     if (sc->num >= 0x200000) {
@@ -3456,11 +3482,13 @@ static void editor_assemble(void) {
 
 /* True for menu entries that modify the buffer, so read-only files can
    gate them behind a confirmation. */
+/* Which menu actions unconditionally mutate the buffer and so require write
+   permission up front.  Undo/Redo (no-ops when there is nothing to revert)
+   and the View catalog/syscall inserts (gated at the point of insertion) are
+   deliberately excluded, mirroring act_needs_write for the keyboard path. */
 static int menu_action_edits(int top, int sub) {
-  if (top == 1) /* Edit: Undo, Redo, Cut, Paste, Replace */
-    return sub == 0 || sub == 1 || sub == 3 || sub == 5 || sub == 9;
-  if (top == 3) /* View: catalog / syscall insertion */
-    return sub == 0 || sub == 1;
+  if (top == 1) /* Edit: Cut, Paste, Replace */
+    return sub == 3 || sub == 5 || sub == 9;
   return 0;
 }
 
@@ -3549,7 +3577,7 @@ static int menu_dispatch(int top, int sub) {
   if (top == 3) {
     if (sub == 0) {
       const char *m = catalog_pick();
-      if (m)
+      if (m && editor_confirm_rw())
         for (const char *p = m; *p; p++)
           do_insert_char(*p);
       return 1;
@@ -3814,8 +3842,10 @@ int editor_open(const char *path) {
        error note), restoring the normal status line. */
     g_diag_status[0] = '\0';
 
-    /* Gate the first edit of a read-only file behind a confirmation. */
-    if (act_is_edit(act) && !editor_confirm_rw()) {
+    /* Gate a mutating action on a read-only file behind a confirmation.
+       Viewers (pickers) and no-op undo/redo are not gated here; the pickers
+       prompt at the point they actually insert. */
+    if (act_needs_write(act) && !editor_confirm_rw()) {
       render_all();
       continue;
     }
@@ -3972,14 +4002,14 @@ int editor_open(const char *path) {
 
     case ACT_CHARMAP: {
       char picked = charmap_pick();
-      if (picked)
+      if (picked && editor_confirm_rw())
         do_insert_char(picked);
       break;
     }
 
     case ACT_CATALOG: {
       const char *m = catalog_pick();
-      if (m) {
+      if (m && editor_confirm_rw()) {
         for (const char *p = m; *p; p++)
           do_insert_char(*p);
       }
