@@ -128,6 +128,24 @@ static int g_crlf;     /* 0 = LF line endings, 1 = CRLF (write \r\n) */
    error after a jump); "" when none.  Dismissed on the next keypress. */
 static char g_diag_status[224] = "";
 
+/* Assemble diagnostics retained for next/previous-error navigation.  Populated
+   after each assemble: g_diags holds the whole parsed batch, g_diag_nav holds
+   the indices of those that land in the file currently open (line >= 1), and
+   g_diag_cur is the current position within g_diag_nav (-1 when none).  Any
+   buffer edit clears this (see diag_nav_reset callers), so navigation can
+   never jump to a line the diagnostics no longer describe. */
+static AsmDiag g_diags[ASMDIAG_MAX];
+static int g_ndiags = 0;
+static int g_diag_nav[ASMDIAG_MAX];
+static int g_diag_nav_count = 0;
+static int g_diag_cur = -1;
+
+static void diag_nav_reset(void) {
+  g_ndiags = 0;
+  g_diag_nav_count = 0;
+  g_diag_cur = -1;
+}
+
 static int path_is_asm_source(const char *path);
 
 static int load_file(const char *path) {
@@ -521,6 +539,7 @@ static void snap_restore(UndoSnap *s) {
     cursor_pos = gb_len(&g_buf);
   cursor_sync_pos();
   g_modified = 1;
+  diag_nav_reset(); /* undo/redo changed the buffer; drop stale diagnostics */
 }
 
 static void do_undo(void) {
@@ -553,6 +572,7 @@ static void do_redo(void) {
    Only INSERT and DELETE runs coalesce; everything else is its own
    group. */
 static void undo_checkpoint(UndoKind kind) {
+  diag_nav_reset(); /* an edit invalidates the retained assemble diagnostics */
   int coalesce =
       (kind == g_undo_kind) && (kind == UK_INSERT || kind == UK_DELETE);
   if (!coalesce)
@@ -1017,6 +1037,8 @@ static void render_all(void) {
 #define ACT_BS_WORD (-48)
 #define ACT_DEL_WORD (-49)
 #define ACT_UNTAB (-50)
+#define ACT_DIAG_NEXT (-51)
+#define ACT_DIAG_PREV (-52)
 
 /* Whether an action counts as a buffer edit for undo-coalescing: a run of
    same-kind edits shares one undo group and any non-edit action ends the
@@ -1177,6 +1199,10 @@ static int poll_key(void) {
     return ACT_SEL_ALL;
   if (ctrl && isKeyPressed(KEY_NSPIRE_B))
     return ACT_ASSEMBLE;
+  if (ctrl && isKeyPressed(KEY_NSPIRE_N))
+    return ACT_DIAG_NEXT;
+  if (ctrl && isKeyPressed(KEY_NSPIRE_P))
+    return ACT_DIAG_PREV;
   if (ctrl && isKeyPressed(KEY_NSPIRE_TRIG))
     return ACT_CHEATSHEET;
 
@@ -3350,20 +3376,12 @@ static void menu_draw(int top_sel, int sub_sel, int in_sub) {
    already holds nstudio.cfg. */
 #define ASM_DIAG_FILE "/documents/ndless/nstudio_diag.json"
 
-/* After an assemble, read the diagnostics nasm left behind and jump to the
-   first error that lands in the file currently open, leaving a one-line note
-   in the status bar.  A missing file, an empty batch, or errors only in
-   INCLUDEd files leave the cursor where it was. */
-static void editor_show_first_diagnostic(void) {
-  static AsmDiag diags[ASMDIAG_MAX];
-  int n = asmdiag_parse_file(ASM_DIAG_FILE, diags, ASMDIAG_MAX);
-  if (n <= 0)
-    return;
-
-  int idx = asmdiag_first_for_file(diags, n, g_filepath);
-  if (idx < 0)
-    return;
-  const AsmDiag *d = &diags[idx];
+/* Move the cursor to the diagnostic at navigation position `nav_pos` (an index
+   into g_diag_nav, in [0, g_diag_nav_count)), scroll it into view, and show it
+   in the status bar with its position in the run (e.g. "Error 2/3, line 27").*/
+static void diag_jump_to_nav(int nav_pos) {
+  g_diag_cur = nav_pos;
+  const AsmDiag *d = &g_diags[g_diag_nav[nav_pos]];
 
   cursor_row = (d->line > num_lines) ? num_lines - 1 : d->line - 1;
   if (cursor_row < 0)
@@ -3378,8 +3396,47 @@ static void editor_show_first_diagnostic(void) {
   const char *sev = d->severity == ADIAG_WARNING
                         ? "Warning"
                         : (d->severity == ADIAG_NOTE ? "Note" : "Error");
-  snprintf(g_diag_status, sizeof(g_diag_status), " %s, line %d: %s", sev,
-           d->line, d->message);
+  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d, line %d: %s", sev,
+           nav_pos + 1, g_diag_nav_count, d->line, d->message);
+}
+
+/* After an assemble, read the diagnostics nasm left behind, retain them for
+   navigation, and jump to the first one that lands in the file currently open.
+   A missing file, an empty batch, or errors only in INCLUDEd files leave the
+   cursor where it was, with nothing to navigate. */
+static void editor_load_diagnostics(void) {
+  diag_nav_reset();
+
+  int n = asmdiag_parse_file(ASM_DIAG_FILE, g_diags, ASMDIAG_MAX);
+  if (n <= 0)
+    return;
+  g_ndiags = n;
+
+  for (int i = 0; i < g_ndiags && g_diag_nav_count < ASMDIAG_MAX; i++)
+    if (asmdiag_in_file(&g_diags[i], g_filepath))
+      g_diag_nav[g_diag_nav_count++] = i;
+
+  if (g_diag_nav_count > 0)
+    diag_jump_to_nav(0);
+}
+
+/* Jump to the next / previous navigable diagnostic, wrapping around at the
+   ends.  With nothing retained (no assemble yet, or invalidated by an edit)
+   they leave a short note instead. */
+static void editor_diag_next(void) {
+  if (g_diag_nav_count == 0) {
+    snprintf(g_diag_status, sizeof(g_diag_status), " No errors to navigate");
+    return;
+  }
+  diag_jump_to_nav((g_diag_cur + 1) % g_diag_nav_count);
+}
+
+static void editor_diag_prev(void) {
+  if (g_diag_nav_count == 0) {
+    snprintf(g_diag_status, sizeof(g_diag_status), " No errors to navigate");
+    return;
+  }
+  diag_jump_to_nav((g_diag_cur - 1 + g_diag_nav_count) % g_diag_nav_count);
 }
 
 static void editor_assemble(void) {
@@ -3476,7 +3533,7 @@ static void editor_assemble(void) {
   gfx_reinit();
 
   /* Read nasm's diagnostics and jump to the first error in this file. */
-  editor_show_first_diagnostic();
+  editor_load_diagnostics();
 #undef NASM_MAX_ARGS
 }
 
@@ -4030,6 +4087,12 @@ int editor_open(const char *path) {
 
     case ACT_ASSEMBLE:
       editor_assemble();
+      break;
+    case ACT_DIAG_NEXT:
+      editor_diag_next();
+      break;
+    case ACT_DIAG_PREV:
+      editor_diag_prev();
       break;
 
     default:

@@ -85,4 +85,12 @@ int asmdiag_parse_file(const char *path, AsmDiag *out, int max);
  */
 int asmdiag_first_for_file(const AsmDiag *diags, int n, const char *path);
 
+/*
+ * Whether diagnostic `d` belongs to the file `path` (matched by full path,
+ * else by base name) and carries a real line number (line >= 1) - i.e. it has
+ * a location the editor can jump to in the buffer it currently shows.  Shared
+ * by asmdiag_first_for_file and by the editor's error-navigation list.
+ */
+int asmdiag_in_file(const AsmDiag *d, const char *path);
+
 #endif /* ASMDIAG_H_INCLUDED */

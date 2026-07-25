@@ -273,6 +273,12 @@ static void test_asmdiag(void) {
     CHECK(asmdiag_first_for_file(out, n, "/documents/test.asm.tns") == 0);
     CHECK(asmdiag_first_for_file(out, n, "/other/dir/test.asm.tns") == 0);
     CHECK(asmdiag_first_for_file(out, n, "nope.asm.tns") == -1);
+
+    /* the underlying in-file predicate (full path / base name / line>=1) */
+    CHECK(asmdiag_in_file(&out[0], "/documents/test.asm.tns") == 1);
+    CHECK(asmdiag_in_file(&out[0], "/other/dir/test.asm.tns") == 1);
+    CHECK(asmdiag_in_file(&out[1], "/documents/test.asm.tns") == 0); /* line -1 */
+    CHECK(asmdiag_in_file(&out[0], "nope.asm.tns") == 0);
   }
 
   /* clean assemble: "[]" -> zero diagnostics */

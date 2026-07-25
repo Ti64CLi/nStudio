@@ -308,16 +308,18 @@ static const char *base_name(const char *path) {
   return slash ? slash + 1 : path;
 }
 
+int asmdiag_in_file(const AsmDiag *d, const char *path) {
+  if (!d || !path || d->line < 1)
+    return 0;
+  return strcmp(d->file, path) == 0 ||
+         strcmp(base_name(d->file), base_name(path)) == 0;
+}
+
 int asmdiag_first_for_file(const AsmDiag *diags, int n, const char *path) {
   if (!diags || !path)
     return -1;
-  const char *want_base = base_name(path);
-  for (int i = 0; i < n; i++) {
-    if (diags[i].line < 1)
-      continue;
-    if (strcmp(diags[i].file, path) == 0 ||
-        strcmp(base_name(diags[i].file), want_base) == 0)
+  for (int i = 0; i < n; i++)
+    if (asmdiag_in_file(&diags[i], path))
       return i;
-  }
   return -1;
 }

@@ -1,0 +1,29 @@
+; ==========================================================
+;  nStudio - Assemble error-jump test   (open, then Ctrl+B)
+; ==========================================================
+;  This file contains TWO deliberate errors.  Assembling it
+;  with Ctrl+B should:
+;    1. run nasm, which lists the errors in its own window;
+;    2. after you close that window, JUMP the cursor to the
+;       FIRST error (not the second), and show its message in
+;       the status bar (accent colour).
+;
+;  EXPECTED first error:  line 24, column 2
+;    "This instruction (name:BOGUSOP, flags:) is unknown"
+;
+;  Any keypress clears the status message.  Fix line 24
+;  (e.g. change "bogusop" to "sub"), save, and Ctrl+B again:
+;  the cursor should then jump to the SECOND error on line
+;  27.  Fix that too and the assemble succeeds.
+; ==========================================================
+
+start
+ mov r0, #1
+ mov r1, #2
+ add r2, r0, r1
+ bogusop r3
+ mov r4, #10
+ sub r5, r4, #1
+ frobnicate r6
+ mov r0, #0
+ bx lr
