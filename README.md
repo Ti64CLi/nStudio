@@ -15,7 +15,7 @@ nStudio is an ARM assembly editor for the TI-Nspire CX and CX II calculators run
 * **Editing**: Undo/redo (coalesced by word), cut/copy/paste, select all, block indent/outdent, and search / replace (with case toggle and Replace All).
 * **Line Endings**: Detects and preserves **LF** or **CRLF**; the current mode is shown in the status bar and can be toggled from the File menu.
 * **Read-only Guard**: Files that do not match your ASM source extension open read-only (shown as `[RO]`); the first edit asks before enabling editing, so binaries are never accidentally corrupted.
-* **Assemble**: Invoke the `nasm` assembler on the current file directly from the editor (Ctrl+B), if its path is configured in Settings.
+* **Assemble**: Invoke the `nasm` assembler on the current file directly from the editor (Ctrl+B), if its path is configured in Settings. When assembly fails, nStudio reads nasm's structured diagnostics and jumps the cursor to the first error in the current file, showing the message in the status bar.
 * **File browser**: Navigate the Ndless filesystem to open existing files and save your work.
 * **Instruction & syscall catalogs**: Offline reference for ARM instructions (signatures, descriptions, CPSR flag effects) and the full Ndless syscall list; insert or view details in place.
 * **Navigation**: Jump to a specific line, browse all defined labels, or jump straight to a branch target.

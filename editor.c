@@ -28,6 +28,7 @@
 #include <libndls.h>
 
 #include "asmdb.h"
+#include "asmdiag.h"
 #include "browser.h"
 #include "editor.h"
 #include "gapbuf.h"
@@ -121,6 +122,9 @@ static int g_modified;
 static int g_saved; /* set once any save succeeds during this editor session */
 static int g_readonly; /* file opened read-only (not an asm source) */
 static int g_crlf;     /* 0 = LF line endings, 1 = CRLF (write \r\n) */
+/* One-line transient message shown in the status bar (e.g. the first assemble
+   error after a jump); "" when none.  Dismissed on the next keypress. */
+static char g_diag_status[224] = "";
 
 static int path_is_asm_source(const char *path);
 
@@ -965,12 +969,19 @@ static void render_editor_core(void) {
       fname = fname ? fname + 1 : g_filepath;
     }
 
-    snprintf(status, sizeof(status), " %s%s%s  Ln %d/%d  Col %d  %s", fname,
-             g_modified ? "*" : "", g_readonly ? " [RO]" : "", cursor_row + 1,
-             num_lines, cursor_col + 1, g_crlf ? "CRLF" : "LF");
-    gfx_drawstr_clipped(0, sy + 1, status,
-                        g_modified ? C_MODIFIED : C_STATUS_FG, C_STATUS_BG,
-                        GFX_W);
+    if (g_diag_status[0]) {
+      /* A transient message (e.g. the first assemble error) takes over the
+         status bar until the next keypress. */
+      gfx_drawstr_clipped(0, sy + 1, g_diag_status, g_default_theme.accent,
+                          C_STATUS_BG, GFX_W);
+    } else {
+      snprintf(status, sizeof(status), " %s%s%s  Ln %d/%d  Col %d  %s", fname,
+               g_modified ? "*" : "", g_readonly ? " [RO]" : "", cursor_row + 1,
+               num_lines, cursor_col + 1, g_crlf ? "CRLF" : "LF");
+      gfx_drawstr_clipped(0, sy + 1, status,
+                          g_modified ? C_MODIFIED : C_STATUS_FG, C_STATUS_BG,
+                          GFX_W);
+    }
   }
 }
 
@@ -3338,6 +3349,43 @@ static void menu_draw(int top_sel, int sub_sel, int in_sub) {
 /* ================================================================
  * Assemble current file via nasm
  * ================================================================ */
+/* Where nasm writes its JSON diagnostics for us to read back (see asmdiag.h
+   for the contract).  Lives in the shared Ndless config directory, which
+   already holds nstudio.cfg. */
+#define ASM_DIAG_FILE "/documents/ndless/nstudio_diag.json"
+
+/* After an assemble, read the diagnostics nasm left behind and jump to the
+   first error that lands in the file currently open, leaving a one-line note
+   in the status bar.  A missing file, an empty batch, or errors only in
+   INCLUDEd files leave the cursor where it was. */
+static void editor_show_first_diagnostic(void) {
+  static AsmDiag diags[ASMDIAG_MAX];
+  int n = asmdiag_parse_file(ASM_DIAG_FILE, diags, ASMDIAG_MAX);
+  if (n <= 0)
+    return;
+
+  int idx = asmdiag_first_for_file(diags, n, g_filepath);
+  if (idx < 0)
+    return;
+  const AsmDiag *d = &diags[idx];
+
+  cursor_row = (d->line > num_lines) ? num_lines - 1 : d->line - 1;
+  if (cursor_row < 0)
+    cursor_row = 0;
+  int ll = line_len(&g_buf, cursor_row);
+  cursor_col = (d->col >= 1) ? d->col - 1 : 0;
+  if (cursor_col > ll)
+    cursor_col = ll;
+  cursor_sync_rowcol();
+  scroll_to_cursor();
+
+  const char *sev = d->severity == ADIAG_WARNING
+                        ? "Warning"
+                        : (d->severity == ADIAG_NOTE ? "Note" : "Error");
+  snprintf(g_diag_status, sizeof(g_diag_status), " %s, line %d: %s", sev,
+           d->line, d->message);
+}
+
 static void editor_assemble(void) {
   if (g_settings.nasm_path[0] == '\0') {
     static const char *body[] = {
@@ -3390,7 +3438,7 @@ static void editor_assemble(void) {
    * Maximum supported extra tokens: 16.
    */
 #define NASM_MAX_ARGS                                                          \
-  20 /* 1 (filepath) + up to 16 flag tokens + 2 (--fb addr) + sentinel */
+  20 /* 1 (file) + up to 16 flag tokens + 3 (--diagnostics-file, --fb, addr) */
   char args_copy[128];
   strncpy(args_copy, g_settings.nasm_args, sizeof(args_copy) - 1);
   args_copy[sizeof(args_copy) - 1] = '\0';
@@ -3399,12 +3447,18 @@ static void editor_assemble(void) {
   int argsn = 0;
   args[argsn++] = g_filepath; /* always first: the source file */
 
-  /* Keep two slots free for the trailing "--fb <addr>" pair. */
+  /* Keep three slots free for the injected diagnostics-file and "--fb addr". */
   char *tok = strtok(args_copy, " \t");
-  while (tok && argsn < NASM_MAX_ARGS - 2) {
+  while (tok && argsn < NASM_MAX_ARGS - 3) {
     args[argsn++] = tok;
     tok = strtok(NULL, " \t");
   }
+
+  /* Ask nasm to write structured diagnostics to a file we can read back;
+     passing this alone is enough to select JSON output.  An older nasm that
+     predates the option ignores it, so we simply do not jump. */
+  static char diag_arg[] = "--diagnostics-file=" ASM_DIAG_FILE;
+  args[argsn++] = diag_arg;
 
   /* Inject the framebuffer argument so nasm can inherit our screen state */
   char fb_addr_str[32];
@@ -3413,6 +3467,10 @@ static void editor_assemble(void) {
   args[argsn++] = "--fb";
   args[argsn++] = fb_addr_str;
 
+  /* Clear any stale diagnostics from a previous run so a cancelled assemble
+     (which never rewrites the file) is never mistaken for this run. */
+  remove(ASM_DIAG_FILE);
+
   nl_exec(g_settings.nasm_path, argsn, args);
   /*
    * nl_exec returns after the child exits (or immediately if it could not
@@ -3420,6 +3478,9 @@ static void editor_assemble(void) {
    * mode, so claim the screen back before drawing anything.
    */
   gfx_reinit();
+
+  /* Read nasm's diagnostics and jump to the first error in this file. */
+  editor_show_first_diagnostic();
 #undef NASM_MAX_ARGS
 }
 
@@ -3777,6 +3838,10 @@ int editor_open(const char *path) {
       idle();
       continue;
     }
+
+    /* Any keypress dismisses a transient status message (e.g. an assemble
+       error note), restoring the normal status line. */
+    g_diag_status[0] = '\0';
 
     /* Gate the first edit of a read-only file behind a confirmation. */
     if (act_is_edit(act) && !editor_confirm_rw()) {
