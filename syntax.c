@@ -175,11 +175,37 @@ static uint16_t tok_colour(TokType t) {
   }
 }
 
+/* Number of colours the bracket-nesting cycle rotates through. */
+#define BRACKET_DEPTH_COLORS 3
+
+/*
+ * Colour for a bracket at nesting depth `depth`, so a matching pair (which is
+ * looked up at the same depth) shares a colour and nested pairs differ.
+ *
+ * For now this reuses three distinct existing syntax colours, so it follows
+ * the active theme (Dark / Light / Custom) with no new configuration.  The
+ * choice of colours is deliberately confined to this one function: a future
+ * set of dedicated, user-configurable "bracket depth" colours only needs to
+ * add the fields to SyntaxColours and swap the three cases below - nothing in
+ * render_line_highlighted changes.
+ */
+static uint16_t bracket_depth_color(int depth) {
+  switch (depth % BRACKET_DEPTH_COLORS) {
+  case 0:
+    return C_REG;
+  case 1:
+    return C_IMM;
+  default:
+    return C_DIR;
+  }
+}
+
 void render_line_highlighted(const char *line_buf, int px, int py, uint16_t bg,
                              int col_off, int max_w) {
   int len = (int)strlen(line_buf);
   int i = 0;
   int draw_x = px - col_off * GFX_CHAR_W;
+  int bracket_depth = 0; /* nesting depth for bracket-pair colourisation */
 
   /* Pre-scan for SWI/SVC to render an inline hint */
   long sys_num = -1;
@@ -254,6 +280,26 @@ void render_line_highlighted(const char *line_buf, int px, int py, uint16_t bg,
       for (int j = start; j < i; j++) {
         DRAWC(line_buf[j], tok_colour(t));
       }
+      continue;
+    }
+
+    /* Bracket-pair colourisation: colour each bracket by nesting depth so a
+       matching pair shares a colour.  Brackets inside strings and comments
+       are consumed by those branches above and never reach here, so only
+       code brackets are coloured.  Respects the syntax-highlight toggle. */
+    if (c == '(' || c == '[' || c == '{') {
+      DRAWC(c, g_settings.syntax_highlight ? bracket_depth_color(bracket_depth)
+                                           : C_FG);
+      bracket_depth++;
+      i++;
+      continue;
+    }
+    if (c == ')' || c == ']' || c == '}') {
+      if (bracket_depth > 0)
+        bracket_depth--;
+      DRAWC(c, g_settings.syntax_highlight ? bracket_depth_color(bracket_depth)
+                                           : C_FG);
+      i++;
       continue;
     }
 
