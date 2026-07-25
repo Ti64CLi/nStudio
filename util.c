@@ -20,3 +20,15 @@ int my_isalnum(char c) {
   return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
          (c >= 'a' && c <= 'z');
 }
+
+/* Case-insensitive compare of at most n chars */
+int strncaseeq(const char *a, const char *b, int n) {
+  int i;
+  for (i = 0; i < n; i++) {
+    if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
+      return 0;
+    if (!a[i])
+      return 1;
+  }
+  return 1;
+}

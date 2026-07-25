@@ -12,9 +12,6 @@
 
 #include <stdint.h>
 
-/* Case-insensitive compare of at most n chars */
-int strncaseeq(const char *a, const char *b, int n);
-
 /* Word-slice classifiers (word need not be NUL-terminated); all are
    backed by the vendored optab.c tables shared with nasm. */
 int syn_is_mnem(const char *word, int wlen);

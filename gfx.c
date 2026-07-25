@@ -10,7 +10,6 @@
 #include <string.h>
 
 #include "gfx.h"
-#include "settings.h"
 
 /* --------------------------------------------------------------*/
 /* Framebuffer & Lifecycle                                      */

@@ -35,6 +35,7 @@
 #include "gfx.h"
 #include "settings.h"
 #include "syntax.h"
+#include "util.h"
 
 /* ================================================================
  * Layout constants

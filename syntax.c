@@ -30,6 +30,7 @@
 #include "optab.h"
 #include "settings.h"
 #include "syntax.h"
+#include "util.h"
 
 #define C_FG settings_col(g_settings.ui_fg)
 #define C_MNEM settings_col(g_settings.syn.mnem)
@@ -39,18 +40,6 @@
 #define C_CMT settings_col(g_settings.syn.comment)
 #define C_DIR settings_col(g_settings.syn.directive)
 #define C_STR settings_col(g_settings.syn.string)
-
-/* Case-insensitive compare of at most n chars */
-int strncaseeq(const char *a, const char *b, int n) {
-  int i;
-  for (i = 0; i < n; i++) {
-    if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i]))
-      return 0;
-    if (!a[i])
-      return 1;
-  }
-  return 1;
-}
 
 /* Copy a word slice into a NUL-terminated buffer for the optab
    classifiers.  Returns 0 if the word cannot be a keyword (too long). */

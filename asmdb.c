@@ -11,7 +11,7 @@
 
 #include "asmdb.h"
 #include "optab.h"
-#include "syntax.h"
+#include "util.h"
 
 /* ================================================================
  * ARM Mnemonic database
