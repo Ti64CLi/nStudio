@@ -2769,6 +2769,7 @@ static void editor_open_file(void) {
   cursor_pos = 0;
   cursor_row = 0;
   cursor_col = 0;
+  cursor_goal_col = 0;
   scroll_row = 0;
   scroll_col = 0;
   sel_anchor = SEL_NONE;
@@ -3750,6 +3751,7 @@ int editor_open(const char *path) {
   cursor_pos = 0;
   cursor_row = 0;
   cursor_col = 0;
+  cursor_goal_col = 0;
   scroll_row = 0;
   scroll_col = 0;
 

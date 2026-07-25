@@ -65,7 +65,7 @@ void settings_defaults(NStudioSettings *s) {
   s->syntax_highlight = 1;
   strncpy(s->asm_extension, "asm", 31);
   s->nasm_path[0] = '\0';
-  strncpy(s->nasm_args, "--ask-name --no-auto-tns", 127);
+  s->nasm_args[0] = '\0';
   strncpy(s->last_dir, "/documents", sizeof(s->last_dir) - 1);
   s->last_dir[sizeof(s->last_dir) - 1] = '\0';
   settings_theme_dark(s);
