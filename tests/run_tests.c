@@ -21,6 +21,7 @@
 
 #include "asmdb.h"
 #include "asmdiag.h"
+#include "fileio.h"
 #include "gapbuf.h"
 #include "optab.h"
 #include "util.h"
@@ -327,12 +328,80 @@ static void test_asmdb(void) {
   CHECK(cheatsheet_lookup("aaaaaaaaaaaaaaaa", 16) == NULL); /* wlen >= 16 */
 }
 
+/* ================================================================ */
+/* fileio  (atomic whole-file replacement)                          */
+/* ================================================================ */
+static int writer_hello(FILE *f, void *ctx) {
+  (void)ctx;
+  fputs("hello", f);
+  return 1;
+}
+
+/* Writes something, then reports failure - the partial content must be
+   discarded and the pre-existing file left untouched. */
+static int writer_fail(FILE *f, void *ctx) {
+  (void)ctx;
+  fputs("partial garbage", f);
+  return 0;
+}
+
+/* Read a whole file into buf (NUL-terminated); returns bytes read, -1 if
+   the file could not be opened. */
+static int read_all(const char *path, char *buf, int cap) {
+  FILE *f = fopen(path, "r");
+  if (!f)
+    return -1;
+  int n = (int)fread(buf, 1, (size_t)cap - 1, f);
+  fclose(f);
+  buf[n] = '\0';
+  return n;
+}
+
+static void test_fileio(void) {
+  printf("fileio\n");
+
+  char path[64];
+  strcpy(path, "/tmp/nstudio_fioXXXXXX");
+  int fd = mkstemp(path);
+  CHECK(fd >= 0);
+  if (fd < 0)
+    return;
+
+  /* seed an existing file with known content */
+  FILE *seed = fdopen(fd, "w");
+  fputs("original", seed);
+  fclose(seed);
+
+  char buf[64];
+
+  /* success: the file is replaced with the writer's output */
+  CHECK(write_file_atomic(path, writer_hello, NULL) == 1);
+  CHECK(read_all(path, buf, sizeof(buf)) == 5);
+  CHECK(strcmp(buf, "hello") == 0);
+
+  /* failure: the previous content survives, unchanged */
+  CHECK(write_file_atomic(path, writer_fail, NULL) == 0);
+  CHECK(read_all(path, buf, sizeof(buf)) == 5);
+  CHECK(strcmp(buf, "hello") == 0);
+
+  /* and no temporary is left behind */
+  char tmp[80];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+  FILE *leftover = fopen(tmp, "r");
+  CHECK(leftover == NULL);
+  if (leftover)
+    fclose(leftover);
+
+  unlink(path);
+}
+
 int main(void) {
   test_util();
   test_optab();
   test_gapbuf();
   test_asmdiag();
   test_asmdb();
+  test_fileio();
 
   printf("\n%d checks, %d failed\n", g_checks, g_fails);
   return g_fails ? 1 : 0;

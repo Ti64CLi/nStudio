@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 
 #include "browser.h"
+#include "fileio.h"
 #include "gfx.h"
 #include "settings.h"
 
@@ -284,10 +285,12 @@ void settings_load(void) {
   settings_apply_theme();
 }
 
-void settings_save(void) {
-  FILE *f = fopen(SETTINGS_FILE, "w");
-  if (!f)
-    return;
+/* Writer for write_file_atomic: emit every managed key, then re-emit any keys
+   owned by another tool sharing this file, untouched.  A failed fprintf/fwrite
+   sets the stream error indicator, which write_file_atomic() checks via
+   ferror(), so returning 1 here still yields an all-or-nothing save. */
+static int settings_writer(FILE *f, void *ctx) {
+  (void)ctx;
   fprintf(f, "tab_width=%d\n", g_settings.tab_width);
   fprintf(f, "auto_indent=%d\n", g_settings.auto_indent);
   fprintf(f, "syntax_highlight=%d\n", g_settings.syntax_highlight);
@@ -316,11 +319,14 @@ void settings_save(void) {
   fprintf(f, "nasm_args=%s\n", g_settings.nasm_args);
   fprintf(f, "nasm_last_dir=%s\n", g_settings.last_dir);
 
-  /* Re-emit any keys owned by another tool sharing this file, untouched. */
   if (g_extra_len > 0)
     fwrite(g_extra_config, 1, g_extra_len, f);
 
-  fclose(f);
+  return 1;
+}
+
+void settings_save(void) {
+  write_file_atomic(SETTINGS_FILE, settings_writer, NULL);
 }
 
 void settings_set_last_dir(const char *dir) {
