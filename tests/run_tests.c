@@ -1,0 +1,339 @@
+/*
+ * tests/run_tests.c
+ * Host-side regression tests for nStudio's pure modules.
+ *
+ * These are compiled and run on the development host with the system
+ * compiler (see `make test`), NOT with the Ndless toolchain.  They cover
+ * only the modules that have no editor / graphics / Ndless dependency:
+ *   util, optab, gapbuf, asmdiag, asmdb
+ * The UI, rendering and syntax renderer (which pulls in gfx.h -> <keys.h>)
+ * are deliberately out of scope; syntax classification is exercised here
+ * through optab, which is what it delegates to.
+ *
+ * POSIX host-only: uses mkstemp()/unlink() for the diagnostics fixture.
+ * Every assertion is grounded in the current source, never a guess.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "asmdb.h"
+#include "asmdiag.h"
+#include "gapbuf.h"
+#include "optab.h"
+#include "util.h"
+
+static int g_checks = 0;
+static int g_fails = 0;
+
+#define CHECK(cond)                                                            \
+  do {                                                                         \
+    g_checks++;                                                                \
+    if (!(cond)) {                                                             \
+      g_fails++;                                                               \
+      printf("  FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond);                 \
+    }                                                                          \
+  } while (0)
+
+/* ================================================================ */
+/* util                                                             */
+/* ================================================================ */
+static void test_util(void) {
+  printf("util\n");
+
+  /* strncaseeq: case-insensitive, stops at NUL in either operand */
+  CHECK(strncaseeq("MOV", "mov", 3) == 1);
+  CHECK(strncaseeq("mov", "mvn", 3) == 0);
+  CHECK(strncaseeq("move", "moved", 3) == 1); /* first 3 match */
+  CHECK(strncaseeq("abc", "abc", 5) == 1);    /* NUL reached before n */
+  CHECK(strncaseeq("abc", "abd", 5) == 0);
+  CHECK(strncaseeq("ab", "abc", 5) == 0); /* differing length at NUL */
+
+  /* strupper */
+  char up[16];
+  strupper("mov", up, sizeof(up));
+  CHECK(strcmp(up, "MOV") == 0);
+  strupper("Ldr12", up, sizeof(up));
+  CHECK(strcmp(up, "LDR12") == 0);
+
+  /* my_isalnum: letters and digits only, not '_' or punctuation */
+  CHECK(my_isalnum('a') == 1);
+  CHECK(my_isalnum('Z') == 1);
+  CHECK(my_isalnum('7') == 1);
+  CHECK(my_isalnum('_') == 0);
+  CHECK(my_isalnum(' ') == 0);
+}
+
+/* ================================================================ */
+/* optab  (the shared classification source of truth)              */
+/* ================================================================ */
+static void test_optab(void) {
+  printf("optab\n");
+
+  /* registers, including the sp/lr/pc aliases */
+  CHECK(get_reg_num("r0") == 0);
+  CHECK(get_reg_num("R15") == 15);
+  CHECK(get_reg_num("sp") == 13);
+  CHECK(get_reg_num("lr") == 14);
+  CHECK(get_reg_num("pc") == 15);
+  CHECK(get_reg_num("r16") == -1);
+  CHECK(is_reg("r7") == 1);
+  CHECK(is_reg("mov") == 0);
+
+  /* condition codes */
+  CHECK(get_condcode_value("eq") == 0);
+  CHECK(get_condcode_value("AL") == 14);
+  CHECK(is_condcode("ne") == 1);
+  CHECK(is_condcode("xy") == 0);
+
+  /* opnames: mnemonics + directives, case-insensitive */
+  CHECK(is_opname("mov") == 1);
+  CHECK(is_opname("MOV") == 1);
+  CHECK(is_opname("ldr") == 1);
+  CHECK(is_opname("b") == 1);
+  CHECK(is_opname("bl") == 1);
+  CHECK(is_opname("bx") == 1);
+  CHECK(is_opname("align") == 1);   /* directive is an opname */
+  CHECK(is_opname("include") == 1); /* pre-assembly directive */
+  CHECK(is_opname("bogusop") == 0);
+  CHECK(is_opname("frobnicate") == 0);
+
+  /* conditionable excludes directives, includes real instructions */
+  CHECK(is_conditionable("mov") == 1);
+  CHECK(is_conditionable("b") == 1);
+  CHECK(is_conditionable("align") == 0);
+  CHECK(is_conditionable("include") == 0);
+
+  /* directives */
+  CHECK(is_directive("EQU") == 1);
+  CHECK(is_directive("align") == 1);
+  CHECK(is_directive("mov") == 0);
+  CHECK(is_preasm_directive("include") == 1);
+  CHECK(is_preasm_directive("get") == 1);
+  CHECK(is_preasm_directive("align") == 0);
+
+  /* branch ops (BLX intentionally absent - nasm does not assemble it) */
+  CHECK(is_branchop("b") == 1);
+  CHECK(is_branchop("bl") == 1);
+  CHECK(is_branchop("bx") == 1);
+  CHECK(is_branchop("blx") == 0);
+
+  /* shift names (RRX is handled separately by syntax.c, not here) */
+  CHECK(is_shiftname("lsl") == 1);
+  CHECK(is_shiftname("ROR") == 1);
+  CHECK(is_shiftname("rrx") == 0);
+
+  /* other operand keywords */
+  CHECK(is_psr("cpsr") == 1);
+  CHECK(is_coprocreg("c0") == 1);
+  CHECK(is_coproc("p15") == 1);
+
+  /* labels: letter first, then alnum/underscore */
+  CHECK(is_valid_label("start") == 1);
+  CHECK(is_valid_label("lab_1") == 1);
+  CHECK(is_valid_label("_x") == 0); /* must start with a letter */
+  CHECK(is_valid_label("1x") == 0);
+  CHECK(is_valid_label("") == 0);
+}
+
+/* ================================================================ */
+/* gapbuf                                                           */
+/* ================================================================ */
+static void test_gapbuf(void) {
+  printf("gapbuf\n");
+
+  GapBuf g;
+  gb_init(&g);
+
+  /* empty buffer is one (empty) line */
+  rebuild_lines(&g);
+  CHECK(gb_len(&g) == 0);
+  CHECK(num_lines == 1);
+  CHECK(line_starts[0] == 0);
+  CHECK(line_len(&g, 0) == 0);
+  CHECK(g_lines_truncated == 0);
+
+  /* three lines of two chars each */
+  gb_inserts(&g, "ab\ncd\nef");
+  CHECK(gb_len(&g) == 8);
+  rebuild_lines(&g);
+  CHECK(num_lines == 3);
+  CHECK(line_starts[0] == 0);
+  CHECK(line_starts[1] == 3);
+  CHECK(line_starts[2] == 6);
+  CHECK(line_len(&g, 0) == 2);
+  CHECK(line_len(&g, 1) == 2);
+  CHECK(line_len(&g, 2) == 2); /* last line runs to end of buffer */
+
+  /* gb_get reads logical indices across the gap */
+  CHECK(gb_get(&g, 0) == 'a');
+  CHECK(gb_get(&g, 2) == '\n');
+  CHECK(gb_get(&g, 7) == 'f');
+
+  /* insert in the middle: "ab\nXcd\nef" */
+  gb_move(&g, 3);
+  CHECK(gb_insert(&g, 'X') == 1);
+  CHECK(gb_len(&g) == 9);
+  CHECK(gb_get(&g, 3) == 'X');
+  CHECK(gb_get(&g, 4) == 'c');
+  rebuild_lines(&g);
+  CHECK(num_lines == 3);
+  CHECK(line_len(&g, 1) == 3); /* "Xcd" */
+
+  /* backspace/delete around the cursor (currently at 4) */
+  gb_backspace(&g); /* removes 'X' at logical 3 */
+  CHECK(gb_len(&g) == 8);
+  CHECK(gb_get(&g, 3) == 'c');
+
+  gb_free(&g);
+
+  /* gb_insert_n is NUL-safe (binary round trip) */
+  GapBuf b;
+  gb_init(&b);
+  char raw[4] = {'x', 'y', '\0', 'z'};
+  CHECK(gb_insert_n(&b, raw, 4) == 4);
+  CHECK(gb_len(&b) == 4);
+  CHECK(gb_get(&b, 2) == '\0');
+  CHECK(gb_get(&b, 3) == 'z');
+  gb_free(&b);
+}
+
+/* ================================================================ */
+/* asmdiag  (nasm JSON diagnostics consumer)                        */
+/* ================================================================ */
+
+/* Write `content` to a fresh temp file; returns 1 and fills path_out. */
+static int write_tmp(const char *content, char *path_out) {
+  strcpy(path_out, "/tmp/nstudio_diagXXXXXX");
+  int fd = mkstemp(path_out);
+  if (fd < 0)
+    return 0;
+  FILE *f = fdopen(fd, "w");
+  if (!f) {
+    close(fd);
+    return 0;
+  }
+  fputs(content, f);
+  fclose(f);
+  return 1;
+}
+
+static void test_asmdiag(void) {
+  printf("asmdiag\n");
+
+  /* Two diagnostics.  The first carries nested "related" and
+     "include_stack" arrays whose own line/col MUST NOT leak into the
+     top-level fields - this exercises the skip-nested-array logic.  The
+     second's message contains a ']' that must not be mistaken for the end
+     of an array. */
+  static const char *json =
+      "[\n"
+      "  {\"severity\":\"error\",\"code\":\"E100\","
+      "\"file\":\"/documents/test.asm.tns\","
+      "\"line\":24,\"col\":2,\"end_col\":9,"
+      "\"message\":\"This instruction (name:BOGUSOP, flags:) is unknown\","
+      "\"source_line\":\" bogusop r3\",\"expanded_from\":\"\","
+      "\"related\":[{\"file\":\"a.asm\",\"line\":1,\"col\":1,"
+      "\"end_col\":2,\"message\":\"first defined here\"}],"
+      "\"include_stack\":[{\"file\":\"inc.asm\",\"line\":5}]},\n"
+      "  {\"severity\":\"warning\",\"code\":\"\","
+      "\"file\":\"/documents/test.asm.tns\","
+      "\"line\":-1,\"col\":0,\"end_col\":0,"
+      "\"message\":\"brackets ] inside a string must not end an array\","
+      "\"source_line\":\"\",\"expanded_from\":\"\","
+      "\"related\":[],\"include_stack\":[]}\n"
+      "]\n";
+
+  AsmDiag out[ASMDIAG_MAX];
+  char path[64];
+
+  CHECK(write_tmp(json, path));
+  int n = asmdiag_parse_file(path, out, ASMDIAG_MAX);
+  unlink(path);
+
+  CHECK(n == 2);
+  if (n == 2) {
+    /* top-level fields survive the nested arrays intact */
+    CHECK(out[0].severity == ADIAG_ERROR);
+    CHECK(out[0].line == 24);
+    CHECK(out[0].col == 2);
+    CHECK(out[0].end_col == 9);
+    CHECK(strcmp(out[0].code, "E100") == 0);
+    CHECK(strcmp(out[0].file, "/documents/test.asm.tns") == 0);
+    CHECK(strstr(out[0].message, "BOGUSOP") != NULL);
+
+    CHECK(out[1].severity == ADIAG_WARNING);
+    CHECK(out[1].line == -1);
+    CHECK(strstr(out[1].message, "brackets") != NULL);
+
+    /* first-for-file: full path, then base name, then no match */
+    CHECK(asmdiag_first_for_file(out, n, "/documents/test.asm.tns") == 0);
+    CHECK(asmdiag_first_for_file(out, n, "/other/dir/test.asm.tns") == 0);
+    CHECK(asmdiag_first_for_file(out, n, "nope.asm.tns") == -1);
+  }
+
+  /* clean assemble: "[]" -> zero diagnostics */
+  CHECK(write_tmp("[]\n", path));
+  CHECK(asmdiag_parse_file(path, out, ASMDIAG_MAX) == 0);
+  unlink(path);
+
+  /* absent file -> -1 (distinct from a clean, empty batch) */
+  CHECK(asmdiag_parse_file("/tmp/nstudio_no_such_diag_file_zzz", out,
+                           ASMDIAG_MAX) == -1);
+
+  /* first-for-file honours the line >= 1 guard even on a file match */
+  AsmDiag one;
+  memset(&one, 0, sizeof(one));
+  strcpy(one.file, "only.asm.tns");
+  one.severity = ADIAG_ERROR;
+  one.line = -1;
+  CHECK(asmdiag_first_for_file(&one, 1, "only.asm.tns") == -1);
+  one.line = 7;
+  CHECK(asmdiag_first_for_file(&one, 1, "only.asm.tns") == 0);
+}
+
+/* ================================================================ */
+/* asmdb  (catalog + syscall lookups)                               */
+/* ================================================================ */
+static void test_asmdb(void) {
+  printf("asmdb\n");
+
+  /* syscall lookup (0x400000 is the emulator debug-alloc entry) */
+  const char *name = get_syscall_name(0x400000);
+  CHECK(name != NULL && strcmp(name, "NDLSEMU_DEBUG_ALLOC") == 0);
+  CHECK(get_syscall_name(-12345) == NULL);
+
+  /* cheatsheet_lookup: exact, case-insensitive, and suffix stripping */
+  const MnemInfo *mi = cheatsheet_lookup("mov", 3);
+  CHECK(mi != NULL && strcmp(mi->name, "mov") == 0);
+
+  mi = cheatsheet_lookup("MOV", 3);
+  CHECK(mi != NULL && strcmp(mi->name, "mov") == 0);
+
+  mi = cheatsheet_lookup("moveq", 5); /* strip condition code */
+  CHECK(mi != NULL && strcmp(mi->name, "mov") == 0);
+
+  mi = cheatsheet_lookup("adds", 4); /* strip trailing S */
+  CHECK(mi != NULL && strcmp(mi->name, "add") == 0);
+
+  mi = cheatsheet_lookup("addeqs", 6); /* condition code before S */
+  CHECK(mi != NULL && strcmp(mi->name, "add") == 0);
+
+  CHECK(cheatsheet_lookup("bogusop", 7) == NULL);
+  CHECK(cheatsheet_lookup("frobnicate", 10) == NULL);
+  CHECK(cheatsheet_lookup("x", 0) == NULL);  /* wlen <= 0 */
+  CHECK(cheatsheet_lookup("aaaaaaaaaaaaaaaa", 16) == NULL); /* wlen >= 16 */
+}
+
+int main(void) {
+  test_util();
+  test_optab();
+  test_gapbuf();
+  test_asmdiag();
+  test_asmdb();
+
+  printf("\n%d checks, %d failed\n", g_checks, g_fails);
+  return g_fails ? 1 : 0;
+}

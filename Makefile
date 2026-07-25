@@ -34,7 +34,25 @@ $(EXE).tns: $(EXE).elf
 
 -include $(DEPS)
 
-clean:
-	rm -f $(OBJS) $(DEPS) $(EXE).tns $(EXE).elf $(EXE).tns.zehn
+# ----------------------------------------------------------------------
+# Host-side unit tests.  These run on the development machine with the
+# system compiler (NOT nspire-gcc) and cover only the pure modules that
+# have no editor / graphics / Ndless dependency.  Compiled in a single
+# invocation to a standalone binary, so no host .o files ever collide
+# with the ARM objects above.
+# ----------------------------------------------------------------------
+HOSTCC ?= cc
+HOSTCFLAGS = -Wall -W -O0 -g -I.
+TEST_BIN = tests/run_tests
+TEST_MODULES = util.c optab.c gapbuf.c asmdiag.c asmdb.c
 
-.PHONY: all clean
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+
+$(TEST_BIN): tests/run_tests.c $(TEST_MODULES)
+	$(HOSTCC) $(HOSTCFLAGS) -o $@ $^
+
+clean:
+	rm -f $(OBJS) $(DEPS) $(EXE).tns $(EXE).elf $(EXE).tns.zehn $(TEST_BIN)
+
+.PHONY: all clean test

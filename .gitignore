@@ -3,3 +3,4 @@
 *.elf
 *.zehn
 nstudio.tns
+tests/run_tests
