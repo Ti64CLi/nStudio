@@ -91,6 +91,9 @@ void settings_theme_dark(NStudioSettings *s) {
   s->syn.directive = 19;
   s->syn.string = 16;
   s->syn.normal = 5;
+  s->syn.bracket1 = 12; /* same hues the depths used before they were */
+  s->syn.bracket2 = 16; /* configurable: register, immediate, directive */
+  s->syn.bracket3 = 19;
 }
 
 void settings_theme_light(NStudioSettings *s) {
@@ -113,6 +116,9 @@ void settings_theme_light(NStudioSettings *s) {
   s->syn.directive = 20;
   s->syn.string = 15;
   s->syn.normal = 0;
+  s->syn.bracket1 = 11;
+  s->syn.bracket2 = 15;
+  s->syn.bracket3 = 20;
 }
 
 /* Config lines whose keys nStudio does not manage are preserved verbatim and
@@ -131,7 +137,8 @@ static int is_known_key(const char *k) {
       "ui_accent_text", "ui_item_bg",   "syn_mnem",
       "syn_reg",     "syn_imm",         "syn_label",
       "syn_comment", "syn_directive",   "syn_string",
-      "syn_normal",  "nasm_path",       "nasm_args",
+      "syn_normal",  "syn_bracket1",    "syn_bracket2",
+      "syn_bracket3", "nasm_path",      "nasm_args",
       "nasm_last_dir", NULL};
   for (int i = 0; keys[i]; i++)
     if (!strcmp(k, keys[i]))
@@ -173,6 +180,9 @@ static void settings_validate(NStudioSettings *s) {
   s->syn.directive = clampi(s->syn.directive, 0, maxc);
   s->syn.string = clampi(s->syn.string, 0, maxc);
   s->syn.normal = clampi(s->syn.normal, 0, maxc);
+  s->syn.bracket1 = clampi(s->syn.bracket1, 0, maxc);
+  s->syn.bracket2 = clampi(s->syn.bracket2, 0, maxc);
+  s->syn.bracket3 = clampi(s->syn.bracket3, 0, maxc);
 }
 
 /* strncpy that always NUL-terminates. */
@@ -186,6 +196,10 @@ void settings_load(void) {
   settings_defaults(&g_settings);
   g_extra_config[0] = '\0';
   g_extra_len = 0;
+
+  /* Which bracket-depth colours the file actually carried.  A config written
+     before they existed has none, and must keep looking the way it did. */
+  int saw_bracket[3] = {0, 0, 0};
 
   FILE *f = fopen(SETTINGS_FILE, "r");
   if (f) {
@@ -264,6 +278,16 @@ void settings_load(void) {
         g_settings.syn.string = vi;
       else if (!strcmp(k, "syn_normal"))
         g_settings.syn.normal = vi;
+      else if (!strcmp(k, "syn_bracket1")) {
+        g_settings.syn.bracket1 = vi;
+        saw_bracket[0] = 1;
+      } else if (!strcmp(k, "syn_bracket2")) {
+        g_settings.syn.bracket2 = vi;
+        saw_bracket[1] = 1;
+      } else if (!strcmp(k, "syn_bracket3")) {
+        g_settings.syn.bracket3 = vi;
+        saw_bracket[2] = 1;
+      }
       else if (!strcmp(k, "nasm_path"))
         copy_str(g_settings.nasm_path, v, sizeof(g_settings.nasm_path));
       else if (!strcmp(k, "nasm_args"))
@@ -273,6 +297,17 @@ void settings_load(void) {
     }
     fclose(f);
   }
+
+  /* Bracket depths used to borrow the register, immediate and directive
+     colours.  When a config predates the dedicated settings, inherit those, so
+     a custom theme keeps exactly the bracket colours it had rather than
+     picking up the built-in defaults. */
+  if (!saw_bracket[0])
+    g_settings.syn.bracket1 = g_settings.syn.reg;
+  if (!saw_bracket[1])
+    g_settings.syn.bracket2 = g_settings.syn.imm;
+  if (!saw_bracket[2])
+    g_settings.syn.bracket3 = g_settings.syn.directive;
 
   /* Lock in preset palettes to prevent visual tearing if user changes theme
    * setting */
@@ -315,6 +350,9 @@ static int settings_writer(FILE *f, void *ctx) {
   fprintf(f, "syn_directive=%d\n", g_settings.syn.directive);
   fprintf(f, "syn_string=%d\n", g_settings.syn.string);
   fprintf(f, "syn_normal=%d\n", g_settings.syn.normal);
+  fprintf(f, "syn_bracket1=%d\n", g_settings.syn.bracket1);
+  fprintf(f, "syn_bracket2=%d\n", g_settings.syn.bracket2);
+  fprintf(f, "syn_bracket3=%d\n", g_settings.syn.bracket3);
   fprintf(f, "nasm_path=%s\n", g_settings.nasm_path);
   fprintf(f, "nasm_args=%s\n", g_settings.nasm_args);
   fprintf(f, "nasm_last_dir=%s\n", g_settings.last_dir);
@@ -432,7 +470,10 @@ static void settings_ui_tick(GfxWindow *win) {
         c->syn.reg != p->syn.reg || c->syn.imm != p->syn.imm ||
         c->syn.label != p->syn.label || c->syn.comment != p->syn.comment ||
         c->syn.directive != p->syn.directive ||
-        c->syn.string != p->syn.string || c->syn.normal != p->syn.normal) {
+        c->syn.string != p->syn.string || c->syn.normal != p->syn.normal ||
+        c->syn.bracket1 != p->syn.bracket1 ||
+        c->syn.bracket2 != p->syn.bracket2 ||
+        c->syn.bracket3 != p->syn.bracket3) {
       g_settings.theme = 2;
     }
   }
@@ -597,6 +638,24 @@ void settings_ui_open(void) {
       widget_create_label(col1, yy, col2 - col1, row_h, "Strings:");
   GfxWidget *w_str_val = widget_create_dropdown(
       col2, yy, ww, row_h, &g_settings.syn.string, color_opts, g_palette_size);
+  yy += row_h;
+  GfxWidget *w_br1_lbl =
+      widget_create_label(col1, yy, col2 - col1, row_h, "Brackets 1:");
+  GfxWidget *w_br1_val =
+      widget_create_dropdown(col2, yy, ww, row_h, &g_settings.syn.bracket1,
+                             color_opts, g_palette_size);
+  yy += row_h;
+  GfxWidget *w_br2_lbl =
+      widget_create_label(col1, yy, col2 - col1, row_h, "Brackets 2:");
+  GfxWidget *w_br2_val =
+      widget_create_dropdown(col2, yy, ww, row_h, &g_settings.syn.bracket2,
+                             color_opts, g_palette_size);
+  yy += row_h;
+  GfxWidget *w_br3_lbl =
+      widget_create_label(col1, yy, col2 - col1, row_h, "Brackets 3:");
+  GfxWidget *w_br3_val =
+      widget_create_dropdown(col2, yy, ww, row_h, &g_settings.syn.bracket3,
+                             color_opts, g_palette_size);
   yy += row_h + 14;
 
   GfxWidget *btn_apply = widget_create_button(10, yy, 125, row_h, "Apply");
@@ -613,7 +672,8 @@ void settings_ui_open(void) {
       w_syx_hdr,  w_nrm_lbl,     w_nrm_val,       w_mnm_lbl,       w_mnm_val,
       w_reg_lbl,  w_reg_val,     w_imm_lbl,       w_imm_val,       w_lbl_lbl,
       w_lbl_val,  w_cmt_lbl,     w_cmt_val,       w_dir_lbl,       w_dir_val,
-      w_str_lbl,  w_str_val,     btn_apply,       btn_restore,
+      w_str_lbl,  w_str_val,     w_br1_lbl,       w_br1_val,       w_br2_lbl,
+      w_br2_val,  w_br3_lbl,     w_br3_val,       btn_apply,       btn_restore,
   };
 
   int num_widgets = (int)(sizeof(children) / sizeof(GfxWidget *));

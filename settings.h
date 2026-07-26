@@ -26,6 +26,13 @@ typedef struct {
   int directive; /* assembler directives    */
   int string;    /* string literals         */
   int normal;    /* generic text            */
+  /* Brackets are coloured by nesting depth so a matching pair shares a colour;
+     the cycle repeats past the third level.  The defaults reproduce what the
+     depths borrowed before they were configurable: register, immediate and
+     directive colours. */
+  int bracket1; /* outermost depth         */
+  int bracket2;
+  int bracket3;
 } SyntaxColours;
 
 /* ------------------------------------------------------------------ */

@@ -169,23 +169,23 @@ static uint16_t tok_colour(TokType t) {
 
 /*
  * Colour for a bracket at nesting depth `depth`, so a matching pair (which is
- * looked up at the same depth) shares a colour and nested pairs differ.
+ * looked up at the same depth) shares a colour and nested pairs differ.  The
+ * cycle repeats beyond the third level, which is deep enough that the pairing
+ * stays readable in practice.
  *
- * For now this reuses three distinct existing syntax colours, so it follows
- * the active theme (Dark / Light / Custom) with no new configuration.  The
- * choice of colours is deliberately confined to this one function: a future
- * set of dedicated, user-configurable "bracket depth" colours only needs to
- * add the fields to SyntaxColours and swap the three cases below - nothing in
- * render_line_highlighted changes.
+ * The three colours are configurable in Settings.  Their defaults are the
+ * register, immediate and directive colours of each theme, which is what the
+ * depths borrowed before they had settings of their own - so an existing
+ * configuration keeps the appearance it had.
  */
 static uint16_t bracket_depth_color(int depth) {
   switch (depth % BRACKET_DEPTH_COLORS) {
   case 0:
-    return C_REG;
+    return settings_col(g_settings.syn.bracket1);
   case 1:
-    return C_IMM;
+    return settings_col(g_settings.syn.bracket2);
   default:
-    return C_DIR;
+    return settings_col(g_settings.syn.bracket3);
   }
 }
 

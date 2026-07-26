@@ -19,7 +19,7 @@ nStudio is an ARM assembly editor for the TI-Nspire CX and CX II calculators run
 * **File browser**: Navigate the Ndless filesystem to open existing files and save your work.
 * **Instruction & syscall catalogs**: Offline reference for ARM instructions (signatures, descriptions, CPSR flag effects) and the full Ndless syscall list; insert or view details in place.
 * **Navigation**: Jump to a specific line, browse all defined labels, or jump straight to a branch target.
-* **Themes**: Dark and Light presets, or a custom color scheme. Settings are shared with the `nasm` assembler.
+* **Themes**: Dark and Light presets, or a custom color scheme, including the three colors that bracket pairs cycle through by nesting depth. Settings are shared with the `nasm` assembler.
 * **Character map**: Insert special symbols that are not on the physical keypad.
 
 ## Controls & Shortcuts
