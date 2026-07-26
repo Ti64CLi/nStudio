@@ -2309,9 +2309,7 @@ static int menu_is_sep(const char *item) {
 static void menu_draw_panel(int px, int py, int pw, const char **items,
                             int nitems, int sel_row, int active) {
   int ph = nitems * MENU_ROW_H + 2;
-  gfx_fillrect(px + 3, py + 3, pw, ph, g_default_theme.border_dark);
-  gfx_borderrect(px, py, pw, ph, g_default_theme.bg,
-                 g_default_theme.border_light);
+  gfx_panel(px, py, pw, ph, 0); /* dropdown panel: no title bar */
 
   for (int i = 0; i < nitems; i++) {
     int ry = py + 1 + i * MENU_ROW_H;
@@ -2596,14 +2594,9 @@ static void editor_diag_detail(void) {
     msleep(20);
 
   for (;;) {
-    gfx_fillrect(WIN_X + 3, WIN_Y + 3, WIN_W, WIN_H,
-                 g_default_theme.border_dark);
-    gfx_borderrect(WIN_X, WIN_Y, WIN_W, WIN_H, g_default_theme.bg,
-                   g_default_theme.border_light);
+    gfx_panel(WIN_X, WIN_Y, WIN_W, WIN_H, TITLE_H);
 
     /* Title: severity, plus nasm's stable code when it tagged one. */
-    gfx_fillrect(WIN_X + 1, WIN_Y + 1, WIN_W - 2, TITLE_H,
-                 g_default_theme.title_bg);
     char title[64];
     if (d->code[0])
       snprintf(title, sizeof(title), "%s  %s", diag_severity_name(d), d->code);

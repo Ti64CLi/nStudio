@@ -129,12 +129,7 @@ static void br_draw(const char *cwd, int sel, int scroll, int pick_dir,
   uint16_t DIM_FG = g_default_theme.border_light;
   uint16_t BD = g_default_theme.border_light;
 
-  gfx_fillrect(BR_WIN_X + 3, BR_WIN_Y + 3, BR_WIN_W, BR_WIN_H,
-               g_default_theme.border_dark);
-  gfx_borderrect(BR_WIN_X, BR_WIN_Y, BR_WIN_W, BR_WIN_H, BG, BD);
-
-  gfx_fillrect(BR_WIN_X + 1, BR_WIN_Y + 1, BR_WIN_W - 2, BR_TITLE_H,
-               g_default_theme.title_bg);
+  gfx_panel(BR_WIN_X, BR_WIN_Y, BR_WIN_W, BR_WIN_H, BR_TITLE_H);
 
   /* Leading extra '/' marks a root folder (calculator convention). */
   char disp_path[512];
