@@ -85,11 +85,7 @@ char charmap_pick(void) {
   int redraw = 1;
   for (;;) {
     if (redraw) {
-      gfx_fillrect(wx + 3, wy + 3, win_w, win_h, g_default_theme.border_dark);
-      gfx_borderrect(wx, wy, win_w, win_h, g_default_theme.bg,
-                     g_default_theme.border_light);
-      gfx_fillrect(wx + 1, wy + 1, win_w - 2, CM_TITLE_H,
-                   g_default_theme.title_bg);
+      gfx_panel(wx, wy, win_w, win_h, CM_TITLE_H);
       gfx_drawstr_clipped(wx + 4, wy + 1 + (CM_TITLE_H - GFX_FONT_H) / 2,
                           "Special characters", g_default_theme.title_fg,
                           g_default_theme.title_bg, win_w - 8);
@@ -251,10 +247,7 @@ static void catalog_show_desc(const MnemInfo *mi) {
   int wx = (GFX_W - win_w) / 2;
   int wy = (GFX_H - win_h) / 2;
 
-  gfx_fillrect(wx + 3, wy + 3, win_w, win_h, g_default_theme.border_dark);
-  gfx_borderrect(wx, wy, win_w, win_h, g_default_theme.bg,
-                 g_default_theme.border_light);
-  gfx_fillrect(wx + 1, wy + 1, win_w - 2, TITLE_H, g_default_theme.title_bg);
+  gfx_panel(wx, wy, win_w, win_h, TITLE_H);
 
   char title[32];
   snprintf(title, sizeof(title), "%s", mi->name);
@@ -306,13 +299,9 @@ static void catalog_draw(int sel, int scroll) {
   uint16_t CAT_FG = g_default_theme.accent;
   uint16_t CAT_BG = g_default_theme.item_bg;
   uint16_t BORDER = g_default_theme.border_light;
-  uint16_t SHADOW = g_default_theme.border_dark;
   uint16_t ARGS_FG = g_default_theme.accent; /* args colour when not selected */
 
-  gfx_fillrect(CAT_WIN_X + 3, CAT_WIN_Y + 3, CAT_WIN_W, CAT_WIN_H, SHADOW);
-  gfx_borderrect(CAT_WIN_X, CAT_WIN_Y, CAT_WIN_W, CAT_WIN_H, WIN_BG, BORDER);
-  gfx_fillrect(CAT_WIN_X + 1, CAT_WIN_Y + 1, CAT_WIN_W - 2, CAT_TITLE_H,
-               TITLE_BG);
+  gfx_panel(CAT_WIN_X, CAT_WIN_Y, CAT_WIN_W, CAT_WIN_H, CAT_TITLE_H);
   gfx_drawstr_clipped(
       CAT_WIN_X + 4, CAT_WIN_Y + 1 + (CAT_TITLE_H - GFX_FONT_H) / 2,
       "ARM Instruction Catalog", TITLE_FG, TITLE_BG, CAT_WIN_W - 8);
@@ -351,16 +340,8 @@ static void catalog_draw(int sel, int scroll) {
     }
   }
 
-  if (cat_nrows > CAT_ROWS_VIS) {
-    int bar_total = CAT_LIST_H;
-    int bar_h = bar_total * CAT_ROWS_VIS / cat_nrows;
-    if (bar_h < 4)
-      bar_h = 4;
-    int ms = cat_nrows - CAT_ROWS_VIS;
-    int bar_y = CAT_LIST_Y + (bar_total - bar_h) * scroll / (ms > 0 ? ms : 1);
-    gfx_fillrect(CAT_WIN_X + CAT_WIN_W - 4, CAT_LIST_Y, 3, bar_total, CAT_BG);
-    gfx_fillrect(CAT_WIN_X + CAT_WIN_W - 4, bar_y, 3, bar_h, BORDER);
-  }
+  gfx_scrollbar_v(CAT_WIN_X, CAT_WIN_W, CAT_LIST_Y, CAT_LIST_H, cat_nrows,
+                  CAT_ROWS_VIS, scroll);
 
   int hy = CAT_WIN_Y + CAT_WIN_H - CAT_HINT_H - 1;
   gfx_hline(CAT_WIN_X + 1, hy, CAT_WIN_W - 2, BORDER);
@@ -487,12 +468,7 @@ void syscall_show_desc(const SyscallInfo *si) {
   int redraw = 1;
   for (;;) {
     if (redraw) {
-      gfx_fillrect(WIN_X + 3, WIN_Y + 3, WIN_W, WIN_H,
-                   g_default_theme.border_dark);
-      gfx_borderrect(WIN_X, WIN_Y, WIN_W, WIN_H, g_default_theme.bg,
-                     g_default_theme.border_light);
-      gfx_fillrect(WIN_X + 1, WIN_Y + 1, WIN_W - 2, TITLE_H,
-                   g_default_theme.title_bg);
+      gfx_panel(WIN_X, WIN_Y, WIN_W, WIN_H, TITLE_H);
 
       int c = 0;
       draw_scrolled_text(WIN_X + PAD, WIN_X + WIN_W - PAD,
@@ -574,13 +550,9 @@ static void syscall_draw(int sel, int scroll, int hscroll, int max_hscroll,
   uint16_t SEL_BG = g_default_theme.accent;
   uint16_t SEL_FG = g_default_theme.accent_text;
   uint16_t BORDER = g_default_theme.border_light;
-  uint16_t SHADOW = g_default_theme.border_dark;
   uint16_t ARGS_FG = g_default_theme.accent;
 
-  gfx_fillrect(CAT_WIN_X + 3, CAT_WIN_Y + 3, CAT_WIN_W, CAT_WIN_H, SHADOW);
-  gfx_borderrect(CAT_WIN_X, CAT_WIN_Y, CAT_WIN_W, CAT_WIN_H, WIN_BG, BORDER);
-  gfx_fillrect(CAT_WIN_X + 1, CAT_WIN_Y + 1, CAT_WIN_W - 2, CAT_TITLE_H,
-               TITLE_BG);
+  gfx_panel(CAT_WIN_X, CAT_WIN_Y, CAT_WIN_W, CAT_WIN_H, CAT_TITLE_H);
 
   int c = 0;
   draw_scrolled_text(CAT_WIN_X + 4, CAT_WIN_X + CAT_WIN_W - 4,
@@ -623,17 +595,8 @@ static void syscall_draw(int sel, int scroll, int hscroll, int max_hscroll,
     }
   }
 
-  if (g_nsyscalls > CAT_ROWS_VIS) {
-    int bar_total = CAT_LIST_H;
-    int bar_h = bar_total * CAT_ROWS_VIS / g_nsyscalls;
-    if (bar_h < 4)
-      bar_h = 4;
-    int ms = g_nsyscalls - CAT_ROWS_VIS;
-    int bar_y = CAT_LIST_Y + (bar_total - bar_h) * scroll / (ms > 0 ? ms : 1);
-    gfx_fillrect(CAT_WIN_X + CAT_WIN_W - 4, CAT_LIST_Y, 3, bar_total,
-                 g_default_theme.item_bg);
-    gfx_fillrect(CAT_WIN_X + CAT_WIN_W - 4, bar_y, 3, bar_h, BORDER);
-  }
+  gfx_scrollbar_v(CAT_WIN_X, CAT_WIN_W, CAT_LIST_Y, CAT_LIST_H, g_nsyscalls,
+                  CAT_ROWS_VIS, scroll);
 
   if (max_hscroll > 0) {
     int bar_total_w = CAT_WIN_W - 6; /* Leave space for vertical scrollbar */
@@ -824,12 +787,7 @@ void mnem_show_desc(const MnemInfo *mi) {
   if (WIN_H > GFX_H - 8)
     WIN_H = GFX_H - 8;
 
-  gfx_fillrect(WIN_X + 3, WIN_Y + 3, WIN_W, WIN_H, g_default_theme.border_dark);
-  gfx_borderrect(WIN_X, WIN_Y, WIN_W, WIN_H, g_default_theme.bg,
-                 g_default_theme.border_light);
-
-  gfx_fillrect(WIN_X + 1, WIN_Y + 1, WIN_W - 2, TITLE_H,
-               g_default_theme.title_bg);
+  gfx_panel(WIN_X, WIN_Y, WIN_W, WIN_H, TITLE_H);
   char title[32];
   snprintf(title, sizeof(title), "%s", mi->name);
   for (int i = 0; title[i]; i++)
@@ -916,12 +874,8 @@ static void labels_draw(const LabelEntry *labels, int n, int sel,
   uint16_t SEL_FG = g_default_theme.accent_text;
   uint16_t DIM_FG = g_default_theme.border_light;
   uint16_t BORDER = g_default_theme.border_light;
-  uint16_t SHADOW = g_default_theme.border_dark;
 
-  gfx_fillrect(LBL_WIN_X + 3, LBL_WIN_Y + 3, LBL_WIN_W, LBL_WIN_H, SHADOW);
-  gfx_borderrect(LBL_WIN_X, LBL_WIN_Y, LBL_WIN_W, LBL_WIN_H, WIN_BG, BORDER);
-  gfx_fillrect(LBL_WIN_X + 1, LBL_WIN_Y + 1, LBL_WIN_W - 2, LBL_TITLE_H,
-               TIT_BG);
+  gfx_panel(LBL_WIN_X, LBL_WIN_Y, LBL_WIN_W, LBL_WIN_H, LBL_TITLE_H);
 
   char title[48];
   snprintf(title, sizeof(title), "Labels  (%d defined)", n);
@@ -962,17 +916,8 @@ static void labels_draw(const LabelEntry *labels, int n, int sel,
     gfx_drawstr(LBL_WIN_X + LBL_WIN_W - 6 - lnw, row_y + 1, lnbuf, lfg, bg);
   }
 
-  if (n > LBL_ROWS_VIS) {
-    int bt = LBL_LIST_H;
-    int bh = bt * LBL_ROWS_VIS / n;
-    if (bh < 4)
-      bh = 4;
-    int ms = n - LBL_ROWS_VIS;
-    int by = LBL_LIST_Y + (bt - bh) * scroll / (ms > 0 ? ms : 1);
-    gfx_fillrect(LBL_WIN_X + LBL_WIN_W - 4, LBL_LIST_Y, 3, bt,
-                 g_default_theme.item_bg);
-    gfx_fillrect(LBL_WIN_X + LBL_WIN_W - 4, by, 3, bh, BORDER);
-  }
+  gfx_scrollbar_v(LBL_WIN_X, LBL_WIN_W, LBL_LIST_Y, LBL_LIST_H, n,
+                  LBL_ROWS_VIS, scroll);
 
   int hy = LBL_WIN_Y + LBL_WIN_H - LBL_HINT_H - 1;
   gfx_hline(LBL_WIN_X + 1, hy, LBL_WIN_W - 2, BORDER);

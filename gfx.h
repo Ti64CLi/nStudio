@@ -73,6 +73,23 @@ void gfx_drawstr_clipped(int x, int y, const char *s, uint16_t fg, uint16_t bg,
                          int maxw);
 
 /* ------------------------------------------------------------------ */
+/* Modal panel chrome                                                 */
+/*                                                                    */
+/* Shared by the hand-drawn modals (catalogs, label list, popups) so   */
+/* the shadow offset and border insets are written once.  The caller   */
+/* still draws its own title text and body.                            */
+/* ------------------------------------------------------------------ */
+
+/* Frame a modal panel: drop shadow, border, and the title bar strip when
+   title_h > 0 (pass 0 for a panel without one). */
+void gfx_panel(int x, int y, int w, int h, int title_h);
+
+/* Vertical scrollbar on the right inside edge of a panel, over the list area
+   [list_y, list_y + list_h).  Draws nothing when total <= visible. */
+void gfx_scrollbar_v(int panel_x, int panel_w, int list_y, int list_h,
+                     int total, int visible, int scroll);
+
+/* ------------------------------------------------------------------ */
 /* Legacy Utility Windows                                             */
 /* ------------------------------------------------------------------ */
 void gfx_window_alert(const char *title, const char **lines, int nlines,

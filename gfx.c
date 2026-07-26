@@ -933,6 +933,45 @@ static GfxTheme *resolve_theme(GfxWindow *win, GfxWidget *w) {
 }
 
 /* --------------------------------------------------------------*/
+/* Modal panel chrome                                            */
+/*                                                               */
+/* Every hand-drawn modal in the editor frames itself the same    */
+/* way, so the shape lives here once instead of being spelled out */
+/* at each call site, where the +3 shadow offset and the +1/-2    */
+/* inset are easy to get subtly wrong.                            */
+/* --------------------------------------------------------------*/
+
+/* Frame a modal panel at (x,y,w,h): drop shadow, border, and - when title_h
+   is positive - the title bar strip.  The caller draws the title text and the
+   body, since those differ from dialog to dialog. */
+void gfx_panel(int x, int y, int w, int h, int title_h) {
+  gfx_fillrect(x + 3, y + 3, w, h, g_default_theme.border_dark);
+  gfx_borderrect(x, y, w, h, g_default_theme.bg, g_default_theme.border_light);
+  if (title_h > 0)
+    gfx_fillrect(x + 1, y + 1, w - 2, title_h, g_default_theme.title_bg);
+}
+
+/* Vertical scrollbar down the right inside edge of a panel, spanning the list
+   area [list_y, list_y + list_h).  `total` items with `visible` on screen and
+   the list scrolled to `scroll`.  Draws nothing when everything fits. */
+void gfx_scrollbar_v(int panel_x, int panel_w, int list_y, int list_h,
+                     int total, int visible, int scroll) {
+  if (total <= visible)
+    return;
+
+  int bar_h = list_h * visible / total;
+  if (bar_h < 4)
+    bar_h = 4;
+  int max_scroll = total - visible;
+  int bar_y =
+      list_y + (list_h - bar_h) * scroll / (max_scroll > 0 ? max_scroll : 1);
+  int bar_x = panel_x + panel_w - 4;
+
+  gfx_fillrect(bar_x, list_y, 3, list_h, g_default_theme.item_bg);
+  gfx_fillrect(bar_x, bar_y, 3, bar_h, g_default_theme.border_light);
+}
+
+/* --------------------------------------------------------------*/
 /* Input Polling (Repeating Nav)                                 */
 /* --------------------------------------------------------------*/
 
