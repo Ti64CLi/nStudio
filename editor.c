@@ -1866,47 +1866,12 @@ static void editor_syscall_catalog(void) {
 /* ================================================================
  * Cheat sheet
  *
- * Reads the word under the cursor, looks it up in the MnemInfo
- * database (case-insensitive), and shows a themed modal popup with:
- *   - Instruction name (title bar)
- *   - Syntax / argument signature
- *   - Description
- *   - CPSR flag effects
+ * Works out what the cursor is on - a SWI/SVC number, or a word to look
+ * up in the MnemInfo database (case-insensitive) - and hands the result
+ * to the matching popup in editor_ui.c.  Deciding what is under the
+ * cursor needs the buffer, so it happens here; drawing the popup does
+ * not, so it happens there.
  * ================================================================ */
-
-
-/* Wrap text at word boundaries and draw into the popup body area.
-   Returns the number of lines consumed.                           */
-static int cheatsheet_draw_wrapped(const char *text, int wx, int ty, int max_w,
-                                   int max_lines, uint16_t fg, uint16_t bg) {
-  int line_chars = max_w / GFX_CHAR_W;
-  if (line_chars < 1)
-    line_chars = 1;
-  int pos = 0, nlines = 0;
-  int len = (int)strlen(text);
-  while (pos < len && nlines < max_lines) {
-    int take = len - pos;
-    if (take > line_chars) {
-      take = line_chars;
-      while (take > 1 && text[pos + take - 1] != ' ')
-        take--;
-      if (take <= 1)
-        take = line_chars;
-    }
-    while (take > 0 && text[pos] == ' ') {
-      pos++;
-      take--;
-    }
-    char linebuf[128];
-    int copy = take < 127 ? take : 127;
-    strncpy(linebuf, text + pos, copy);
-    linebuf[copy] = '\0';
-    gfx_drawstr_clipped(wx, ty + nlines * GFX_FONT_H, linebuf, fg, bg, max_w);
-    pos += take;
-    nlines++;
-  }
-  return nlines;
-}
 
 static void editor_cheatsheet(void) {
   if (cursor_row >= num_lines)
@@ -1965,93 +1930,7 @@ static void editor_cheatsheet(void) {
     return;
   }
 
-  /* Render the ARM mnemonic details popup */
-  const int WIN_W = GFX_W - 16;
-  const int WIN_X = 8;
-  const int WIN_Y = 8;
-  const int TITLE_H = 12;
-  const int PAD = 5;
-  const int HINT_H = 11;
-  const int INNER_W = WIN_W - 2 * PAD - 2;
-  const int LINE_H = GFX_FONT_H;
-  const int SEC_GAP = 3; /* pixels between sections */
-
-  int body_h = PAD + LINE_H + SEC_GAP /* "Syntax:" label */
-               + LINE_H + SEC_GAP     /* args value */
-               + LINE_H + SEC_GAP     /* "Description:" label */
-               + 3 * LINE_H + SEC_GAP /* desc (up to 3 wrapped lines) */
-               + LINE_H + SEC_GAP     /* "Flags:" label */
-               + 3 * LINE_H           /* flags (up to 3 wrapped lines) */
-               + PAD;
-  int WIN_H = TITLE_H + body_h + HINT_H + 2;
-  if (WIN_H > GFX_H - 8)
-    WIN_H = GFX_H - 8;
-
-  gfx_fillrect(WIN_X + 3, WIN_Y + 3, WIN_W, WIN_H, g_default_theme.border_dark);
-  gfx_borderrect(WIN_X, WIN_Y, WIN_W, WIN_H, g_default_theme.bg,
-                 g_default_theme.border_light);
-
-  gfx_fillrect(WIN_X + 1, WIN_Y + 1, WIN_W - 2, TITLE_H,
-               g_default_theme.title_bg);
-  char title[32];
-  snprintf(title, sizeof(title), "%s", mi->name);
-  for (int i = 0; title[i]; i++)
-    title[i] = toupper((unsigned char)title[i]);
-  gfx_drawstr_clipped(WIN_X + PAD, WIN_Y + 1 + (TITLE_H - GFX_FONT_H) / 2,
-                      title, g_default_theme.title_fg, g_default_theme.title_bg,
-                      WIN_W - 2 * PAD);
-
-  int body_top = WIN_Y + 1 + TITLE_H;
-  int body_bot = WIN_Y + WIN_H - HINT_H - 1;
-  gfx_fillrect(WIN_X + 1, body_top, WIN_W - 2, body_bot - body_top,
-               g_default_theme.bg);
-
-  int tx = WIN_X + 1 + PAD;
-  int ty = body_top + PAD;
-  uint16_t BG = g_default_theme.bg;
-  uint16_t FG = g_default_theme.fg;
-  uint16_t LABEL = g_default_theme.accent;
-
-  gfx_drawstr_clipped(tx, ty, "Syntax:", LABEL, BG, INNER_W);
-  ty += LINE_H;
-  if (mi->args[0]) {
-    char argbuf[80];
-    snprintf(argbuf, sizeof(argbuf), "%s  %s", mi->name, mi->args);
-    int ni = 0;
-    while (argbuf[ni] && argbuf[ni] != ' ') {
-      argbuf[ni] = toupper((unsigned char)argbuf[ni]);
-      ni++;
-    }
-    gfx_drawstr_clipped(tx, ty, argbuf, FG, BG, INNER_W);
-  } else {
-    gfx_drawstr_clipped(tx, ty, mi->name, FG, BG, INNER_W);
-  }
-  ty += LINE_H + SEC_GAP;
-
-  gfx_drawstr_clipped(tx, ty, "Description:", LABEL, BG, INNER_W);
-  ty += LINE_H;
-  int used = cheatsheet_draw_wrapped(mi->desc, tx, ty, INNER_W, 4, FG, BG);
-  ty += used * LINE_H + SEC_GAP;
-
-  if (ty + LINE_H < body_bot) {
-    gfx_drawstr_clipped(tx, ty, "CPSR Flags:", LABEL, BG, INNER_W);
-    ty += LINE_H;
-    cheatsheet_draw_wrapped(mi->flags, tx, ty, INNER_W, 3, FG, BG);
-  }
-
-  int hy = WIN_Y + WIN_H - HINT_H - 1;
-  gfx_hline(WIN_X + 1, hy, WIN_W - 2, g_default_theme.border_light);
-  gfx_fillrect(WIN_X + 1, hy + 1, WIN_W - 2, HINT_H - 1, BG);
-  gfx_drawstr_clipped(WIN_X + PAD, hy + 2, "Any key: close", FG, BG,
-                      WIN_W - 2 * PAD);
-
-  gfx_flip();
-  while (!any_key_pressed()) {
-    msleep(16);
-    idle();
-  }
-  while (any_key_pressed())
-    msleep(20);
+  mnem_show_desc(mi);
 }
 
 
@@ -2223,20 +2102,18 @@ static void editor_goto_line(void) {
 /* ================================================================
  * Label browser
  *
- * Scans the gap buffer for label definitions (word immediately
- * followed by ':') and presents them in a scrollable picker.
- * Selecting a label moves the cursor to its definition line.
+ * Scans the gap buffer for label definitions - under nasm's rule an
+ * identifier in column 0 with NO trailing colon - into a table that the
+ * picker in editor_ui.c displays.  Scanning needs the buffer and moving
+ * the cursor to the chosen label needs the engine, so both stay here;
+ * only the list UI lives over there.
  *
  * Also provides label-lookup by name (used by jump-to-label).
  * ================================================================ */
 
+/* LabelEntry and MAX_LABEL_LEN live in editor_ui.h: the table is filled here
+   from the buffer, and displayed by the picker there. */
 #define MAX_LABELS 256
-#define MAX_LABEL_LEN 64
-
-typedef struct {
-  char name[MAX_LABEL_LEN];
-  int line; /* 0-based line index */
-} LabelEntry;
 
 static LabelEntry g_labels[MAX_LABELS];
 static int g_nlabels;
@@ -2286,159 +2163,20 @@ static int label_find(const char *name) {
   return -1;
 }
 
-#define LBL_WIN_X 20
-#define LBL_WIN_Y 10
-#define LBL_WIN_W (GFX_W - 40)
-#define LBL_WIN_H (GFX_H - 20)
-#define LBL_TITLE_H 12
-#define LBL_HINT_H 11
-#define LBL_ROW_H 10
-#define LBL_LIST_Y (LBL_WIN_Y + 1 + LBL_TITLE_H)
-#define LBL_LIST_H (LBL_WIN_H - LBL_TITLE_H - LBL_HINT_H - 2)
-#define LBL_ROWS_VIS (LBL_LIST_H / LBL_ROW_H)
-
-static void labels_draw(int sel, int scroll) {
-  uint16_t WIN_BG = g_default_theme.bg;
-  uint16_t WIN_FG = g_default_theme.fg;
-  uint16_t TIT_BG = g_default_theme.title_bg;
-  uint16_t TIT_FG = g_default_theme.title_fg;
-  uint16_t SEL_BG = g_default_theme.accent;
-  uint16_t SEL_FG = g_default_theme.accent_text;
-  uint16_t DIM_FG = g_default_theme.border_light;
-  uint16_t BORDER = g_default_theme.border_light;
-  uint16_t SHADOW = g_default_theme.border_dark;
-
-  gfx_fillrect(LBL_WIN_X + 3, LBL_WIN_Y + 3, LBL_WIN_W, LBL_WIN_H, SHADOW);
-  gfx_borderrect(LBL_WIN_X, LBL_WIN_Y, LBL_WIN_W, LBL_WIN_H, WIN_BG, BORDER);
-  gfx_fillrect(LBL_WIN_X + 1, LBL_WIN_Y + 1, LBL_WIN_W - 2, LBL_TITLE_H,
-               TIT_BG);
-
-  char title[48];
-  snprintf(title, sizeof(title), "Labels  (%d defined)", g_nlabels);
-  gfx_drawstr_clipped(LBL_WIN_X + 4,
-                      LBL_WIN_Y + 1 + (LBL_TITLE_H - GFX_FONT_H) / 2, title,
-                      TIT_FG, TIT_BG, LBL_WIN_W - 8);
-
-  if (g_nlabels == 0) {
-    gfx_fillrect(LBL_WIN_X + 1, LBL_LIST_Y, LBL_WIN_W - 2,
-                 LBL_WIN_H - LBL_TITLE_H - LBL_HINT_H - 2, WIN_BG);
-    gfx_drawstr_clipped(LBL_WIN_X + 8, LBL_LIST_Y + 10,
-                        "No labels defined in this file.", DIM_FG, WIN_BG,
-                        LBL_WIN_W - 16);
-  }
-
-  for (int vi = 0; vi < LBL_ROWS_VIS; vi++) {
-    int ri = scroll + vi;
-    int row_y = LBL_LIST_Y + vi * LBL_ROW_H;
-
-    if (ri >= g_nlabels) {
-      gfx_fillrect(LBL_WIN_X + 1, row_y, LBL_WIN_W - 2, LBL_ROW_H, WIN_BG);
-      continue;
-    }
-
-    int is_sel = (ri == sel);
-    uint16_t bg = is_sel ? SEL_BG : WIN_BG;
-    uint16_t fg = is_sel ? SEL_FG : WIN_FG;
-    uint16_t lfg = is_sel ? SEL_FG : DIM_FG;
-
-    gfx_fillrect(LBL_WIN_X + 1, row_y, LBL_WIN_W - 2, LBL_ROW_H, bg);
-
-    gfx_drawstr_clipped(LBL_WIN_X + 4, row_y + 1, g_labels[ri].name, fg, bg,
-                        LBL_WIN_W - 50);
-
-    char lnbuf[16];
-    snprintf(lnbuf, sizeof(lnbuf), "Ln %d", g_labels[ri].line + 1);
-    int lnw = (int)strlen(lnbuf) * GFX_CHAR_W;
-    gfx_drawstr(LBL_WIN_X + LBL_WIN_W - 6 - lnw, row_y + 1, lnbuf, lfg, bg);
-  }
-
-  if (g_nlabels > LBL_ROWS_VIS) {
-    int bt = LBL_LIST_H;
-    int bh = bt * LBL_ROWS_VIS / g_nlabels;
-    if (bh < 4)
-      bh = 4;
-    int ms = g_nlabels - LBL_ROWS_VIS;
-    int by = LBL_LIST_Y + (bt - bh) * scroll / (ms > 0 ? ms : 1);
-    gfx_fillrect(LBL_WIN_X + LBL_WIN_W - 4, LBL_LIST_Y, 3, bt,
-                 g_default_theme.item_bg);
-    gfx_fillrect(LBL_WIN_X + LBL_WIN_W - 4, by, 3, bh, BORDER);
-  }
-
-  int hy = LBL_WIN_Y + LBL_WIN_H - LBL_HINT_H - 1;
-  gfx_hline(LBL_WIN_X + 1, hy, LBL_WIN_W - 2, BORDER);
-  gfx_fillrect(LBL_WIN_X + 1, hy + 1, LBL_WIN_W - 2, LBL_HINT_H - 1, WIN_BG);
-  gfx_drawstr_clipped(LBL_WIN_X + 4, hy + 2, "Enter:jump  Esc:close", WIN_FG,
-                      WIN_BG, LBL_WIN_W - 8);
-
-  gfx_flip();
-}
 
 /* Open the label browser.  Returns 1 if cursor was moved. */
 static int editor_label_browser(void) {
   labels_scan();
 
-  int sel = 0;
-  int scroll = 0;
+  int sel = label_pick(g_labels, g_nlabels, cursor_row);
+  if (sel < 0)
+    return 0;
 
-  if (g_nlabels > 0) {
-    int best = 0, bestd = abs(g_labels[0].line - cursor_row);
-    for (int i = 1; i < g_nlabels; i++) {
-      int d = abs(g_labels[i].line - cursor_row);
-      if (d < bestd) {
-        bestd = d;
-        best = i;
-      }
-    }
-    sel = best;
-    scroll = sel - LBL_ROWS_VIS / 2;
-    if (scroll < 0)
-      scroll = 0;
-    if (scroll > g_nlabels - LBL_ROWS_VIS && g_nlabels > LBL_ROWS_VIS)
-      scroll = g_nlabels - LBL_ROWS_VIS;
-  }
-
-  while (any_key_pressed())
-    msleep(20);
-  labels_draw(sel, scroll);
-
-  for (;;) {
-    NavAction nav = gfx_poll_nav();
-    if (nav == NAV_NONE) {
-      msleep(16);
-      idle();
-      continue;
-    }
-
-    if (nav == NAV_ESC) {
-      while (any_key_pressed())
-        msleep(20);
-      return 0;
-    } else if (nav == NAV_UP) {
-      if (sel > 0) {
-        sel--;
-        if (sel < scroll)
-          scroll = sel;
-      }
-    } else if (nav == NAV_DOWN) {
-      if (sel < g_nlabels - 1) {
-        sel++;
-        if (sel >= scroll + LBL_ROWS_VIS)
-          scroll = sel - LBL_ROWS_VIS + 1;
-      }
-    } else if (nav == NAV_ENTER) {
-      while (any_key_pressed())
-        msleep(20);
-      if (g_nlabels > 0) {
-        cursor_row = g_labels[sel].line;
-        cursor_col = 0;
-        cursor_sync_rowcol();
-        scroll_to_cursor();
-        return 1;
-      }
-      return 0;
-    }
-    labels_draw(sel, scroll);
-  }
+  cursor_row = g_labels[sel].line;
+  cursor_col = 0;
+  cursor_sync_rowcol();
+  scroll_to_cursor();
+  return 1;
 }
 
 /* ================================================================
@@ -2897,7 +2635,7 @@ static void editor_diag_detail(void) {
     gfx_drawstr_clipped(tx, ty, loc, LABEL, BG, INNER_W);
     ty += LINE_H + SEC_GAP;
 
-    cheatsheet_draw_wrapped(d->message, tx, ty, INNER_W, MSG_LINES, FG, BG);
+    ui_draw_wrapped(d->message, tx, ty, INNER_W, MSG_LINES, FG, BG);
     ty += MSG_LINES * LINE_H;
 
     /* INCLUDE chain, outermost includer first (nasm's order). */

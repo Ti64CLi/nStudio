@@ -31,4 +31,35 @@ const SyscallInfo *syscall_pick(void);
    Shared with the cheat sheet, which shows it for the SWI under the cursor. */
 void syscall_show_desc(const SyscallInfo *si);
 
+/* Full-width detail popup for one instruction: signature, description and the
+   CPSR flags it affects.  Used by the cheat sheet for the mnemonic under the
+   cursor; the catalog keeps its own narrower detail view. */
+void mnem_show_desc(const MnemInfo *mi);
+
+/* Draw `text` wrapped at word boundaries into a popup body, at most
+   `max_lines` lines.  Returns the number of lines drawn.  Shared by the popups
+   here and by the editor's diagnostic details. */
+int ui_draw_wrapped(const char *text, int wx, int ty, int max_w, int max_lines,
+                    uint16_t fg, uint16_t bg);
+
+/* ------------------------------------------------------------------ */
+/* Label browser                                                      */
+/* ------------------------------------------------------------------ */
+
+#define MAX_LABEL_LEN 64
+
+/* One entry of the label table.  The editor scans these out of the buffer -
+   under nasm's rule, an identifier in column 0 with no trailing colon - and
+   the picker below only displays them. */
+typedef struct {
+  char name[MAX_LABEL_LEN];
+  int line; /* 0-based line index */
+} LabelEntry;
+
+/* Modal list of the labels defined in the file.  `cur_line` is the line the
+   cursor is on, used to pre-select the nearest label.  Returns the index of
+   the chosen entry, or -1 when cancelled; moving the cursor is the caller's
+   job, so this stays free of editor state like every dialog here. */
+int label_pick(const LabelEntry *labels, int n, int cur_line);
+
 #endif /* EDITOR_UI_H_INCLUDED */
