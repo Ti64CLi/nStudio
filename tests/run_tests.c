@@ -269,6 +269,26 @@ static void test_asmdiag(void) {
     CHECK(out[1].line == -1);
     CHECK(strstr(out[1].message, "brackets") != NULL);
 
+    /* nested related / include_stack are now stored, not skipped */
+    CHECK(out[0].related_count == 1);
+    CHECK(out[0].related_truncated == 0);
+    CHECK(strcmp(out[0].related[0].file, "a.asm") == 0);
+    CHECK(out[0].related[0].line == 1);
+    CHECK(out[0].related[0].col == 1);
+    CHECK(out[0].related[0].end_col == 2);
+    CHECK(strcmp(out[0].related[0].message, "first defined here") == 0);
+
+    CHECK(out[0].include_count == 1);
+    CHECK(out[0].include_truncated == 0);
+    CHECK(strcmp(out[0].include_stack[0].file, "inc.asm") == 0);
+    CHECK(out[0].include_stack[0].line == 5);
+
+    /* empty arrays yield empty, untruncated collections */
+    CHECK(out[1].related_count == 0);
+    CHECK(out[1].include_count == 0);
+    CHECK(out[1].related_truncated == 0);
+    CHECK(out[1].include_truncated == 0);
+
     /* first-for-file: full path, then base name, then no match */
     CHECK(asmdiag_first_for_file(out, n, "/documents/test.asm.tns") == 0);
     CHECK(asmdiag_first_for_file(out, n, "/other/dir/test.asm.tns") == 0);
@@ -279,6 +299,51 @@ static void test_asmdiag(void) {
     CHECK(asmdiag_in_file(&out[0], "/other/dir/test.asm.tns") == 1);
     CHECK(asmdiag_in_file(&out[1], "/documents/test.asm.tns") == 0); /* line -1 */
     CHECK(asmdiag_in_file(&out[0], "nope.asm.tns") == 0);
+  }
+
+  /* Over-long related / include_stack truncate gracefully: the caps are
+     honoured, the flags are set, order is preserved and the primary
+     diagnostic (and the keys after the arrays) survive intact. */
+  static const char *json_trunc =
+      "[{\"severity\":\"error\",\"code\":\"E1\",\"file\":\"deep.asm\","
+      "\"line\":3,\"col\":1,\"end_col\":2,"
+      "\"related\":["
+      "{\"file\":\"r0\",\"line\":10,\"col\":1,\"end_col\":2,\"message\":\"m0\"},"
+      "{\"file\":\"r1\",\"line\":11,\"col\":1,\"end_col\":2,\"message\":\"m1\"},"
+      "{\"file\":\"r2\",\"line\":12,\"col\":1,\"end_col\":2,\"message\":\"m2\"},"
+      "{\"file\":\"r3\",\"line\":13,\"col\":1,\"end_col\":2,\"message\":\"m3\"},"
+      "{\"file\":\"r4\",\"line\":14,\"col\":1,\"end_col\":2,\"message\":\"m4\"}],"
+      "\"include_stack\":["
+      "{\"file\":\"i0\",\"line\":1},{\"file\":\"i1\",\"line\":2},"
+      "{\"file\":\"i2\",\"line\":3},{\"file\":\"i3\",\"line\":4},"
+      "{\"file\":\"i4\",\"line\":5},{\"file\":\"i5\",\"line\":6},"
+      "{\"file\":\"i6\",\"line\":7},{\"file\":\"i7\",\"line\":8}],"
+      "\"message\":\"after the arrays\"}]\n";
+
+  CHECK(write_tmp(json_trunc, path));
+  int tn = asmdiag_parse_file(path, out, ASMDIAG_MAX);
+  unlink(path);
+
+  CHECK(tn == 1);
+  if (tn == 1) {
+    /* the primary diagnostic is preserved, including a key that follows the
+       nested arrays (so the arrays were consumed to their exact end) */
+    CHECK(out[0].line == 3);
+    CHECK(strcmp(out[0].file, "deep.asm") == 0);
+    CHECK(strcmp(out[0].message, "after the arrays") == 0);
+
+    CHECK(out[0].related_count == ASMDIAG_MAX_RELATED);
+    CHECK(out[0].related_truncated == 1);
+    CHECK(strcmp(out[0].related[0].file, "r0") == 0); /* order preserved */
+    CHECK(out[0].related[ASMDIAG_MAX_RELATED - 1].line == 10 +
+                                                          ASMDIAG_MAX_RELATED -
+                                                          1);
+
+    CHECK(out[0].include_count == ASMDIAG_MAX_INCLUDE);
+    CHECK(out[0].include_truncated == 1);
+    CHECK(strcmp(out[0].include_stack[0].file, "i0") == 0); /* outermost 1st */
+    CHECK(out[0].include_stack[ASMDIAG_MAX_INCLUDE - 1].line ==
+          ASMDIAG_MAX_INCLUDE);
   }
 
   /* clean assemble: "[]" -> zero diagnostics */

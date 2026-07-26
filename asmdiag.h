@@ -37,8 +37,10 @@
  *   message       human-readable text
  *   source_line   text of the offending line          (parsed-and-ignored)
  *   expanded_from pseudo-op the line came from, or ""  (parsed-and-ignored)
- *   related       [ {file,line,col,end_col,message} ] (parsed-and-ignored)
- *   include_stack [ {file,line} ]                      (parsed-and-ignored)
+ *   related       [ {file,line,col,end_col,message} ] (stored, capped)
+ *   include_stack [ {file,line} ]                      (stored, capped)
+ * Both arrays are always present, empty when there is nothing to report;
+ * include frames run outermost includer first.
  * Strings are JSON-escaped.  This parser reads by key name (not position),
  * skips nested arrays/objects it does not consume, and tolerates keys it does
  * not know, so it stays compatible if nasm adds fields.
@@ -46,10 +48,10 @@
  * ------------------------------------------------------------------
  * Extending this later (kept deliberately cheap)
  * ------------------------------------------------------------------
- * asmdiag_parse_file() already returns the whole batch, and AsmDiag keeps the
- * span and code, so a diagnostics panel, next/previous-error navigation or
- * quick-fixes only need to retain the array and add UI - no change to the
- * protocol or this parser.  M5 itself consumes only the first in-file error.
+ * asmdiag_parse_file() returns the whole batch, and AsmDiag keeps the span,
+ * code, secondary locations and INCLUDE chain, so a diagnostics panel,
+ * jump-to-related or quick-fixes only need to add UI - no change to the
+ * protocol or this parser.
  */
 #ifndef ASMDIAG_H_INCLUDED
 #define ASMDIAG_H_INCLUDED
@@ -60,6 +62,38 @@
 
 typedef enum { ADIAG_ERROR, ADIAG_WARNING, ADIAG_NOTE } AsmDiagSeverity;
 
+/*
+ * Bounded per-diagnostic capacities.  nasm may emit more entries than these;
+ * the parser keeps the first N, sets the matching *_truncated flag and never
+ * fails - the primary diagnostic is always preserved.  The caps are a
+ * deliberate trade-off: the retained batch is a static array of ASMDIAG_MAX
+ * diagnostics, so every byte here costs 100x in RAM on the calculator.
+ */
+#define ASMDIAG_MAX_RELATED 3
+#define ASMDIAG_MAX_INCLUDE 6
+
+/*
+ * A secondary source location explaining the diagnostic, each with its own
+ * message (e.g. "previously defined here").  Mirrors nasm's DiagRelated.
+ */
+typedef struct {
+  int line;    /* 1-based, or -1 when unknown */
+  int col;     /* 1-based start column, or 0 when unknown */
+  int end_col; /* 1-based exclusive end column, or 0 when unknown */
+  char file[256];
+  char message[192];
+} AsmDiagRelated;
+
+/*
+ * One frame of the INCLUDE chain: a file that included the next one, and the
+ * line of the INCLUDE directive within it.  nasm orders these outermost
+ * includer first, immediate parent last; that order is preserved verbatim.
+ */
+typedef struct {
+  int line; /* 1-based line of the INCLUDE directive in `file` */
+  char file[256];
+} AsmDiagInclude;
+
 typedef struct {
   AsmDiagSeverity severity;
   int line;    /* 1-based, or -1 when not tied to a line */
@@ -68,6 +102,16 @@ typedef struct {
   char code[32];
   char file[256];
   char message[192];
+
+  /* Secondary locations, in the order nasm emitted them. */
+  AsmDiagRelated related[ASMDIAG_MAX_RELATED];
+  int related_count;     /* how many are stored (0..ASMDIAG_MAX_RELATED) */
+  int related_truncated; /* nasm emitted more than we kept */
+
+  /* INCLUDE chain, empty when the diagnostic is in the top-level file. */
+  AsmDiagInclude include_stack[ASMDIAG_MAX_INCLUDE];
+  int include_count;     /* how many are stored (0..ASMDIAG_MAX_INCLUDE) */
+  int include_truncated; /* nasm emitted a deeper chain than we kept */
 } AsmDiag;
 
 /*

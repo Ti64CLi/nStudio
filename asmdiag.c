@@ -165,6 +165,166 @@ static AsmDiagSeverity severity_from(const char *s) {
   return ADIAG_ERROR;
 }
 
+/* Parse one location object at *p (pointing at '{') - the shape shared by a
+   `related` entry {file,line,col,end_col,message} and an `include_stack`
+   frame {file,line}.  Any out-param may be NULL, in which case that key is
+   skipped, so both callers reuse this single key loop.  Unknown keys are
+   skipped too.  Returns 1 on a well-formed object. */
+static int parse_location_object(const char **p, char *file, int filesz,
+                                 int *line, int *col, int *end_col,
+                                 char *message, int msgsz) {
+  skip_ws(p);
+  if (**p != '{')
+    return 0;
+  (*p)++;
+
+  if (file && filesz > 0)
+    file[0] = '\0';
+  if (message && msgsz > 0)
+    message[0] = '\0';
+  if (line)
+    *line = -1;
+  if (col)
+    *col = 0;
+  if (end_col)
+    *end_col = 0;
+
+  for (;;) {
+    skip_ws(p);
+    if (**p == '}') {
+      (*p)++;
+      return 1;
+    }
+    if (**p == '\0')
+      return 0;
+
+    char key[24];
+    if (!parse_string(p, key, sizeof(key)))
+      return 0;
+    skip_ws(p);
+    if (**p != ':')
+      return 0;
+    (*p)++;
+
+    if (file && !strcmp(key, "file")) {
+      parse_string(p, file, filesz);
+    } else if (message && !strcmp(key, "message")) {
+      parse_string(p, message, msgsz);
+    } else if (line && !strcmp(key, "line")) {
+      *line = parse_int(p);
+    } else if (col && !strcmp(key, "col")) {
+      *col = parse_int(p);
+    } else if (end_col && !strcmp(key, "end_col")) {
+      *end_col = parse_int(p);
+    } else {
+      skip_value(p);
+    }
+
+    skip_ws(p);
+    if (**p == ',') {
+      (*p)++;
+      continue;
+    }
+    if (**p == '}') {
+      (*p)++;
+      return 1;
+    }
+    return 1; /* malformed tail: keep what we parsed */
+  }
+}
+
+/* Read the `related` array at *p into d, keeping at most ASMDIAG_MAX_RELATED
+   entries.  Extra entries are consumed but discarded, with related_truncated
+   set; the array is always walked to its ']' so parsing continues correctly.*/
+static void parse_related_array(const char **p, AsmDiag *d) {
+  skip_ws(p);
+  if (**p != '[') {
+    skip_value(p); /* not an array: ignore whatever it is */
+    return;
+  }
+  (*p)++;
+
+  for (;;) {
+    skip_ws(p);
+    if (**p == ']') {
+      (*p)++;
+      return;
+    }
+    if (**p == '\0')
+      return;
+
+    if (**p == '{' && d->related_count < ASMDIAG_MAX_RELATED) {
+      AsmDiagRelated *r = &d->related[d->related_count];
+      if (parse_location_object(p, r->file, (int)sizeof(r->file), &r->line,
+                                &r->col, &r->end_col, r->message,
+                                (int)sizeof(r->message)))
+        d->related_count++;
+    } else {
+      if (**p == '{')
+        d->related_truncated = 1;
+      skip_value(p);
+    }
+
+    skip_ws(p);
+    if (**p == ',') {
+      (*p)++;
+      continue;
+    }
+    if (**p == ']') {
+      (*p)++;
+      return;
+    }
+    if (**p == '\0')
+      return;
+    (*p)++; /* stray token: advance to make progress */
+  }
+}
+
+/* Read the `include_stack` array at *p into d, keeping at most
+   ASMDIAG_MAX_INCLUDE frames (outermost first, as nasm emits them). */
+static void parse_include_array(const char **p, AsmDiag *d) {
+  skip_ws(p);
+  if (**p != '[') {
+    skip_value(p);
+    return;
+  }
+  (*p)++;
+
+  for (;;) {
+    skip_ws(p);
+    if (**p == ']') {
+      (*p)++;
+      return;
+    }
+    if (**p == '\0')
+      return;
+
+    if (**p == '{' && d->include_count < ASMDIAG_MAX_INCLUDE) {
+      AsmDiagInclude *fr = &d->include_stack[d->include_count];
+      if (parse_location_object(p, fr->file, (int)sizeof(fr->file), &fr->line,
+                                NULL, NULL, NULL, 0))
+        d->include_count++;
+    } else {
+      if (**p == '{')
+        d->include_truncated = 1;
+      skip_value(p);
+    }
+
+    skip_ws(p);
+    if (**p == ',') {
+      (*p)++;
+      continue;
+    }
+    if (**p == ']') {
+      (*p)++;
+      return;
+    }
+    if (**p == '\0')
+      return;
+    (*p)++; /* stray token: advance to make progress */
+  }
+}
+
 /* Parse one diagnostic object at *p (which points at '{') into d.
    Returns 1 on a well-formed object. */
 static int parse_object(const char **p, AsmDiag *d) {
@@ -180,6 +340,10 @@ static int parse_object(const char **p, AsmDiag *d) {
   d->code[0] = '\0';
   d->file[0] = '\0';
   d->message[0] = '\0';
+  d->related_count = 0;
+  d->related_truncated = 0;
+  d->include_count = 0;
+  d->include_truncated = 0;
 
   for (;;) {
     skip_ws(p);
@@ -214,8 +378,12 @@ static int parse_object(const char **p, AsmDiag *d) {
       d->col = parse_int(p);
     } else if (!strcmp(key, "end_col")) {
       d->end_col = parse_int(p);
+    } else if (!strcmp(key, "related")) {
+      parse_related_array(p, d);
+    } else if (!strcmp(key, "include_stack")) {
+      parse_include_array(p, d);
     } else {
-      skip_value(p); /* source_line, expanded_from, related, include_stack... */
+      skip_value(p); /* source_line, expanded_from, and any future keys */
     }
 
     skip_ws(p);
