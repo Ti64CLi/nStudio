@@ -126,6 +126,42 @@ void rebuild_lines(const GapBuf *g) {
   g_lines_truncated = (num_lines >= MAX_LINES && i < len);
 }
 
+/*
+ * Cheap line-table maintenance for an edit that did not add or remove a line
+ * break: `delta` bytes were inserted (positive) or removed (negative) at `pos`.
+ *
+ * Only the offsets move - every line starting after `pos` slides by `delta`,
+ * and the number of lines is unchanged - so this replaces rebuild_lines()'s
+ * scan of the whole buffer with a walk over the table alone.  That is the
+ * difference between touching every byte of the file and touching one int per
+ * line on each keystroke.
+ *
+ * A line starting exactly at `pos` must NOT move: inserting at the head of a
+ * line leaves that line starting where it did.  Deletions cannot strand a line
+ * start inside the removed range, because a start always follows a '\n' and by
+ * contract no '\n' was removed - callers that touch a line break (Enter,
+ * joining lines, pasting) must still call rebuild_lines().
+ */
+void lines_shift(int pos, int delta) {
+  if (delta == 0)
+    return;
+
+  /* First line starting strictly after `pos`; everything below it is fixed. */
+  int lo = 1, hi = num_lines, first = num_lines;
+  while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    if (line_starts[mid] > pos) {
+      first = mid;
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+
+  for (int i = first; i < num_lines; i++)
+    line_starts[i] += delta;
+}
+
 int line_len(const GapBuf *g, int line) {
   int start = line_starts[line];
   int end = (line + 1 < num_lines) ? line_starts[line + 1] - 1 : gb_len(g);

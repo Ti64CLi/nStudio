@@ -1289,13 +1289,16 @@ static int autopair_context_ok(void) {
    single undo step. */
 static void insert_pair(char open, char close) {
   undo_checkpoint(UK_OTHER);
+  int pos = cursor_pos;
+  int before = gb_len(&g_buf);
   gb_move(&g_buf, cursor_pos);
   if (gb_insert(&g_buf, open)) {
     cursor_pos++;
     gb_move(&g_buf, cursor_pos);
     gb_insert(&g_buf, close); /* cursor stays in front of the closer */
   }
-  rebuild_lines(&g_buf);
+  /* Brackets only: no line break, so the table just slides. */
+  lines_shift(pos, gb_len(&g_buf) - before);
   cursor_sync_pos();
   g_modified = 1;
 }
@@ -1306,10 +1309,15 @@ static void do_insert_char(char c) {
   if (sel_active_flag())
     sel_delete_region();
 
+  int pos = cursor_pos;
+  int before = gb_len(&g_buf);
   gb_move(&g_buf, cursor_pos);
   if (gb_insert(&g_buf, c))
     cursor_pos++;
-  rebuild_lines(&g_buf);
+  if (c == '\n')
+    rebuild_lines(&g_buf); /* a new line: the table's shape changes */
+  else
+    lines_shift(pos, gb_len(&g_buf) - before);
   cursor_sync_pos();
   g_modified = 1;
   if (!wordy)
@@ -1398,17 +1406,21 @@ static void do_backspace(void) {
     gb_delete(&g_buf);    /* the closer, at the cursor */
     gb_backspace(&g_buf); /* the opener, before the cursor */
     cursor_pos--;
-    rebuild_lines(&g_buf);
+    lines_shift(cursor_pos, -2); /* both are brackets, never a line break */
     cursor_sync_pos();
     g_modified = 1;
     return;
   }
 
   undo_checkpoint(UK_DELETE);
+  int erased_nl = (gb_get(&g_buf, cursor_pos - 1) == '\n');
   gb_move(&g_buf, cursor_pos);
   gb_backspace(&g_buf);
   cursor_pos--;
-  rebuild_lines(&g_buf);
+  if (erased_nl)
+    rebuild_lines(&g_buf); /* two lines join: the table loses an entry */
+  else
+    lines_shift(cursor_pos, -1);
   cursor_sync_pos();
   g_modified = 1;
 }
@@ -1422,9 +1434,13 @@ static void do_delete(void) {
   if (cursor_pos >= gb_len(&g_buf))
     return;
   undo_checkpoint(UK_DELETE);
+  int erased_nl = (gb_get(&g_buf, cursor_pos) == '\n');
   gb_move(&g_buf, cursor_pos);
   gb_delete(&g_buf);
-  rebuild_lines(&g_buf);
+  if (erased_nl)
+    rebuild_lines(&g_buf); /* two lines join: the table loses an entry */
+  else
+    lines_shift(cursor_pos, -1);
   cursor_sync_pos();
   g_modified = 1;
 }
@@ -1491,13 +1507,16 @@ static void do_tab(void) {
   int n = tw - (cursor_col % tw);
   if (n <= 0)
     n = tw;
+  int pos = cursor_pos;
+  int before = gb_len(&g_buf);
   gb_move(&g_buf, cursor_pos);
   for (int i = 0; i < n; i++) {
     if (!gb_insert(&g_buf, ' '))
       break;
     cursor_pos++;
   }
-  rebuild_lines(&g_buf);
+  /* Spaces only: the table just slides. */
+  lines_shift(pos, gb_len(&g_buf) - before);
   cursor_sync_pos();
   g_modified = 1;
 }
@@ -1523,7 +1542,9 @@ static void do_untab(void) {
     gb_move(&g_buf, start);
     for (int i = 0; i < rem; i++)
       gb_delete(&g_buf);
-    rebuild_lines(&g_buf);
+    /* Leading whitespace only, so no line break is removed.  `start` is this
+       line's own start, which stays put; later lines slide back. */
+    lines_shift(start, -rem);
     if (cursor_col >= rem)
       cursor_col -= rem;
     else

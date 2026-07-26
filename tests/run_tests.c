@@ -201,6 +201,78 @@ static void test_gapbuf(void) {
   gb_free(&b);
 }
 
+/* Differential test for lines_shift(): drive a buffer through many random
+   single-character edits, maintaining the line table the way editor.c does -
+   lines_shift() when no line break is involved, rebuild_lines() otherwise -
+   and after every edit assert the table is byte-for-byte what a full rescan
+   would have produced.  This is what guarantees the cheap path cannot drift
+   from the authoritative one. */
+static void test_lines_shift(void) {
+  printf("lines_shift\n");
+
+  GapBuf g;
+  gb_init(&g);
+  gb_inserts(&g, "start\n mov r0, #1\n add r1, r2\nloop\n bx lr\n");
+  rebuild_lines(&g);
+
+  unsigned seed = 12345;
+  int mismatches = 0;
+  int saved_starts[MAX_LINES], saved_n;
+
+  for (int step = 0; step < 4000; step++) {
+    seed = seed * 1103515245u + 12345u;
+    int len = gb_len(&g);
+    int pos = len ? (int)((seed >> 8) % (unsigned)(len + 1)) : 0;
+    int insert = ((seed >> 3) & 1) || len < 8;
+
+    if (insert) {
+      /* mostly ordinary characters, occasionally a newline */
+      char c = (((seed >> 16) % 11u) == 0) ? '\n' : (char)('a' + (seed >> 20) % 26u);
+      int before = gb_len(&g);
+      gb_move(&g, pos);
+      gb_insert(&g, c);
+      if (c == '\n')
+        rebuild_lines(&g);
+      else
+        lines_shift(pos, gb_len(&g) - before);
+    } else {
+      char c = gb_get(&g, pos);
+      gb_move(&g, pos);
+      gb_delete(&g);
+      if (c == '\n')
+        rebuild_lines(&g);
+      else
+        lines_shift(pos, -1);
+    }
+
+    /* compare the maintained table against a fresh full rescan */
+    saved_n = num_lines;
+    memcpy(saved_starts, line_starts, sizeof(int) * (size_t)num_lines);
+    rebuild_lines(&g);
+    if (saved_n != num_lines ||
+        memcmp(saved_starts, line_starts, sizeof(int) * (size_t)num_lines) != 0)
+      mismatches++;
+  }
+  CHECK(mismatches == 0);
+  gb_free(&g);
+
+  /* A line start exactly at the edit position must not move: inserting at the
+     head of a line leaves that line starting where it was. */
+  GapBuf h;
+  gb_init(&h);
+  gb_inserts(&h, "ab\ncd\n");
+  rebuild_lines(&h);
+  int second = line_starts[1]; /* start of "cd" */
+  gb_move(&h, second);
+  gb_insert(&h, 'X'); /* insert at the head of line 1 */
+  lines_shift(second, 1);
+  CHECK(line_starts[1] == second);
+  CHECK(num_lines == 3);
+  rebuild_lines(&h);
+  CHECK(line_starts[1] == second); /* and the rescan agrees */
+  gb_free(&h);
+}
+
 /* ================================================================ */
 /* asmdiag  (nasm JSON diagnostics consumer)                        */
 /* ================================================================ */
@@ -480,6 +552,7 @@ int main(void) {
   test_util();
   test_optab();
   test_gapbuf();
+  test_lines_shift();
   test_asmdiag();
   test_asmdb();
   test_fileio();

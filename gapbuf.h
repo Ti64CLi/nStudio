@@ -58,4 +58,16 @@ extern int g_lines_truncated; /* set when the file exceeds MAX_LINES lines */
 void rebuild_lines(const GapBuf *g);
 int line_len(const GapBuf *g, int line);
 
+/*
+ * Update the line table for an edit at `pos` that changed the buffer length by
+ * `delta` bytes WITHOUT adding or removing a line break: line starts after
+ * `pos` slide by `delta` and the line count is unchanged.
+ *
+ * This is the cheap path for ordinary typing - it walks the line table instead
+ * of rescanning the whole buffer, as rebuild_lines() does.  Any edit that
+ * inserts or deletes a '\n' (Enter, joining two lines, pasting, block indent)
+ * changes the structure of the table and must still call rebuild_lines().
+ */
+void lines_shift(int pos, int delta);
+
 #endif /* GAPBUF_H_INCLUDED */
