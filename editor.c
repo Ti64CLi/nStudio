@@ -1106,6 +1106,7 @@ static void render_all(void) {
 #define ACT_RUN (-54)
 #define ACT_JUMP_BACK (-55)
 #define ACT_FIND_REFS (-56)
+#define ACT_DIAG_PANEL (-57)
 
 /* Whether an action counts as a buffer edit for undo-coalescing: a run of
    same-kind edits shares one undo group and any non-edit action ends the
@@ -1279,6 +1280,8 @@ static int poll_key(void) {
     return ACT_RUN;
   if (ctrl && isKeyPressed(KEY_NSPIRE_U))
     return ACT_FIND_REFS;
+  if (ctrl && isKeyPressed(KEY_NSPIRE_E))
+    return ACT_DIAG_PANEL;
   if (ctrl && isKeyPressed(KEY_NSPIRE_TRIG))
     return ACT_CHEATSHEET;
 
@@ -2282,7 +2285,8 @@ static int word_under_cursor(char *out, int outsz) {
   int col = cursor_col > len ? len : cursor_col;
 
   int ws = col;
-  while (ws > 0 && (isalnum((unsigned char)line[ws - 1]) || line[ws - 1] == '_'))
+  while (ws > 0 &&
+         (isalnum((unsigned char)line[ws - 1]) || line[ws - 1] == '_'))
     ws--;
   int we = col;
   while (we < len && (isalnum((unsigned char)line[we]) || line[we] == '_'))
@@ -2404,7 +2408,9 @@ static void editor_jump_back(void) {
  * label named "loop" is not found inside "loopback".
  * ================================================================ */
 #define MAX_REFS 128
-#define REF_ROW_LEN 96
+/* Source lines have no fixed limit, so this is a pragmatic cap: far more than
+   the window shows, scrollable, and the line itself is one Enter away. */
+#define REF_ROW_LEN 176
 
 static int g_ref_lines[MAX_REFS];
 static char g_ref_rows[MAX_REFS][REF_ROW_LEN];
@@ -2470,7 +2476,8 @@ static void editor_find_refs(void) {
      user already is rather than at the top of the file. */
   int initial = 0;
   for (int i = 1; i < g_nrefs; i++) {
-    if (abs(g_ref_lines[i] - cursor_row) < abs(g_ref_lines[initial] - cursor_row))
+    if (abs(g_ref_lines[i] - cursor_row) <
+        abs(g_ref_lines[initial] - cursor_row))
       initial = i;
   }
 
@@ -2480,7 +2487,7 @@ static void editor_find_refs(void) {
            g_nrefs == 1 ? "" : "s");
 
   int sel = list_pick(title, g_ref_ptrs, NULL, g_nrefs, initial,
-                      "Enter:go  Esc:close");
+                      "Enter:go  <>:scroll  Esc:close");
   if (sel < 0)
     return;
 
@@ -2950,6 +2957,63 @@ static void editor_diag_detail(void) {
       return;
     }
   }
+}
+
+/* ================================================================
+ * Diagnostics panel
+ *
+ * The whole batch at once, rather than stepping through it with Ctrl+N.
+ * Diagnostics in the open file can be jumped to; those in an INCLUDEd file
+ * are listed and dimmed, since there is nowhere in this buffer to go - which
+ * is exactly the distinction list_pick's `actionable` flags express.
+ * ================================================================ */
+/* Wide enough for a full diagnostic message (AsmDiag carries up to 192 chars)
+   plus the severity and location prefix, so scrolling sideways reveals the
+   whole text rather than running into a truncation of our own making. */
+#define DIAG_ROW_LEN 240
+
+static char g_diag_rows[ASMDIAG_MAX][DIAG_ROW_LEN];
+static const char *g_diag_row_ptrs[ASMDIAG_MAX];
+static char g_diag_actionable[ASMDIAG_MAX];
+
+static void editor_diag_panel(void) {
+  if (g_diag_nav_count == 0) {
+    snprintf(g_diag_status, sizeof(g_diag_status), " No diagnostics to list");
+    return;
+  }
+
+  for (int i = 0; i < g_diag_nav_count; i++) {
+    const AsmDiag *d = &g_diags[g_diag_nav[i]];
+    char sev = d->severity == ADIAG_WARNING ? 'W'
+               : d->severity == ADIAG_NOTE  ? 'N'
+                                            : 'E';
+    int here = asmdiag_in_file(d, g_filepath);
+
+    if (here)
+      snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  Ln %-5d %s", sev, d->line,
+               d->message);
+    else
+      /* Name the file, since the line number alone would be misleading. */
+      snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  %s:%d  %s", sev,
+               asmdiag_base_name(d->file), d->line, d->message);
+
+    g_diag_row_ptrs[i] = g_diag_rows[i];
+    g_diag_actionable[i] = (char)here;
+  }
+
+  char title[48];
+  snprintf(title, sizeof(title), "Diagnostics  (%d)", g_diag_nav_count);
+
+  int sel = list_pick(title, g_diag_row_ptrs, g_diag_actionable,
+                      g_diag_nav_count, g_diag_cur,
+                      "Enter:go  <>:scroll  Esc:close");
+  if (sel < 0)
+    return;
+
+  /* Selecting one also makes it the current entry, so Ctrl+N and Ctrl+P
+     carry on from where the panel left off. */
+  jump_push();
+  diag_jump_to_nav(sel);
 }
 
 static void editor_assemble(void) {
@@ -3683,6 +3747,9 @@ int editor_open(const char *path) {
       break;
     case ACT_DIAG_DETAIL:
       editor_diag_detail();
+      break;
+    case ACT_DIAG_PANEL:
+      editor_diag_panel();
       break;
 
     default:

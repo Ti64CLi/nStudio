@@ -1017,9 +1017,12 @@ int label_pick(const LabelEntry *labels, int n, int cur_line) {
 #define LP_LIST_H (LP_WIN_H - LP_TITLE_H - LP_HINT_H - 2)
 #define LP_ROWS_VIS (LP_LIST_H / LP_ROW_H)
 
+/* Columns of row text the window can show at once. */
+#define LP_VIS_COLS ((LP_WIN_W - 10) / GFX_CHAR_W)
+
 static void list_draw(const char *title, const char *const *rows,
                       const char *actionable, int n, int sel, int scroll,
-                      const char *hint) {
+                      int hscroll, const char *hint) {
   const uint16_t BG = g_default_theme.bg;
   const uint16_t FG = g_default_theme.fg;
   const uint16_t DIM = g_default_theme.border_light;
@@ -1048,8 +1051,11 @@ static void list_draw(const char *title, const char *const *rows,
     uint16_t bg = is_sel ? g_default_theme.accent : BG;
     uint16_t fg = is_sel ? g_default_theme.accent_text : (on ? FG : DIM);
     gfx_fillrect(LP_WIN_X + 1, row_y, LP_WIN_W - 2, LP_ROW_H, bg);
-    gfx_drawstr_clipped(LP_WIN_X + 4, row_y + 1, rows[ri], fg, bg,
-                        LP_WIN_W - 10);
+    /* Scrolled sideways by advancing into the row; past its end there is
+       simply nothing left to show. */
+    int rlen = (int)strlen(rows[ri]);
+    const char *text = hscroll < rlen ? rows[ri] + hscroll : "";
+    gfx_drawstr_clipped(LP_WIN_X + 4, row_y + 1, text, fg, bg, LP_WIN_W - 10);
   }
 
   gfx_scrollbar_v(LP_WIN_X, LP_WIN_W, LP_LIST_Y, LP_LIST_H, n, LP_ROWS_VIS,
@@ -1071,9 +1077,22 @@ int list_pick(const char *title, const char *const *rows,
   if (scroll > n - LP_ROWS_VIS && n > LP_ROWS_VIS)
     scroll = n - LP_ROWS_VIS;
 
+  /* Rows are often wider than the window - a diagnostic message, or a line of
+     source - so allow scrolling sideways as far as the longest one needs. */
+  int longest = 0;
+  for (int i = 0; i < n; i++) {
+    int l = (int)strlen(rows[i]);
+    if (l > longest)
+      longest = l;
+  }
+  int max_hscroll = longest - LP_VIS_COLS;
+  if (max_hscroll < 0)
+    max_hscroll = 0;
+  int hscroll = 0;
+
   while (any_key_pressed())
     msleep(20);
-  list_draw(title, rows, actionable, n, sel, scroll, hint);
+  list_draw(title, rows, actionable, n, sel, scroll, hscroll, hint);
 
   for (;;) {
     NavAction nav = gfx_poll_nav();
@@ -1099,6 +1118,15 @@ int list_pick(const char *title, const char *const *rows,
         if (sel >= scroll + LP_ROWS_VIS)
           scroll = sel - LP_ROWS_VIS + 1;
       }
+    } else if (nav == NAV_LEFT) {
+      /* Ctrl jumps a windowful, matching the syscall catalog. */
+      hscroll -= isKeyPressed(KEY_NSPIRE_CTRL) ? LP_VIS_COLS : 8;
+      if (hscroll < 0)
+        hscroll = 0;
+    } else if (nav == NAV_RIGHT) {
+      hscroll += isKeyPressed(KEY_NSPIRE_CTRL) ? LP_VIS_COLS : 8;
+      if (hscroll > max_hscroll)
+        hscroll = max_hscroll;
     } else if (nav == NAV_ENTER) {
       while (any_key_pressed())
         msleep(20);
@@ -1106,6 +1134,6 @@ int list_pick(const char *title, const char *const *rows,
         return -1; /* nothing to act on */
       return sel;
     }
-    list_draw(title, rows, actionable, n, sel, scroll, hint);
+    list_draw(title, rows, actionable, n, sel, scroll, hscroll, hint);
   }
 }
