@@ -25,6 +25,7 @@
 #include "gapbuf.h"
 #include "optab.h"
 #include "textdiff.h"
+#include "undo.h"
 #include "util.h"
 
 static int g_checks = 0;
@@ -408,6 +409,164 @@ static void test_textdiff(void) {
 }
 
 /* ================================================================ */
+/* undo  (delta history)                                            */
+/* ================================================================ */
+
+/* Apply a delta to `text` the way the editor applies it to the gap buffer:
+   replace [pos, pos+rm) with `ins`.  Returns the new length. */
+static int apply_span(char *text, int len, int pos, int rm, const char *ins,
+                      int ins_len) {
+  memmove(text + pos + ins_len, text + pos + rm, (size_t)(len - pos - rm));
+  if (ins_len)
+    memcpy(text + pos, ins, (size_t)ins_len);
+  return len - rm + ins_len;
+}
+
+static void test_undo(void) {
+  printf("undo\n");
+  undo_reset();
+  CHECK(undo_can_undo() == 0);
+  CHECK(undo_can_redo() == 0);
+
+  /* An unchanged text records nothing. */
+  CHECK(undo_record("abc", 3, "abc", 3, 0, 0, 0, 0, 0, 0) == 0);
+  CHECK(undo_can_undo() == 0);
+
+  /* One edit: "abc" -> "axbc" */
+  CHECK(undo_record("abc", 3, "axbc", 4, 1, -1, 0, 2, -1, 0) == 1);
+  CHECK(undo_can_undo() == 1);
+  CHECK(undo_can_redo() == 0);
+
+  char text[256];
+  int len;
+
+  /* Undo restores the earlier text and the cursor from before the edit. */
+  const UndoDelta *d = undo_take_undo();
+  CHECK(d != NULL);
+  if (d) {
+    CHECK(d->pos == 1);
+    CHECK(d->old_len == 0); /* nothing was there */
+    CHECK(d->new_len == 1); /* one byte was inserted */
+    CHECK(d->cursor_before == 1);
+    memcpy(text, "axbc", 4);
+    len = apply_span(text, 4, d->pos, d->new_len, d->old_text, d->old_len);
+    CHECK(len == 3);
+    CHECK(memcmp(text, "abc", 3) == 0);
+  }
+  CHECK(undo_can_undo() == 0);
+  CHECK(undo_can_redo() == 1);
+
+  /* Redo puts it back, with the cursor from after the edit. */
+  d = undo_take_redo();
+  CHECK(d != NULL);
+  if (d) {
+    CHECK(d->cursor_after == 2);
+    len = apply_span(text, 3, d->pos, d->old_len, d->new_text, d->new_len);
+    CHECK(len == 4);
+    CHECK(memcmp(text, "axbc", 4) == 0);
+  }
+  CHECK(undo_can_undo() == 1);
+  CHECK(undo_can_redo() == 0); /* taking the redo moved it back to undo */
+
+  /* A new edit after an undo abandons the redo path. */
+  undo_reset();
+  undo_record("a", 1, "ab", 2, 0, -1, 0, 1, -1, 0);
+  undo_take_undo(); /* now redo has one entry */
+  CHECK(undo_can_redo() == 1);
+  undo_record("a", 1, "az", 2, 0, -1, 0, 1, -1, 0);
+  CHECK(undo_can_redo() == 0);
+
+  /* The ring holds UNDO_MAX edits and drops the oldest beyond that. */
+  undo_reset();
+  char cur[128] = "";
+  int curlen = 0;
+  for (int i = 0; i < UNDO_MAX + 10; i++) {
+    char next[128];
+    memcpy(next, cur, (size_t)curlen);
+    next[curlen] = 'a';
+    undo_record(cur, curlen, next, curlen + 1, curlen, -1, 0, curlen + 1, -1, 0);
+    memcpy(cur, next, (size_t)curlen + 1);
+    curlen++;
+  }
+  int steps = 0;
+  while (undo_can_undo()) {
+    d = undo_take_undo();
+    curlen = apply_span(cur, curlen, d->pos, d->new_len, d->old_text,
+                        d->old_len);
+    steps++;
+  }
+  CHECK(steps == UNDO_MAX);       /* exactly the retained depth */
+  CHECK(curlen == 10);            /* the 10 oldest edits are no longer undoable */
+
+  /*
+   * Model check: run a random sequence of edits through the history, then undo
+   * every one of them and confirm the text walks back through exactly the
+   * states it came from - and that redoing walks forward to the same place.
+   */
+  undo_reset();
+  char states[24][80];
+  int lens[24];
+  char t[80] = "start\n bx lr\n";
+  int tl = 13;
+  unsigned seed = 987654321u;
+  memcpy(states[0], t, (size_t)tl);
+  lens[0] = tl;
+
+  int n = 20;
+  for (int i = 1; i <= n; i++) {
+    char nt[80];
+    int nl;
+    seed = seed * 1103515245u + 12345u;
+    int at = (int)((seed >> 9) % (unsigned)(tl + 1));
+    if (((seed >> 5) & 1) && tl > 0) { /* delete a byte */
+      if (at >= tl)
+        at = tl - 1;
+      memcpy(nt, t, (size_t)at);
+      memcpy(nt + at, t + at + 1, (size_t)(tl - at - 1));
+      nl = tl - 1;
+    } else { /* insert a byte */
+      memcpy(nt, t, (size_t)at);
+      nt[at] = (char)('a' + (seed >> 17) % 26u);
+      memcpy(nt + at + 1, t + at, (size_t)(tl - at));
+      nl = tl + 1;
+    }
+    undo_record(t, tl, nt, nl, at, -1, 0, at, -1, 0);
+    memcpy(t, nt, (size_t)nl);
+    tl = nl;
+    memcpy(states[i], t, (size_t)tl);
+    lens[i] = tl;
+  }
+
+  int bad = 0;
+  for (int i = n; i >= 1; i--) {
+    d = undo_take_undo();
+    if (!d) {
+      bad++;
+      break;
+    }
+    tl = apply_span(t, tl, d->pos, d->new_len, d->old_text, d->old_len);
+    if (tl != lens[i - 1] || memcmp(t, states[i - 1], (size_t)tl) != 0)
+      bad++;
+  }
+  CHECK(bad == 0); /* undo walked back through every original state */
+
+  bad = 0;
+  for (int i = 1; i <= n; i++) {
+    d = undo_take_redo();
+    if (!d) {
+      bad++;
+      break;
+    }
+    tl = apply_span(t, tl, d->pos, d->old_len, d->new_text, d->new_len);
+    if (tl != lens[i] || memcmp(t, states[i], (size_t)tl) != 0)
+      bad++;
+  }
+  CHECK(bad == 0); /* and redo walked forward through the same states */
+
+  undo_reset();
+}
+
+/* ================================================================ */
 /* asmdiag  (nasm JSON diagnostics consumer)                        */
 /* ================================================================ */
 
@@ -688,6 +847,7 @@ int main(void) {
   test_gapbuf();
   test_lines_shift();
   test_textdiff();
+  test_undo();
   test_asmdiag();
   test_asmdb();
   test_fileio();

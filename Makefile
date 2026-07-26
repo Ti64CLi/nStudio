@@ -14,7 +14,7 @@ else
 	GCCFLAGS += -O0 -g
 endif
 
-SRCS = nstudio.c gfx.c editor.c editor_ui.c settings.c gapbuf.c syntax.c asmdb.c browser.c optab.c util.c asmdiag.c fileio.c textdiff.c
+SRCS = nstudio.c gfx.c editor.c editor_ui.c settings.c gapbuf.c syntax.c asmdb.c browser.c optab.c util.c asmdiag.c fileio.c textdiff.c undo.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 EXE = nstudio
@@ -44,7 +44,7 @@ $(EXE).tns: $(EXE).elf
 HOSTCC ?= cc
 HOSTCFLAGS = -Wall -W -O0 -g -I.
 TEST_BIN = tests/run_tests
-TEST_MODULES = util.c optab.c gapbuf.c asmdiag.c asmdb.c fileio.c textdiff.c
+TEST_MODULES = util.c optab.c gapbuf.c asmdiag.c asmdb.c fileio.c textdiff.c undo.c
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

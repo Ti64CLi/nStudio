@@ -44,6 +44,7 @@
 #include "gfx.h"
 #include "settings.h"
 #include "syntax.h"
+#include "undo.h"
 #include "util.h"
 
 /* ================================================================
@@ -460,131 +461,143 @@ static void clipboard_paste(void) {
 /* ================================================================
  * Undo / Redo
  *
- * Each snapshot stores: full logical buffer, its length, and the
- * cursor position at the time of the snapshot.  We take a snapshot
- * before every mutating operation.  The ring holds UNDO_MAX entries.
+ * The history (undo.c) stores only the region each edit changed, so its
+ * cost follows how much was edited rather than how large the file is - a
+ * ring of whole-buffer copies would need more memory than the calculator
+ * has on a large source, and undo would quietly stop working there.
+ *
+ * Deriving a delta needs the text from both before and after an edit, but
+ * undo_checkpoint() runs before the mutation, so recording lags by one
+ * step: g_last holds the text as of the last checkpoint, and the next
+ * flush diffs it against the buffer.  Coalescing then costs nothing - a
+ * run of same-kind edits simply does not flush, so the whole run is
+ * recorded as the single entry it should be.
  * ================================================================ */
-#define UNDO_MAX 32
 
-typedef struct {
-  char *buf; /* malloc'd copy of the logical text */
-  int len;
-  int cursor;
-  int s_anchor;
-  int s_active;
-} UndoSnap;
+/* Text as of the last checkpoint, with the editor state from that moment. */
+static char *g_last;
+static int g_last_len;
+static int g_last_cursor, g_last_anchor, g_last_active;
 
-static UndoSnap g_undo_ring[UNDO_MAX];
-static int g_undo_head = 0; /* next write slot */
-static int g_undo_count = 0;
-static int g_redo_head = 0;
-static int g_redo_count = 0;
-static UndoSnap g_redo_ring[UNDO_MAX];
-
-static void snap_free(UndoSnap *s) {
-  free(s->buf);
-  s->buf = NULL;
-  s->len = 0;
-}
-
-/* Capture the current buffer + cursor into ring[*head] and advance the
-   ring.  The copy is allocated before the old slot is freed, so a failed
-   allocation leaves the ring fully intact.  Returns 1 on success. */
-static int snap_capture(UndoSnap *ring, int *head, int *count) {
+/* Flatten the gap buffer into a fresh array.  Returns NULL on failure. */
+static char *buf_snapshot(int *out_len) {
   int len = gb_len(&g_buf);
-  char *nb = (char *)malloc(len + 1);
+  char *nb = (char *)malloc((size_t)len + 1);
   if (!nb)
-    return 0;
-  /* Copy both halves directly, no per-character branch needed. */
-  memcpy(nb, g_buf.buf, g_buf.gap_lo);
+    return NULL;
+  memcpy(nb, g_buf.buf, (size_t)g_buf.gap_lo);
   int after = g_buf.size - g_buf.gap_hi;
-  memcpy(nb + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, after);
+  memcpy(nb + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, (size_t)after);
   nb[len] = '\0';
-
-  UndoSnap *s = &ring[*head % UNDO_MAX];
-  snap_free(s);
-  s->buf = nb;
-  s->len = len;
-  s->cursor = cursor_pos;
-  s->s_anchor = sel_anchor;
-  s->s_active = sel_active;
-  *head = (*head + 1) % UNDO_MAX;
-  if (*count < UNDO_MAX)
-    (*count)++;
-  return 1;
+  *out_len = len;
+  return nb;
 }
 
-/* Undo coalescing: consecutive same-kind edits share one snapshot, so
-   the 32-slot ring covers many keystrokes and undo steps back a word
-   or edit at a time.  Movement and other operations break the group.
-   (UndoKind is declared near the clipboard code above.) */
+/* Adopt the current buffer as the reference for the next delta. */
+static void undo_mark(void) {
+  int len;
+  char *snap = buf_snapshot(&len);
+  if (!snap)
+    return; /* keep the old reference; the next flush simply spans more */
+  free(g_last);
+  g_last = snap;
+  g_last_len = len;
+  g_last_cursor = cursor_pos;
+  g_last_anchor = sel_anchor;
+  g_last_active = sel_active;
+}
+
+/* Record whatever has changed since the last mark as one history entry. */
+static void undo_flush(void) {
+  if (!g_last)
+    return;
+  int len;
+  char *now = buf_snapshot(&len);
+  if (!now)
+    return;
+  undo_record(g_last, g_last_len, now, len, g_last_cursor, g_last_anchor,
+              g_last_active, cursor_pos, sel_anchor, sel_active);
+  free(now);
+  undo_mark();
+}
+
+/* Drop the history entirely (a new file, or leaving the editor). */
+static void undo_forget(void) {
+  undo_reset();
+  free(g_last);
+  g_last = NULL;
+  g_last_len = 0;
+}
+
+/* Undo coalescing: consecutive same-kind edits share one entry, so undo
+   steps back a word or an edit at a time rather than a keystroke.
+   Movement and other operations break the group. */
 static UndoKind g_undo_kind = UK_NONE;
 
 /* Force the next edit to start a fresh undo group. */
 static void undo_break(void) { g_undo_kind = UK_NONE; }
 
-static void undo_push(void) {
-  if (!snap_capture(g_undo_ring, &g_undo_head, &g_undo_count))
-    return;
-  for (int i = 0; i < UNDO_MAX; i++)
-    snap_free(&g_redo_ring[i]);
-  g_redo_count = 0;
-  g_redo_head = 0;
-}
-
-static void snap_restore(UndoSnap *s) {
-  if (!s->buf)
-    return;
-  gb_free(&g_buf);
-  gb_init(&g_buf);
-  gb_insert_n(&g_buf, s->buf, s->len);
-  gb_move(&g_buf, 0);
+/* Put the buffer back the way `d` describes and restore the editor state
+   that went with it.  `remove`/`insert` pick the direction. */
+static void undo_apply(int pos, int remove_len, const char *insert,
+                       int insert_len, int cursor, int anchor, int active) {
+  gb_move(&g_buf, pos);
+  for (int i = 0; i < remove_len; i++)
+    gb_delete(&g_buf);
+  if (insert_len > 0)
+    gb_insert_n(&g_buf, insert, insert_len);
   rebuild_lines(&g_buf);
-  cursor_pos = s->cursor;
-  sel_anchor = s->s_anchor;
-  sel_active = s->s_active;
+
+  cursor_pos = cursor;
   if (cursor_pos > gb_len(&g_buf))
     cursor_pos = gb_len(&g_buf);
+  if (cursor_pos < 0)
+    cursor_pos = 0;
+  sel_anchor = anchor;
+  sel_active = active;
   cursor_sync_pos();
   g_modified = 1;
-  diag_nav_reset(); /* undo/redo changed the buffer; drop stale diagnostics */
+  diag_nav_reset(); /* the buffer moved; drop stale assemble diagnostics */
+
+  undo_mark(); /* the buffer is now the reference for the next delta */
 }
 
 static void do_undo(void) {
-  if (g_undo_count == 0)
+  undo_flush(); /* fold in an edit still in progress */
+  const UndoDelta *d = undo_take_undo();
+  if (!d)
     return;
-  /* Save the current state to the Redo ring first; if that fails,
-     abort rather than silently losing the redo path. */
-  if (!snap_capture(g_redo_ring, &g_redo_head, &g_redo_count))
-    return;
-  g_undo_head = (g_undo_head - 1 + UNDO_MAX) % UNDO_MAX;
-  g_undo_count--;
-  snap_restore(&g_undo_ring[g_undo_head]);
+  undo_apply(d->pos, d->new_len, d->old_text, d->old_len, d->cursor_before,
+             d->anchor_before, d->active_before);
   undo_break();
 }
 
 static void do_redo(void) {
-  if (g_redo_count == 0)
+  /* Fold in an edit still in progress first.  If there is one, recording it
+     discards the redo path - editing after an undo has always done that - and
+     the take below correctly finds nothing.  Skipping this would apply a delta
+     describing a state the buffer no longer holds, corrupting the text. */
+  undo_flush();
+  const UndoDelta *d = undo_take_redo();
+  if (!d)
     return;
-  /* Save the current state to the Undo ring.  snap_capture does not
-     wipe the redo ring, unlike undo_push. */
-  if (!snap_capture(g_undo_ring, &g_undo_head, &g_undo_count))
-    return;
-  g_redo_head = (g_redo_head - 1 + UNDO_MAX) % UNDO_MAX;
-  g_redo_count--;
-  snap_restore(&g_redo_ring[g_redo_head]);
+  undo_apply(d->pos, d->old_len, d->new_text, d->new_len, d->cursor_after,
+             d->anchor_after, d->active_after);
   undo_break();
 }
 
-/* Snapshot before a mutation, coalescing runs of the same kind.
-   Only INSERT and DELETE runs coalesce; everything else is its own
-   group. */
+/* Called before a mutation.  Runs of the same kind coalesce into one entry;
+   everything else closes the previous entry first. */
 static void undo_checkpoint(UndoKind kind) {
   diag_nav_reset(); /* an edit invalidates the retained assemble diagnostics */
   int coalesce =
       (kind == g_undo_kind) && (kind == UK_INSERT || kind == UK_DELETE);
-  if (!coalesce)
-    undo_push();
+  if (!coalesce) {
+    if (g_last)
+      undo_flush();
+    else
+      undo_mark(); /* first edit of the session: establish the reference */
+  }
   g_undo_kind = kind;
 }
 
@@ -2001,14 +2014,7 @@ static void editor_open_file(void) {
   scroll_col = 0;
   sel_anchor = SEL_NONE;
   sel_active = 0;
-  for (int i = 0; i < UNDO_MAX; i++) {
-    snap_free(&g_undo_ring[i]);
-    snap_free(&g_redo_ring[i]);
-  }
-  g_undo_head = 0;
-  g_undo_count = 0;
-  g_redo_head = 0;
-  g_redo_count = 0;
+  undo_forget();
   g_modified = 0;
   g_readonly = !path_is_asm_source(g_filepath);
   /* The retained diagnostics describe the previous buffer, not this one. */
@@ -3205,14 +3211,7 @@ int editor_open(const char *path) {
 
   sel_anchor = SEL_NONE;
   sel_active = 0;
-  for (int i = 0; i < UNDO_MAX; i++) {
-    snap_free(&g_undo_ring[i]);
-    snap_free(&g_redo_ring[i]);
-  }
-  g_undo_head = 0;
-  g_undo_count = 0;
-  g_redo_head = 0;
-  g_redo_count = 0;
+  undo_forget();
 
   render_all();
 
@@ -3493,11 +3492,6 @@ int editor_open(const char *path) {
   lines_free();
   /* Release the undo/redo snapshots (up to 32 buffer copies) rather than
      holding them while the user is back in the main menu. */
-  for (int i = 0; i < UNDO_MAX; i++) {
-    snap_free(&g_undo_ring[i]);
-    snap_free(&g_redo_ring[i]);
-  }
-  g_undo_head = g_undo_count = 0;
-  g_redo_head = g_redo_count = 0;
+  undo_forget();
   return g_saved;
 }
