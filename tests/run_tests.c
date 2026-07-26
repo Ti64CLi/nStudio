@@ -24,6 +24,7 @@
 #include "fileio.h"
 #include "gapbuf.h"
 #include "optab.h"
+#include "textdiff.h"
 #include "util.h"
 
 static int g_checks = 0;
@@ -287,6 +288,123 @@ static void test_lines_shift(void) {
   gb_free(&big);
   lines_free();
   CHECK(num_lines == 0);
+}
+
+/* ================================================================ */
+/* textdiff  (minimal changed span, the basis of delta undo)        */
+/* ================================================================ */
+
+/* Assert one diff, and verify the span really does turn `a` into `b`. */
+static void check_diff(const char *a, int alen, const char *b, int blen,
+                       int want_pos, int want_alen, int want_blen) {
+  int pos, da, db;
+  buf_diff_span(a, alen, b, blen, &pos, &da, &db);
+  CHECK(pos == want_pos);
+  CHECK(da == want_alen);
+  CHECK(db == want_blen);
+
+  /* Reconstruct b from a by replacing a[pos, pos+da) with b[pos, pos+db). */
+  char out[256];
+  int n = 0;
+  memcpy(out, a, (size_t)pos);
+  n = pos;
+  memcpy(out + n, b + pos, (size_t)db);
+  n += db;
+  memcpy(out + n, a + pos + da, (size_t)(alen - pos - da));
+  n += alen - pos - da;
+  CHECK(n == blen);
+  CHECK(memcmp(out, b, (size_t)blen) == 0);
+}
+
+static void test_textdiff(void) {
+  printf("textdiff\n");
+
+  /* identical: nothing differs */
+  check_diff("abc", 3, "abc", 3, 3, 0, 0);
+  check_diff("", 0, "", 0, 0, 0, 0);
+
+  /* single-character insert at head, middle, tail */
+  check_diff("bc", 2, "abc", 3, 0, 0, 1);
+  check_diff("ac", 2, "abc", 3, 1, 0, 1);
+  check_diff("ab", 2, "abc", 3, 2, 0, 1);
+
+  /* single-character delete at head, middle, tail */
+  check_diff("abc", 3, "bc", 2, 0, 1, 0);
+  check_diff("abc", 3, "ac", 2, 1, 1, 0);
+  check_diff("abc", 3, "ab", 2, 2, 1, 0);
+
+  /* replacement, and a longer run */
+  check_diff("abc", 3, "axc", 3, 1, 1, 1);
+  check_diff("a-----b", 7, "a+b", 3, 1, 5, 1);
+
+  /* from/to empty */
+  check_diff("", 0, "abc", 3, 0, 0, 3);
+  check_diff("abc", 3, "", 0, 0, 3, 0);
+
+  /* repeated characters: the prefix eats everything, so the suffix scan must
+     not overlap it (the classic off-by-one in this algorithm) */
+  check_diff("aa", 2, "aaa", 3, 2, 0, 1);
+  check_diff("aaa", 3, "aa", 2, 2, 1, 0);
+  check_diff("aaaa", 4, "aa", 2, 2, 2, 0);
+
+  /* NUL bytes are ordinary data */
+  check_diff("a\0c", 3, "a\0xc", 4, 2, 0, 1);
+
+  /* realistic editing: typing into a line of assembly */
+  check_diff(" mov r0, #1\n", 12, " mov r0, #12\n", 13, 11, 0, 1);
+  check_diff("start\n bx lr\n", 13, "start\n\n bx lr\n", 14, 6, 0, 1);
+
+  /*
+   * Exhaustive check over a small alphabet: for every pair of strings up to
+   * length 4 over {a,b}, the reported span must reconstruct b from a exactly.
+   * This is what makes the primitive trustworthy enough to drive undo.
+   */
+  char sa[8], sb[8];
+  int checked = 0, bad = 0;
+  for (int la = 0; la <= 4; la++) {
+    for (int ia = 0; ia < (1 << la); ia++) {
+      for (int k = 0; k < la; k++)
+        sa[k] = (char)('a' + ((ia >> k) & 1));
+      for (int lb = 0; lb <= 4; lb++) {
+        for (int ib = 0; ib < (1 << lb); ib++) {
+          for (int k = 0; k < lb; k++)
+            sb[k] = (char)('a' + ((ib >> k) & 1));
+
+          int pos, da, db;
+          buf_diff_span(sa, la, sb, lb, &pos, &da, &db);
+
+          /* well-formed: non-negative, inside both buffers */
+          if (pos < 0 || da < 0 || db < 0 || pos + da > la || pos + db > lb) {
+            bad++;
+            continue;
+          }
+          /* and it reconstructs b */
+          char out[16];
+          int n = 0;
+          memcpy(out, sa, (size_t)pos);
+          n = pos;
+          memcpy(out + n, sb + pos, (size_t)db);
+          n += db;
+          memcpy(out + n, sa + pos + da, (size_t)(la - pos - da));
+          n += la - pos - da;
+          if (n != lb || memcmp(out, sb, (size_t)lb) != 0)
+            bad++;
+
+          /* Minimal: when both regions are non-empty their first and last
+             bytes must differ, or the common prefix/suffix scans stopped
+             early and we are storing more than the edit actually changed. */
+          if (da > 0 && db > 0) {
+            if (sa[pos] == sb[pos] ||
+                sa[pos + da - 1] == sb[pos + db - 1])
+              bad++;
+          }
+          checked++;
+        }
+      }
+    }
+  }
+  CHECK(checked == 961); /* (1+2+4+8+16)^2 pairs */
+  CHECK(bad == 0);
 }
 
 /* ================================================================ */
@@ -569,6 +687,7 @@ int main(void) {
   test_optab();
   test_gapbuf();
   test_lines_shift();
+  test_textdiff();
   test_asmdiag();
   test_asmdb();
   test_fileio();
