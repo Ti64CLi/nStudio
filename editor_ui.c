@@ -991,3 +991,121 @@ int label_pick(const LabelEntry *labels, int n, int cur_line) {
     labels_draw(labels, n, sel, scroll);
   }
 }
+
+/* ================================================================
+ * Generic list picker
+ *
+ * A scrollable list of pre-formatted rows that returns the chosen index.
+ * Used for anything whose result is "pick one of these places": label
+ * references now, the diagnostics panel next.  The callers format their own
+ * rows, which is what lets one widget serve lists whose columns differ.
+ *
+ * Deliberately plain - up, down, Enter, Esc.  The catalog and syscall pickers
+ * are not built on this and should not be: their left/right keys mean
+ * different things (collapsing a tree, scrolling text sideways), and folding
+ * those into one widget would cost more than the duplication saves.
+ * ================================================================ */
+
+#define LP_WIN_X 14
+#define LP_WIN_Y 8
+#define LP_WIN_W (GFX_W - 28)
+#define LP_WIN_H (GFX_H - 16)
+#define LP_TITLE_H 12
+#define LP_HINT_H 11
+#define LP_ROW_H 10
+#define LP_LIST_Y (LP_WIN_Y + 1 + LP_TITLE_H)
+#define LP_LIST_H (LP_WIN_H - LP_TITLE_H - LP_HINT_H - 2)
+#define LP_ROWS_VIS (LP_LIST_H / LP_ROW_H)
+
+static void list_draw(const char *title, const char *const *rows,
+                      const char *actionable, int n, int sel, int scroll,
+                      const char *hint) {
+  const uint16_t BG = g_default_theme.bg;
+  const uint16_t FG = g_default_theme.fg;
+  const uint16_t DIM = g_default_theme.border_light;
+
+  gfx_panel(LP_WIN_X, LP_WIN_Y, LP_WIN_W, LP_WIN_H, LP_TITLE_H);
+  gfx_drawstr_clipped(LP_WIN_X + 4,
+                      LP_WIN_Y + 1 + (LP_TITLE_H - GFX_FONT_H) / 2, title,
+                      g_default_theme.title_fg, g_default_theme.title_bg,
+                      LP_WIN_W - 8);
+
+  if (n == 0)
+    gfx_drawstr_clipped(LP_WIN_X + 8, LP_LIST_Y + 10, "Nothing to show.", DIM,
+                        BG, LP_WIN_W - 16);
+
+  for (int vi = 0; vi < LP_ROWS_VIS; vi++) {
+    int ri = scroll + vi;
+    int row_y = LP_LIST_Y + vi * LP_ROW_H;
+    if (ri >= n) {
+      gfx_fillrect(LP_WIN_X + 1, row_y, LP_WIN_W - 2, LP_ROW_H, BG);
+      continue;
+    }
+    int is_sel = (ri == sel);
+    /* Rows the caller marked unactionable are dimmed but still shown: they
+       are context, not choices. */
+    int on = !actionable || actionable[ri];
+    uint16_t bg = is_sel ? g_default_theme.accent : BG;
+    uint16_t fg = is_sel ? g_default_theme.accent_text : (on ? FG : DIM);
+    gfx_fillrect(LP_WIN_X + 1, row_y, LP_WIN_W - 2, LP_ROW_H, bg);
+    gfx_drawstr_clipped(LP_WIN_X + 4, row_y + 1, rows[ri], fg, bg,
+                        LP_WIN_W - 10);
+  }
+
+  gfx_scrollbar_v(LP_WIN_X, LP_WIN_W, LP_LIST_Y, LP_LIST_H, n, LP_ROWS_VIS,
+                  scroll);
+
+  int hy = LP_WIN_Y + LP_WIN_H - LP_HINT_H - 1;
+  gfx_hline(LP_WIN_X + 1, hy, LP_WIN_W - 2, g_default_theme.border_light);
+  gfx_fillrect(LP_WIN_X + 1, hy + 1, LP_WIN_W - 2, LP_HINT_H - 1, BG);
+  gfx_drawstr_clipped(LP_WIN_X + 4, hy + 2, hint, FG, BG, LP_WIN_W - 8);
+  gfx_flip();
+}
+
+int list_pick(const char *title, const char *const *rows,
+              const char *actionable, int n, int initial, const char *hint) {
+  int sel = (initial > 0 && initial < n) ? initial : 0;
+  int scroll = sel - LP_ROWS_VIS / 2;
+  if (scroll < 0)
+    scroll = 0;
+  if (scroll > n - LP_ROWS_VIS && n > LP_ROWS_VIS)
+    scroll = n - LP_ROWS_VIS;
+
+  while (any_key_pressed())
+    msleep(20);
+  list_draw(title, rows, actionable, n, sel, scroll, hint);
+
+  for (;;) {
+    NavAction nav = gfx_poll_nav();
+    if (nav == NAV_NONE) {
+      msleep(16);
+      idle();
+      continue;
+    }
+
+    if (nav == NAV_ESC) {
+      while (any_key_pressed())
+        msleep(20);
+      return -1;
+    } else if (nav == NAV_UP) {
+      if (sel > 0) {
+        sel--;
+        if (sel < scroll)
+          scroll = sel;
+      }
+    } else if (nav == NAV_DOWN) {
+      if (sel < n - 1) {
+        sel++;
+        if (sel >= scroll + LP_ROWS_VIS)
+          scroll = sel - LP_ROWS_VIS + 1;
+      }
+    } else if (nav == NAV_ENTER) {
+      while (any_key_pressed())
+        msleep(20);
+      if (n == 0 || (actionable && !actionable[sel]))
+        return -1; /* nothing to act on */
+      return sel;
+    }
+    list_draw(title, rows, actionable, n, sel, scroll, hint);
+  }
+}

@@ -62,4 +62,20 @@ typedef struct {
    job, so this stays free of editor state like every dialog here. */
 int label_pick(const LabelEntry *labels, int n, int cur_line);
 
+/* ------------------------------------------------------------------ */
+/* Generic list picker                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Modal list of pre-formatted rows; returns the chosen index, or -1 when
+ * cancelled or when the selected row is not actionable.  `actionable` may be
+ * NULL, or an array of flags marking which rows can be chosen - the rest are
+ * dimmed and shown for context.  `initial` pre-selects a row.
+ *
+ * Callers format their own row text, which is what lets one widget serve
+ * lists whose columns differ (label references, diagnostics).
+ */
+int list_pick(const char *title, const char *const *rows,
+              const char *actionable, int n, int initial, const char *hint);
+
 #endif /* EDITOR_UI_H_INCLUDED */

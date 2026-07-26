@@ -1105,6 +1105,7 @@ static void render_all(void) {
 #define ACT_DIAG_DETAIL (-53)
 #define ACT_RUN (-54)
 #define ACT_JUMP_BACK (-55)
+#define ACT_FIND_REFS (-56)
 
 /* Whether an action counts as a buffer edit for undo-coalescing: a run of
    same-kind edits shares one undo group and any non-edit action ends the
@@ -1276,6 +1277,8 @@ static int poll_key(void) {
     return ACT_DIAG_DETAIL;
   if (ctrl && isKeyPressed(KEY_NSPIRE_R))
     return ACT_RUN;
+  if (ctrl && isKeyPressed(KEY_NSPIRE_U))
+    return ACT_FIND_REFS;
   if (ctrl && isKeyPressed(KEY_NSPIRE_TRIG))
     return ACT_CHEATSHEET;
 
@@ -2389,6 +2392,102 @@ static void editor_jump_back(void) {
   int len = gb_len(&g_buf);
   cursor_pos = pos > len ? len : pos; /* edits may have shortened the buffer */
   cursor_sync_pos();
+  scroll_to_cursor();
+}
+
+/* ================================================================
+ * Find references
+ *
+ * Every mention of a label, wherever it appears as a whole identifier -
+ * branch targets, operands, EQU right-hand sides.  Matching is
+ * case-insensitive and word-bounded, the same rule label_find uses, so a
+ * label named "loop" is not found inside "loopback".
+ * ================================================================ */
+#define MAX_REFS 128
+#define REF_ROW_LEN 96
+
+static int g_ref_lines[MAX_REFS];
+static char g_ref_rows[MAX_REFS][REF_ROW_LEN];
+static const char *g_ref_ptrs[MAX_REFS];
+static int g_nrefs;
+
+/* Collect the lines mentioning `name`, formatting a row for each. */
+static void refs_scan(const char *name) {
+  int nlen = (int)strlen(name);
+  g_nrefs = 0;
+
+  for (int row = 0; row < num_lines && g_nrefs < MAX_REFS; row++) {
+    extract_line(row);
+    const char *line = line_scratch;
+    int len = (int)strlen(line);
+
+    for (int i = 0; i < len;) {
+      if (line[i] == ';')
+        break; /* a comment mention is not a reference */
+      if (!isalnum((unsigned char)line[i]) && line[i] != '_') {
+        i++;
+        continue;
+      }
+      int ws = i;
+      while (i < len && (isalnum((unsigned char)line[i]) || line[i] == '_'))
+        i++;
+      if (i - ws != nlen || !strncaseeq(line + ws, name, nlen))
+        continue;
+
+      /* Trim leading blanks so the row shows the code, not the indent. */
+      const char *text = line;
+      while (*text == ' ' || *text == '\t')
+        text++;
+      snprintf(g_ref_rows[g_nrefs], REF_ROW_LEN, "Ln %-5d %s", row + 1, text);
+      g_ref_lines[g_nrefs] = row;
+      g_ref_ptrs[g_nrefs] = g_ref_rows[g_nrefs];
+      g_nrefs++;
+      break; /* one row per line, however often the name occurs on it */
+    }
+  }
+}
+
+/* List every mention of the label under the cursor (Ctrl+U). */
+static void editor_find_refs(void) {
+  char name[MAX_LABEL_LEN];
+  if (word_under_cursor(name, sizeof(name)) == 0) {
+    static const char *body[] = {"Place the cursor on a label name",
+                                 "to list its references."};
+    gfx_window_alert("Find References", body, 2, "OK");
+    return;
+  }
+
+  refs_scan(name);
+  if (g_nrefs == 0) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "No references to \"%s\" in this file.", name);
+    const char *body[1] = {msg};
+    gfx_window_alert("Find References", body, 1, "OK");
+    return;
+  }
+
+  /* Pre-select the reference nearest the cursor, so the list opens where the
+     user already is rather than at the top of the file. */
+  int initial = 0;
+  for (int i = 1; i < g_nrefs; i++) {
+    if (abs(g_ref_lines[i] - cursor_row) < abs(g_ref_lines[initial] - cursor_row))
+      initial = i;
+  }
+
+  /* Sized for the longest label plus the suffix, so it is never truncated. */
+  char title[MAX_LABEL_LEN + 48];
+  snprintf(title, sizeof(title), "%s  (%d reference%s)", name, g_nrefs,
+           g_nrefs == 1 ? "" : "s");
+
+  int sel = list_pick(title, g_ref_ptrs, NULL, g_nrefs, initial,
+                      "Enter:go  Esc:close");
+  if (sel < 0)
+    return;
+
+  jump_push();
+  cursor_row = g_ref_lines[sel];
+  cursor_col = 0;
+  cursor_sync_rowcol();
   scroll_to_cursor();
 }
 
@@ -3561,6 +3660,9 @@ int editor_open(const char *path) {
       break;
     case ACT_JUMP_BACK:
       editor_jump_back();
+      break;
+    case ACT_FIND_REFS:
+      editor_find_refs();
       break;
 
     case ACT_CHEATSHEET:
