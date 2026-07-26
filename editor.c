@@ -137,6 +137,14 @@ static int g_crlf;     /* 0 = LF line endings, 1 = CRLF (write \r\n) */
    error after a jump); "" when none.  Dismissed on the next keypress. */
 static char g_diag_status[224] = "";
 
+/* Set whenever the buffer changes after a successful assemble, i.e. the built
+   program no longer matches the source.  The calculator's filesystem does not
+   report a usable modification time, so this - not the timestamps - is what
+   makes the "older than the source" warning reliable.  It only tracks the
+   current session: after opening a file we cannot know whether an existing
+   build matches, so we start out not warning. */
+static int g_build_stale;
+
 /* Assemble diagnostics retained for next/previous-error navigation.  Populated
    after each assemble: g_diags holds the whole parsed batch, g_diag_nav holds
    the indices of those that land in the file currently open (line >= 1), and
@@ -558,6 +566,7 @@ static void undo_apply(int pos, int remove_len, const char *insert,
   cursor_sync_pos();
   g_modified = 1;
   diag_nav_reset(); /* the buffer moved; drop stale assemble diagnostics */
+  g_build_stale = 1;
 
   undo_mark(); /* the buffer is now the reference for the next delta */
 }
@@ -590,6 +599,7 @@ static void do_redo(void) {
    everything else closes the previous entry first. */
 static void undo_checkpoint(UndoKind kind) {
   diag_nav_reset(); /* an edit invalidates the retained assemble diagnostics */
+  g_build_stale = 1; /* ...and leaves any built program behind the source */
   int coalesce =
       (kind == g_undo_kind) && (kind == UK_INSERT || kind == UK_DELETE);
   if (!coalesce) {
@@ -2015,6 +2025,8 @@ static void editor_open_file(void) {
   sel_anchor = SEL_NONE;
   sel_active = 0;
   undo_forget();
+  /* A different buffer: whatever was built before says nothing about it. */
+  g_build_stale = 0;
   g_modified = 0;
   g_readonly = !path_is_asm_source(g_filepath);
   /* The retained diagnostics describe the previous buffer, not this one. */
@@ -2846,6 +2858,9 @@ static void editor_assemble(void) {
      one can take nStudio down with it. */
   char outpath[1024];
   struct stat ost;
+  if (ndiag == 0)
+    g_build_stale = 0; /* what is on disk now matches this buffer */
+
   if (ndiag == 0 && editor_output_path(g_filepath, outpath, sizeof(outpath)) &&
       stat(outpath, &ost) == 0) {
     char line[288];
@@ -2882,15 +2897,18 @@ static void editor_run_build(void) {
   }
 
   /*
-   * Warn when what we are about to run predates the source.  Unsaved edits are
-   * always proof of that; the timestamp comparison is a best-effort extra,
-   * applied only when both stamps look real, because the calculator's
-   * filesystem does not guarantee a useful modification time.  Treating an
-   * absent timestamp as "not stale" keeps a spurious prompt off the common
-   * path - the buffer flag already covers the case that actually matters.
+   * Warn when what we are about to run no longer matches the source.
+   *
+   * Two things prove that outright: unsaved edits in the buffer, and any change
+   * made since the last successful assemble.  Both are tracked here rather than
+   * asked of the filesystem, because Ndless does not fill in a modification
+   * time - stat() reports zero - so a timestamp comparison silently never
+   * fires on the calculator.  It is still attempted, guarded on both stamps
+   * looking real, to catch a build left over from an earlier session on a
+   * platform that does report times.
    */
   struct stat sst;
-  int stale = g_modified;
+  int stale = g_modified || g_build_stale;
   if (!stale && stat(g_filepath, &sst) == 0 && sst.st_mtim.tv_sec > 0 &&
       ost.st_mtim.tv_sec > 0)
     stale = sst.st_mtim.tv_sec > ost.st_mtim.tv_sec;
@@ -3212,6 +3230,8 @@ int editor_open(const char *path) {
   sel_anchor = SEL_NONE;
   sel_active = 0;
   undo_forget();
+  /* A different buffer: whatever was built before says nothing about it. */
+  g_build_stale = 0;
 
   render_all();
 
