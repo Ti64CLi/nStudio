@@ -428,9 +428,17 @@ static void test_undo(void) {
   CHECK(undo_can_undo() == 0);
   CHECK(undo_can_redo() == 0);
 
-  /* An unchanged text records nothing. */
-  CHECK(undo_record("abc", 3, "abc", 3, 0, 0, 0, 0, 0, 0) == 0);
+  /* The three outcomes are distinct, which is what lets a caller tell "there
+     was nothing to record" from "a real change could not be recorded".
+     Conflating them is what allowed a stale entry to be applied to a buffer
+     that had moved on. */
+  CHECK(undo_record("abc", 3, "abc", 3, 0, 0, 0, 0, 0, 0) == 0); /* identical */
   CHECK(undo_can_undo() == 0);
+  CHECK(undo_record("abc", 3, "abd", 3, 0, 0, 0, 0, 0, 0) == 1); /* stored */
+  CHECK(undo_can_undo() == 1);
+  undo_reset();
+  /* The -1 outcome needs allocation failure, which this harness cannot yet
+     inject; see the fault-injection note in the roadmap. */
 
   /* One edit: "abc" -> "axbc" */
   CHECK(undo_record("abc", 3, "axbc", 4, 1, -1, 0, 2, -1, 0) == 1);

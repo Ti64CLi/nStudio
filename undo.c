@@ -83,14 +83,14 @@ int undo_record(const char *before, int blen, const char *after, int alen,
   if (old_len > 0) {
     d.old_text = (char *)malloc((size_t)old_len);
     if (!d.old_text)
-      return 0;
+      return -1; /* could not record a real change */
     memcpy(d.old_text, before + pos, (size_t)old_len);
   }
   if (new_len > 0) {
     d.new_text = (char *)malloc((size_t)new_len);
     if (!d.new_text) {
       free(d.old_text);
-      return 0;
+      return -1;
     }
     memcpy(d.new_text, after + pos, (size_t)new_len);
   }

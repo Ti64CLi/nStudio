@@ -43,8 +43,12 @@ void undo_reset(void);
  * Record the transition from `before` to `after`, storing only what differs.
  * Also clears the redo history, since a new edit invalidates it.
  *
- * Returns 1 when an entry was stored, 0 when the two texts are identical (no
- * entry needed) or memory ran out (history is left intact and consistent).
+ * Returns 1 when an entry was stored and 0 when the two texts are identical, so
+ * there was nothing to record.  Returns -1 when the entry could not be stored
+ * for want of memory: the history is left intact but no longer describes the
+ * text, and a caller that went on to apply an older entry would be patching a
+ * buffer that had moved on.  The two zero-ish outcomes are distinguished for
+ * exactly that reason.
  */
 int undo_record(const char *before, int blen, const char *after, int alen,
                 int cursor_before, int anchor_before, int active_before,

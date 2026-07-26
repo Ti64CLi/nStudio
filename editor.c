@@ -552,32 +552,59 @@ static char *buf_snapshot(int *out_len) {
   return nb;
 }
 
-/* Adopt the current buffer as the reference for the next delta. */
-static void undo_mark(void) {
+/* Adopt the current buffer as the reference for the next delta.  Returns 0 if
+   the snapshot could not be taken, in which case g_last still describes an
+   older state and the history no longer lines up with the buffer. */
+static int undo_mark(void) {
   int len;
   char *snap = buf_snapshot(&len);
   if (!snap)
-    return; /* keep the old reference; the next flush simply spans more */
+    return 0;
   free(g_last);
   g_last = snap;
   g_last_len = len;
   g_last_cursor = cursor_pos;
   g_last_anchor = sel_anchor;
   g_last_active = sel_active;
+  return 1;
 }
 
-/* Record whatever has changed since the last mark as one history entry. */
-static void undo_flush(void) {
+/*
+ * Record whatever has changed since the last mark as one history entry.
+ *
+ * Returns 1 while the history still describes the buffer, and 0 once it does
+ * not - the buffer changed but the change could not be stored.  That case must
+ * not be ignored: applying an older entry afterwards would delete bytes at a
+ * position derived from text the buffer no longer holds, corrupting it.
+ */
+static int undo_flush(void) {
   if (!g_last)
-    return;
+    return 1; /* no reference yet, so nothing can be out of step */
+
   int len;
   char *now = buf_snapshot(&len);
   if (!now)
-    return;
-  undo_record(g_last, g_last_len, now, len, g_last_cursor, g_last_anchor,
-              g_last_active, cursor_pos, sel_anchor, sel_active);
+    return 0; /* cannot even tell what changed */
+
+  int rec = undo_record(g_last, g_last_len, now, len, g_last_cursor,
+                        g_last_anchor, g_last_active, cursor_pos, sel_anchor,
+                        sel_active);
   free(now);
-  undo_mark();
+  if (rec < 0)
+    return 0; /* a real change went unrecorded */
+
+  return undo_mark();
+}
+
+static void undo_forget(void);
+
+/* Called when the history can no longer be trusted.  Dropping it costs the
+   user their undo depth; keeping it risks patching the buffer from entries
+   that describe text it no longer holds, which costs them their work. */
+static void undo_history_lost(void) {
+  undo_forget();
+  snprintf(g_diag_status, sizeof(g_diag_status),
+           " Out of memory: undo history cleared");
 }
 
 /* Drop the history entirely (a new file, or leaving the editor). */
@@ -619,11 +646,20 @@ static void undo_apply(int pos, int remove_len, const char *insert,
   diag_nav_reset(); /* the buffer moved; drop stale assemble diagnostics */
   g_build_stale = 1;
 
-  undo_mark(); /* the buffer is now the reference for the next delta */
+  /* The buffer is now the reference for the next delta.  If that cannot be
+     captured, g_last still describes the pre-undo text and the next flush would
+     record the undo itself as an edit, so drop the history instead. */
+  if (!undo_mark())
+    undo_history_lost();
 }
 
 static void do_undo(void) {
-  undo_flush(); /* fold in an edit still in progress */
+  /* Fold in an edit still in progress.  If it could not be recorded the
+     history no longer matches the buffer, so there is nothing safe to apply. */
+  if (!undo_flush()) {
+    undo_history_lost();
+    return;
+  }
   const UndoDelta *d = undo_take_undo();
   if (!d)
     return;
@@ -636,8 +672,12 @@ static void do_redo(void) {
   /* Fold in an edit still in progress first.  If there is one, recording it
      discards the redo path - editing after an undo has always done that - and
      the take below correctly finds nothing.  Skipping this would apply a delta
-     describing a state the buffer no longer holds, corrupting the text. */
-  undo_flush();
+     describing a state the buffer no longer holds, corrupting the text - and so
+     would carrying on after a flush that failed. */
+  if (!undo_flush()) {
+    undo_history_lost();
+    return;
+  }
   const UndoDelta *d = undo_take_redo();
   if (!d)
     return;
@@ -654,10 +694,14 @@ static void undo_checkpoint(UndoKind kind) {
   int coalesce =
       (kind == g_undo_kind) && (kind == UK_INSERT || kind == UK_DELETE);
   if (!coalesce) {
-    if (g_last)
-      undo_flush();
-    else
-      undo_mark(); /* first edit of the session: establish the reference */
+    if (g_last) {
+      if (!undo_flush())
+        undo_history_lost();
+    } else if (!undo_mark()) {
+      /* First edit of the session and no reference could be taken; without one
+         nothing is recorded, so say so rather than fail silently. */
+      undo_history_lost();
+    }
   }
   g_undo_kind = kind;
 }
