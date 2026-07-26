@@ -68,7 +68,15 @@ int undo_record(const char *before, int blen, const char *after, int alen,
                 int cursor_after, int anchor_after, int active_after) {
   int pos, old_len, new_len;
   buf_diff_span(before, blen, after, alen, &pos, &old_len, &new_len);
+  return undo_record_span(pos, before + pos, old_len, after + pos, new_len,
+                          cursor_before, anchor_before, active_before,
+                          cursor_after, anchor_after, active_after);
+}
 
+int undo_record_span(int pos, const char *old_text, int old_len,
+                     const char *new_text, int new_len, int cursor_before,
+                     int anchor_before, int active_before, int cursor_after,
+                     int anchor_after, int active_after) {
   if (old_len == 0 && new_len == 0)
     return 0; /* nothing actually changed */
 
@@ -84,7 +92,7 @@ int undo_record(const char *before, int blen, const char *after, int alen,
     d.old_text = (char *)malloc((size_t)old_len);
     if (!d.old_text)
       return -1; /* could not record a real change */
-    memcpy(d.old_text, before + pos, (size_t)old_len);
+    memcpy(d.old_text, old_text, (size_t)old_len);
   }
   if (new_len > 0) {
     d.new_text = (char *)malloc((size_t)new_len);
@@ -92,7 +100,7 @@ int undo_record(const char *before, int blen, const char *after, int alen,
       free(d.old_text);
       return -1;
     }
-    memcpy(d.new_text, after + pos, (size_t)new_len);
+    memcpy(d.new_text, new_text, (size_t)new_len);
   }
 
   d.cursor_before = cursor_before;

@@ -849,12 +849,52 @@ static void test_fileio(void) {
   unlink(path);
 }
 
+/* buf_diff_span_gap() must agree with buf_diff_span() on the same bytes: it is
+   the version the undo history actually uses, so a divergence would record the
+   wrong span and corrupt the text on undo.  Driven over random edits with the
+   gap parked in a different place each time, since the gap position is exactly
+   what the flat version cannot see. */
+static void test_textdiff_gap(void) {
+  printf("textdiff (gap)\n");
+
+  unsigned seed = 24680u;
+  int mismatches = 0;
+
+  for (int step = 0; step < 3000; step++) {
+    seed = seed * 1103515245u + 12345u;
+
+    char a[64], b[64];
+    int alen = (int)((seed >> 7) % 40u);
+    int blen = (int)((seed >> 13) % 40u);
+    for (int i = 0; i < alen; i++)
+      a[i] = (char)('a' + ((seed >> (i % 13)) & 3));
+    for (int i = 0; i < blen; i++)
+      b[i] = (char)('a' + ((seed >> (i % 11)) & 3));
+
+    GapBuf g;
+    gb_init(&g);
+    gb_insert_n(&g, b, blen);
+    /* park the gap somewhere arbitrary, which is the whole point */
+    gb_move(&g, (int)((seed >> 19) % (unsigned)(blen + 1)));
+
+    int p1, o1, n1, p2, o2, n2;
+    buf_diff_span(a, alen, b, blen, &p1, &o1, &n1);
+    buf_diff_span_gap(a, alen, &g, &p2, &o2, &n2);
+    if (p1 != p2 || o1 != o2 || n1 != n2)
+      mismatches++;
+
+    gb_free(&g);
+  }
+  CHECK(mismatches == 0);
+}
+
 int main(void) {
   test_util();
   test_optab();
   test_gapbuf();
   test_lines_shift();
   test_textdiff();
+  test_textdiff_gap();
   test_undo();
   test_asmdiag();
   test_asmdb();

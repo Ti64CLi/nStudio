@@ -50,6 +50,17 @@ void undo_reset(void);
  * buffer that had moved on.  The two zero-ish outcomes are distinguished for
  * exactly that reason.
  */
+/*
+ * Record an already-computed change: the bytes at [pos, pos+old_len) became
+ * `new_text`.  This is what undo_record() does after diffing, split out so a
+ * caller that derived the span another way - against a gap buffer, say - need
+ * not flatten the whole file to hand it over.  Same return values.
+ */
+int undo_record_span(int pos, const char *old_text, int old_len,
+                     const char *new_text, int new_len, int cursor_before,
+                     int anchor_before, int active_before, int cursor_after,
+                     int anchor_after, int active_after);
+
 int undo_record(const char *before, int blen, const char *after, int alen,
                 int cursor_before, int anchor_before, int active_before,
                 int cursor_after, int anchor_after, int active_after);

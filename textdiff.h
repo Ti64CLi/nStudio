@@ -12,6 +12,9 @@
 #ifndef TEXTDIFF_H_INCLUDED
 #define TEXTDIFF_H_INCLUDED
 
+#include "gapbuf.h" /* for the gap-buffer variant below; gapbuf does not
+                       depend on this header, so there is no cycle */
+
 /*
  * Locate the single region in which `a` (length `alen`) and `b` (length `blen`)
  * differ, by stripping their common prefix and common suffix.
@@ -31,5 +34,19 @@
  */
 void buf_diff_span(const char *a, int alen, const char *b, int blen,
                    int *out_pos, int *out_alen, int *out_blen);
+
+/*
+ * The same comparison with the newer text read straight out of a gap buffer
+ * instead of a flat array.
+ *
+ * The undo history diffs the file against its previous contents after every
+ * edit group.  Flattening the buffer to do so costs an allocation and a full
+ * copy of the file each time, which is the dominant cost of recording an edit
+ * on a large source; reading it in place costs neither.  The result is defined
+ * to be identical to buf_diff_span() on the same bytes, and the tests check
+ * that against the flat version rather than trusting the duplication.
+ */
+void buf_diff_span_gap(const char *a, int alen, const GapBuf *g, int *out_pos,
+                       int *out_alen, int *out_blen);
 
 #endif /* TEXTDIFF_H_INCLUDED */

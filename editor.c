@@ -45,6 +45,7 @@
 #include "gfx.h"
 #include "settings.h"
 #include "syntax.h"
+#include "textdiff.h"
 #include "undo.h"
 #include "util.h"
 
@@ -533,39 +534,75 @@ static void clipboard_paste(void) {
  * recorded as the single entry it should be.
  * ================================================================ */
 
-/* Text as of the last checkpoint, with the editor state from that moment. */
+/*
+ * Text as of the last checkpoint, with the editor state from that moment.
+ *
+ * The buffer is kept across flushes and grown as needed rather than
+ * reallocated each time, and it is patched with the change just recorded
+ * instead of being re-copied from the file.  Recording an edit therefore costs
+ * two scans and one memmove rather than two allocations and two full copies of
+ * the file, without a second file-sized buffer resident to pay for it.
+ */
 static char *g_last;
 static int g_last_len;
+static int g_last_cap;
 static int g_last_cursor, g_last_anchor, g_last_active;
 
-/* Flatten the gap buffer into a fresh array.  Returns NULL on failure. */
-static char *buf_snapshot(int *out_len) {
-  int len = gb_len(&g_buf);
-  char *nb = (char *)malloc((size_t)len + 1);
+static void undo_note_state(void) {
+  g_last_cursor = cursor_pos;
+  g_last_anchor = sel_anchor;
+  g_last_active = sel_active;
+}
+
+/* Make room for `need` bytes plus a terminator.  The existing contents and
+   capacity survive a failure. */
+static int last_reserve(int need) {
+  if (need + 1 <= g_last_cap)
+    return 1;
+  int cap = g_last_cap ? g_last_cap : 1024;
+  while (cap < need + 1) {
+    if (cap > 0x3fffffff)
+      return 0;
+    cap *= 2;
+  }
+  char *nb = (char *)realloc(g_last, (size_t)cap);
   if (!nb)
-    return NULL;
-  memcpy(nb, g_buf.buf, (size_t)g_buf.gap_lo);
-  int after = g_buf.size - g_buf.gap_hi;
-  memcpy(nb + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, (size_t)after);
-  nb[len] = '\0';
-  *out_len = len;
-  return nb;
+    return 0;
+  g_last = nb;
+  g_last_cap = cap;
+  return 1;
 }
 
 /* Adopt the current buffer as the reference for the next delta.  Returns 0 if
    the snapshot could not be taken, in which case g_last still describes an
    older state and the history no longer lines up with the buffer. */
 static int undo_mark(void) {
-  int len;
-  char *snap = buf_snapshot(&len);
-  if (!snap)
+  int len = gb_len(&g_buf);
+  if (!last_reserve(len))
     return 0;
-  free(g_last);
-  g_last = snap;
+  /* The gap buffer is two contiguous runs; copy them rather than byte by byte. */
+  memcpy(g_last, g_buf.buf, (size_t)g_buf.gap_lo);
+  int after = g_buf.size - g_buf.gap_hi;
+  memcpy(g_last + g_buf.gap_lo, g_buf.buf + g_buf.gap_hi, (size_t)after);
+  g_last[len] = '\0';
   g_last_len = len;
-  g_last_cursor = cursor_pos;
-  g_last_anchor = sel_anchor;
-  g_last_active = sel_active;
+  undo_note_state();
+  return 1;
+}
+
+/* Apply the change just recorded to g_last, so it tracks the buffer without
+   being copied from it again. */
+static int last_patch(int pos, int old_len, const char *new_text, int new_len) {
+  int newlen = g_last_len - old_len + new_len;
+  if (!last_reserve(newlen))
+    return 0;
+  memmove(g_last + pos + new_len, g_last + pos + old_len,
+          (size_t)(g_last_len - pos - old_len));
+  if (new_len > 0)
+    memcpy(g_last + pos, new_text, (size_t)new_len);
+  g_last_len = newlen;
+  g_last[newlen] = '\0';
+  undo_note_state();
   return 1;
 }
 
@@ -581,19 +618,30 @@ static int undo_flush(void) {
   if (!g_last)
     return 1; /* no reference yet, so nothing can be out of step */
 
-  int len;
-  char *now = buf_snapshot(&len);
-  if (!now)
-    return 0; /* cannot even tell what changed */
+  /* Compare against the live buffer: no copy of the file is made, and only the
+     span that actually changed is ever handled. */
+  int pos, old_len, new_len;
+  buf_diff_span_gap(g_last, g_last_len, &g_buf, &pos, &old_len, &new_len);
+  if (old_len == 0 && new_len == 0) {
+    undo_note_state(); /* unchanged text, but the cursor may have moved */
+    return 1;
+  }
 
-  int rec = undo_record(g_last, g_last_len, now, len, g_last_cursor,
-                        g_last_anchor, g_last_active, cursor_pos, sel_anchor,
-                        sel_active);
-  free(now);
-  if (rec < 0)
-    return 0; /* a real change went unrecorded */
+  char *nb = NULL;
+  if (new_len > 0) {
+    nb = (char *)malloc((size_t)new_len);
+    if (!nb)
+      return 0;
+    for (int i = 0; i < new_len; i++)
+      nb[i] = gb_get(&g_buf, pos + i);
+  }
 
-  return undo_mark();
+  int rec = undo_record_span(pos, g_last + pos, old_len, nb, new_len,
+                             g_last_cursor, g_last_anchor, g_last_active,
+                             cursor_pos, sel_anchor, sel_active);
+  int ok = (rec >= 0) && last_patch(pos, old_len, nb, new_len);
+  free(nb);
+  return ok;
 }
 
 static void undo_forget(void);
@@ -613,6 +661,7 @@ static void undo_forget(void) {
   free(g_last);
   g_last = NULL;
   g_last_len = 0;
+  g_last_cap = 0;
 }
 
 /* Undo coalescing: consecutive same-kind edits share one entry, so undo
