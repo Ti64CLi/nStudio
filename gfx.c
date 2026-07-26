@@ -951,6 +951,31 @@ void gfx_panel(int x, int y, int w, int h, int title_h) {
     gfx_fillrect(x + 1, y + 1, w - 2, title_h, g_default_theme.title_bg);
 }
 
+/* Scrollbars are 2 pixels thick with a 4-pixel minimum thumb, matching the
+   assembler's scrolling error window so the two programs look like one. */
+
+/* Horizontal scrollbar along the bottom of a panel's list area, for content
+   `total` columns wide with `visible` on screen.  Mirrors gfx_scrollbar_v: same
+   parameters, other axis.  The track stops short of the right edge so it does
+   not run under the vertical bar.  Draws nothing when everything fits. */
+void gfx_scrollbar_h(int panel_x, int panel_w, int list_y, int list_h,
+                     int total, int visible, int scroll) {
+  if (total <= visible)
+    return;
+
+  int track_w = panel_w - 6;
+  int bar_w = track_w * visible / total;
+  if (bar_w < 4)
+    bar_w = 4;
+  int max_scroll = total - visible;
+  int bar_x = panel_x + 1 +
+              (track_w - bar_w) * scroll / (max_scroll > 0 ? max_scroll : 1);
+  int bar_y = list_y + list_h - 4;
+
+  gfx_fillrect(panel_x + 1, bar_y, track_w, 2, g_default_theme.item_bg);
+  gfx_fillrect(bar_x, bar_y, bar_w, 2, g_default_theme.border_light);
+}
+
 /* Vertical scrollbar down the right inside edge of a panel, spanning the list
    area [list_y, list_y + list_h).  `total` items with `visible` on screen and
    the list scrolled to `scroll`.  Draws nothing when everything fits. */
@@ -967,8 +992,8 @@ void gfx_scrollbar_v(int panel_x, int panel_w, int list_y, int list_h,
       list_y + (list_h - bar_h) * scroll / (max_scroll > 0 ? max_scroll : 1);
   int bar_x = panel_x + panel_w - 4;
 
-  gfx_fillrect(bar_x, list_y, 3, list_h, g_default_theme.item_bg);
-  gfx_fillrect(bar_x, bar_y, 3, bar_h, g_default_theme.border_light);
+  gfx_fillrect(bar_x, list_y, 2, list_h, g_default_theme.item_bg);
+  gfx_fillrect(bar_x, bar_y, 2, bar_h, g_default_theme.border_light);
 }
 
 /* --------------------------------------------------------------*/
@@ -1000,6 +1025,36 @@ int gfx_repeat_gate(GfxRepeat *st, int action, int none, int one_shot) {
   if ((st->timer - GFX_REPEAT_DELAY) % GFX_REPEAT_RATE != 0)
     return none;
   return action;
+}
+
+/*
+ * Poll the sideways-scroll keys, paced like the assembler's error window: a
+ * step roughly every 40ms for as long as the key is held.
+ *
+ * These deliberately bypass gfx_repeat_gate, which is tuned for stepping
+ * through menu items - a ~290ms lead-in and then 16 steps a second. That is
+ * right for moving a selection and far too slow for gliding along a line of
+ * text one column at a time. Returns the column delta to apply, or 0 when
+ * neither key is down; `page` is the jump Ctrl makes.
+ *
+ * Only for views that scroll text sideways. The instruction catalog binds
+ * left and right to collapsing its tree and must keep reading them through
+ * gfx_poll_nav.
+ */
+int gfx_poll_hscroll(int page) {
+  int step = isKeyPressed(KEY_NSPIRE_CTRL) ? page : 1;
+
+  if (isKeyPressed(KEY_NSPIRE_LEFT) || isKeyPressed(KEY_NSPIRE_4)) {
+    msleep(40);
+    idle();
+    return -step;
+  }
+  if (isKeyPressed(KEY_NSPIRE_RIGHT) || isKeyPressed(KEY_NSPIRE_6)) {
+    msleep(40);
+    idle();
+    return step;
+  }
+  return 0;
 }
 
 NavAction gfx_poll_nav(void) {
@@ -1092,8 +1147,8 @@ static int gfx_popup_dropdown(int dx, int dy, int dw, const char **opts,
           bar_h = 4;
         int bar_y =
             sb_y_start + ((sb_total_h - bar_h) * scroll) / (nopts - max_vis);
-        gfx_fillrect(sb_x, sb_y_start, 4, sb_total_h, th->item_bg);
-        gfx_fillrect(sb_x, bar_y, 4, bar_h, th->border_light);
+        gfx_fillrect(sb_x, sb_y_start, 2, sb_total_h, th->item_bg);
+        gfx_fillrect(sb_x, bar_y, 2, bar_h, th->border_light);
       }
       gfx_flip();
       redraw = 0;

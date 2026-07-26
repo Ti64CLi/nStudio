@@ -535,7 +535,7 @@ void syscall_show_desc(const SyscallInfo *si) {
         redraw = 1;
       }
     } else if (nav == NAV_RIGHT) {
-      hscroll += ctrl ? visible_cols : 8;
+      hscroll += ctrl ? visible_cols : 1;
       redraw = 1;
     }
   }
@@ -598,18 +598,9 @@ static void syscall_draw(int sel, int scroll, int hscroll, int max_hscroll,
   gfx_scrollbar_v(CAT_WIN_X, CAT_WIN_W, CAT_LIST_Y, CAT_LIST_H, g_nsyscalls,
                   CAT_ROWS_VIS, scroll);
 
-  if (max_hscroll > 0) {
-    int bar_total_w = CAT_WIN_W - 6; /* Leave space for vertical scrollbar */
-    int bar_w = bar_total_w * visible_cols / total_cols;
-    if (bar_w < 8)
-      bar_w = 8;
-    int bar_x = CAT_WIN_X + 1 + (bar_total_w - bar_w) * hscroll / max_hscroll;
-    int bar_y = CAT_LIST_Y + CAT_LIST_H -
-                4; /* Position at the very bottom of the list */
-
-    gfx_fillrect(CAT_WIN_X + 1, bar_y, bar_total_w, 4, g_default_theme.item_bg);
-    gfx_fillrect(bar_x, bar_y, bar_w, 4, BORDER);
-  }
+  (void)max_hscroll; /* the bar derives its own extent from total/visible */
+  gfx_scrollbar_h(CAT_WIN_X, CAT_WIN_W, CAT_LIST_Y, CAT_LIST_H, total_cols,
+                  visible_cols, hscroll);
 
   int hy = CAT_WIN_Y + CAT_WIN_H - CAT_HINT_H - 1;
   gfx_hline(CAT_WIN_X + 1, hy, CAT_WIN_W - 2, BORDER);
@@ -645,6 +636,21 @@ const SyscallInfo *syscall_pick(void) {
   syscall_draw(sel, scroll, hscroll, max_hscroll, total_cols, visible_cols);
 
   for (;;) {
+    /* Sideways scrolling at the same glide as the diagnostics list. */
+    if (max_hscroll > 0) {
+      int dx = gfx_poll_hscroll(visible_cols);
+      if (dx) {
+        hscroll += dx;
+        if (hscroll < 0)
+          hscroll = 0;
+        if (hscroll > max_hscroll)
+          hscroll = max_hscroll;
+        syscall_draw(sel, scroll, hscroll, max_hscroll, total_cols,
+                     visible_cols);
+        continue;
+      }
+    }
+
     NavAction nav = gfx_poll_nav();
     if (nav == NAV_NONE) {
       msleep(16);
@@ -696,18 +702,6 @@ const SyscallInfo *syscall_pick(void) {
           if (sel >= scroll + CAT_ROWS_VIS)
             scroll = sel - CAT_ROWS_VIS + 1;
         }
-      }
-    } else if (nav == NAV_LEFT) {
-      if (hscroll > 0) {
-        hscroll -= ctrl ? visible_cols : 8;
-        if (hscroll < 0)
-          hscroll = 0;
-      }
-    } else if (nav == NAV_RIGHT) {
-      if (hscroll < max_hscroll) {
-        hscroll += ctrl ? visible_cols : 8;
-        if (hscroll > max_hscroll)
-          hscroll = max_hscroll;
       }
     } else if (nav == NAV_ENTER) {
       if (shift) {
@@ -1022,7 +1016,7 @@ int label_pick(const LabelEntry *labels, int n, int cur_line) {
 
 static void list_draw(const char *title, const char *const *rows,
                       const char *actionable, int n, int sel, int scroll,
-                      int hscroll, const char *hint) {
+                      int hscroll, int longest, const char *hint) {
   const uint16_t BG = g_default_theme.bg;
   const uint16_t FG = g_default_theme.fg;
   const uint16_t DIM = g_default_theme.border_light;
@@ -1060,6 +1054,8 @@ static void list_draw(const char *title, const char *const *rows,
 
   gfx_scrollbar_v(LP_WIN_X, LP_WIN_W, LP_LIST_Y, LP_LIST_H, n, LP_ROWS_VIS,
                   scroll);
+  gfx_scrollbar_h(LP_WIN_X, LP_WIN_W, LP_LIST_Y, LP_LIST_H, longest,
+                  LP_VIS_COLS, hscroll);
 
   int hy = LP_WIN_Y + LP_WIN_H - LP_HINT_H - 1;
   gfx_hline(LP_WIN_X + 1, hy, LP_WIN_W - 2, g_default_theme.border_light);
@@ -1092,9 +1088,25 @@ int list_pick(const char *title, const char *const *rows,
 
   while (any_key_pressed())
     msleep(20);
-  list_draw(title, rows, actionable, n, sel, scroll, hscroll, hint);
+  list_draw(title, rows, actionable, n, sel, scroll, hscroll, longest, hint);
 
   for (;;) {
+    /* Sideways scrolling is polled first and at its own pace, so holding the
+       key glides along the text instead of stepping at the menu rate. */
+    if (max_hscroll > 0) {
+      int dx = gfx_poll_hscroll(LP_VIS_COLS);
+      if (dx) {
+        hscroll += dx;
+        if (hscroll < 0)
+          hscroll = 0;
+        if (hscroll > max_hscroll)
+          hscroll = max_hscroll;
+        list_draw(title, rows, actionable, n, sel, scroll, hscroll, longest,
+                  hint);
+        continue;
+      }
+    }
+
     NavAction nav = gfx_poll_nav();
     if (nav == NAV_NONE) {
       msleep(16);
@@ -1118,15 +1130,6 @@ int list_pick(const char *title, const char *const *rows,
         if (sel >= scroll + LP_ROWS_VIS)
           scroll = sel - LP_ROWS_VIS + 1;
       }
-    } else if (nav == NAV_LEFT) {
-      /* Ctrl jumps a windowful, matching the syscall catalog. */
-      hscroll -= isKeyPressed(KEY_NSPIRE_CTRL) ? LP_VIS_COLS : 8;
-      if (hscroll < 0)
-        hscroll = 0;
-    } else if (nav == NAV_RIGHT) {
-      hscroll += isKeyPressed(KEY_NSPIRE_CTRL) ? LP_VIS_COLS : 8;
-      if (hscroll > max_hscroll)
-        hscroll = max_hscroll;
     } else if (nav == NAV_ENTER) {
       while (any_key_pressed())
         msleep(20);
@@ -1134,6 +1137,6 @@ int list_pick(const char *title, const char *const *rows,
         return -1; /* nothing to act on */
       return sel;
     }
-    list_draw(title, rows, actionable, n, sel, scroll, hscroll, hint);
+    list_draw(title, rows, actionable, n, sel, scroll, hscroll, longest, hint);
   }
 }

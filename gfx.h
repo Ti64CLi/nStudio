@@ -89,6 +89,11 @@ void gfx_panel(int x, int y, int w, int h, int title_h);
 void gfx_scrollbar_v(int panel_x, int panel_w, int list_y, int list_h,
                      int total, int visible, int scroll);
 
+/* Horizontal scrollbar along the bottom of that same area, for content `total`
+   columns wide.  Same parameters as the vertical one, other axis. */
+void gfx_scrollbar_h(int panel_x, int panel_w, int list_y, int list_h,
+                     int total, int visible, int scroll);
+
 /* ------------------------------------------------------------------ */
 /* Legacy Utility Windows                                             */
 /* ------------------------------------------------------------------ */
@@ -119,6 +124,12 @@ typedef enum {
 } NavAction;
 
 NavAction gfx_poll_nav(void);
+
+/* Poll the sideways-scroll keys with the assembler's pacing (about a step
+   every 40ms while held), bypassing the slower menu repeat.  Returns the
+   column delta, or 0.  `page` is the jump Ctrl makes.  Not for views whose
+   left/right keys mean something else. */
+int gfx_poll_hscroll(int page);
 
 /* Shared auto-repeat state/gate (used by gfx_poll_nav, text inputs and
    the editor's key loop). */
