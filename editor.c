@@ -41,6 +41,7 @@
 #include "editor_ui.h"
 #include "fileio.h"
 #include "gapbuf.h"
+#include "optab.h"
 #include "gfx.h"
 #include "settings.h"
 #include "syntax.h"
@@ -130,18 +131,34 @@ static void scroll_to_cursor(void) {
  *
  * Anything that moves the cursor somewhere the user did not navigate to by
  * hand - a label definition, a browser pick, go-to-line, a diagnostic's
- * related location - first records where they were, so they can step back
- * the way they came.  Positions are logical offsets and are clamped when
- * popped, so editing after a jump leaves them approximate rather than wrong;
- * that is friendlier than discarding the trail on every keystroke.
+ * related location, following an INCLUDE - first records where they were, so
+ * they can step back the way they came.  Each mark carries its file as well as
+ * its offset, so a jump that opened another file is walked back the same way
+ * as one inside a single buffer, reopening what it left.
+ *
+ * Offsets are clamped when popped, so editing after a jump leaves them
+ * approximate rather than wrong; that is friendlier than discarding the trail
+ * on every keystroke.  Choosing a file in the browser does discard it, being a
+ * decision to work elsewhere rather than a step in a trail.
  *
  * Error cycling (Ctrl+N / Ctrl+P) deliberately does not push: it already
  * moves in both directions, and recording each step would bury the position
  * the user actually wants to come back to.
  * ================================================================ */
+/* Path of the file in the buffer; the jump trail below records it per mark. */
+static char g_filepath[512];
+
 #define JUMP_STACK_MAX 16
 
-static int g_jump_stack[JUMP_STACK_MAX];
+/* A place to come back to.  The file is recorded as well as the offset, so a
+   jump that opened another file - following an INCLUDE - can be walked back
+   just like one inside a single buffer. */
+typedef struct {
+  char path[512];
+  int pos;
+} JumpMark;
+
+static JumpMark g_jump_stack[JUMP_STACK_MAX];
 static int g_jump_count;
 
 /* Remember the current position as a place to come back to. */
@@ -152,7 +169,10 @@ static void jump_push(void) {
             sizeof(g_jump_stack[0]) * (JUMP_STACK_MAX - 1));
     g_jump_count--;
   }
-  g_jump_stack[g_jump_count++] = cursor_pos;
+  JumpMark *m = &g_jump_stack[g_jump_count++];
+  strncpy(m->path, g_filepath, sizeof(m->path) - 1);
+  m->path[sizeof(m->path) - 1] = '\0';
+  m->pos = cursor_pos;
 }
 
 static void jump_stack_clear(void) { g_jump_count = 0; }
@@ -160,7 +180,6 @@ static void jump_stack_clear(void) { g_jump_count = 0; }
 /* ================================================================
  * File I/O
  * ================================================================ */
-static char g_filepath[512];
 static int g_modified;
 static int g_saved; /* set once any save succeeds during this editor session */
 static int g_readonly; /* file opened read-only (not an asm source) */
@@ -2028,6 +2047,34 @@ static void editor_cheatsheet(void) {
 static int prompt_unsaved(void);
 static int editor_do_save(void);
 
+/* Replace the buffer with `path`, discarding everything that described the
+   previous file: cursor, selection, undo history, jump trail, diagnostics and
+   the build's currency.  Callers are responsible for offering to save first. */
+static void editor_switch_to(const char *path) {
+  settings_remember_file_dir(path);
+
+  strncpy(g_filepath, path, sizeof(g_filepath) - 1);
+  g_filepath[sizeof(g_filepath) - 1] = '\0';
+  gb_free(&g_buf);
+  load_file(g_filepath);
+  cursor_pos = 0;
+  cursor_row = 0;
+  cursor_col = 0;
+  cursor_goal_col = 0;
+  scroll_row = 0;
+  scroll_col = 0;
+  sel_anchor = SEL_NONE;
+  sel_active = 0;
+  undo_forget();
+  g_build_stale = 0;
+  g_modified = 0;
+  g_readonly = !path_is_asm_source(g_filepath);
+  diag_nav_reset();
+  /* The jump trail is deliberately not cleared here: it records the file each
+     mark belongs to, so it survives following an INCLUDE.  Callers that mean
+     to abandon it say so. */
+}
+
 static void editor_open_file(void) {
   if (g_modified) {
     int choice = prompt_unsaved();
@@ -2052,28 +2099,8 @@ static void editor_open_file(void) {
   if (!browser_pick_file(start_dir, 1, newpath, sizeof(newpath)))
     return;
 
-  settings_remember_file_dir(newpath);
-
-  strncpy(g_filepath, newpath, sizeof(g_filepath) - 1);
-  g_filepath[sizeof(g_filepath) - 1] = '\0';
-  gb_free(&g_buf);
-  load_file(g_filepath);
-  cursor_pos = 0;
-  cursor_row = 0;
-  cursor_col = 0;
-  cursor_goal_col = 0;
-  scroll_row = 0;
-  scroll_col = 0;
-  sel_anchor = SEL_NONE;
-  sel_active = 0;
-  undo_forget();
-  /* A different buffer: whatever was built before says nothing about it. */
-  g_build_stale = 0;
-  jump_stack_clear(); /* the trail belonged to the previous file */
-  g_modified = 0;
-  g_readonly = !path_is_asm_source(g_filepath);
-  /* The retained diagnostics describe the previous buffer, not this one. */
-  diag_nav_reset();
+  editor_switch_to(newpath);
+  jump_stack_clear(); /* picking a file is starting elsewhere, not navigating */
 }
 
 /* Save As: pick a directory, then enter a filename; saves as dir/name.tns.
@@ -2276,6 +2303,145 @@ static int editor_label_browser(void) {
  * ================================================================ */
 
 
+/* ================================================================
+ * Follow an INCLUDE
+ *
+ * nasm resolves an INCLUDE against the directory of the file containing it
+ * and takes the operand verbatim - it appends no extension - so on the
+ * calculator the directive names the file in full, ".tns" and all.  The
+ * resolution below mirrors nasm's abspath(): absolute paths stand, "./" is
+ * skipped and each leading "../" climbs one directory.
+ * ================================================================ */
+
+/* If the current line is an INCLUDE (or GET), copy its operand into `out`.
+   Returns its length, or 0 when this is not an include line. */
+static int include_operand(char *out, int outsz) {
+  extract_line(cursor_row);
+  const char *line = line_scratch;
+  int len = (int)strlen(line);
+
+  int i = 0;
+  while (i < len && (line[i] == ' ' || line[i] == '\t'))
+    i++;
+  int ds = i;
+  while (i < len && (isalnum((unsigned char)line[i]) || line[i] == '_'))
+    i++;
+  int dlen = i - ds;
+  if (dlen == 0 || dlen >= 16)
+    return 0;
+
+  char directive[16];
+  memcpy(directive, line + ds, (size_t)dlen);
+  directive[dlen] = '\0';
+  if (!is_preasm_directive(directive))
+    return 0; /* INCLUDE and GET, as optab defines them */
+
+  while (i < len && (line[i] == ' ' || line[i] == '\t'))
+    i++;
+  int os = i;
+  while (i < len && line[i] != ';' && line[i] != '\t')
+    i++;
+  int olen = i - os;
+  while (olen > 0 && line[os + olen - 1] == ' ') /* trim trailing spaces */
+    olen--;
+
+  if (olen <= 0 || olen >= outsz)
+    return 0;
+  memcpy(out, line + os, (size_t)olen);
+  out[olen] = '\0';
+  return olen;
+}
+
+/* Resolve `rel` against the open file's directory, as nasm's abspath does.
+   Returns 0 if the result would not fit, rather than silently forming a
+   truncated path that would then be reported as missing. */
+static int resolve_include_path(const char *rel, char *out, int outsz) {
+  if (rel[0] == '/') { /* already absolute */
+    if ((int)strlen(rel) >= outsz)
+      return 0;
+    strncpy(out, rel, (size_t)outsz - 1);
+    out[outsz - 1] = '\0';
+    return 1;
+  }
+
+  char dir[1024];
+  strncpy(dir, g_filepath, sizeof(dir) - 1);
+  dir[sizeof(dir) - 1] = '\0';
+  char *slash = strrchr(dir, '/');
+  if (slash)
+    slash[1] = '\0'; /* keep the trailing slash, as nasm does */
+  else
+    dir[0] = '\0';
+
+  while (*rel) {
+    if (rel[0] == '.' && rel[1] == '/') {
+      rel += 2;
+      continue;
+    }
+    if (rel[0] == '.' && rel[1] == '.' && rel[2] == '/') {
+      /* Climb one directory: drop the trailing slash, then the last name. */
+      int dl = (int)strlen(dir);
+      if (dl > 0 && dir[dl - 1] == '/')
+        dir[--dl] = '\0';
+      char *up = strrchr(dir, '/');
+      if (up)
+        up[1] = '\0';
+      else
+        dir[0] = '\0';
+      rel += 3;
+      continue;
+    }
+    break;
+  }
+
+  int dl = (int)strlen(dir), rl = (int)strlen(rel);
+  if (dl + rl >= outsz)
+    return 0;
+  memcpy(out, dir, (size_t)dl);
+  memcpy(out + dl, rel, (size_t)rl + 1); /* copies the terminator too */
+  return 1;
+}
+
+/* Open the file an INCLUDE line names.  Returns 1 when this was an include
+   line, whether or not the file could be opened, so the caller knows the line
+   was handled. */
+static int editor_follow_include(void) {
+  char operand[256];
+  if (include_operand(operand, sizeof(operand)) == 0)
+    return 0;
+
+  char path[1024];
+  if (!resolve_include_path(operand, path, sizeof(path))) {
+    static const char *body[] = {"That include path is too long to open."};
+    gfx_window_alert("Follow Include", body, 1, "OK");
+    return 1;
+  }
+
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    char l1[sizeof(path) + 16]; /* the dialog clips it to the window */
+    snprintf(l1, sizeof(l1), "Not found: %s", path);
+    const char *body[] = {l1, "INCLUDE is resolved next to this file,",
+                          "and the name must include its extension."};
+    gfx_window_alert("Follow Include", body, 3, "OK");
+    return 1;
+  }
+
+  if (g_modified) {
+    int choice = prompt_unsaved();
+    if (choice == 1) {
+      if (!editor_do_save())
+        return 1; /* save failed or cancelled: stay put */
+    } else if (choice == 0) {
+      return 1;
+    }
+  }
+
+  jump_push(); /* so Ctrl+Shift+Enter comes back to this line */
+  editor_switch_to(path);
+  return 1;
+}
+
 /* Copy the identifier the cursor sits on (or just after) into `out`.
    Returns its length, or 0 when the cursor is not on one. */
 static int word_under_cursor(char *out, int outsz) {
@@ -2325,6 +2491,11 @@ static int jump_to_label_named(const char *name) {
  * an operand of any instruction, not only B/BL/BX.
  */
 static void editor_jump_to_label(void) {
+  /* An INCLUDE line refers to a file rather than a label, and following it is
+     the same gesture, so Ctrl+Enter opens it. */
+  if (editor_follow_include())
+    return;
+
   extract_line(cursor_row);
   const char *line = line_scratch;
   int len = (int)strlen(line);
@@ -2386,15 +2557,40 @@ static void editor_jump_to_label(void) {
   }
 }
 
-/* Step back to the position before the last jump (Ctrl+Shift+Enter). */
+/* Step back to the position before the last jump (Ctrl+Shift+Enter), reopening
+   the file it was in when the jump crossed into another one. */
 static void editor_jump_back(void) {
   if (g_jump_count == 0) {
     snprintf(g_diag_status, sizeof(g_diag_status), " Nowhere to jump back to");
     return;
   }
-  int pos = g_jump_stack[--g_jump_count];
+
+  JumpMark mark = g_jump_stack[g_jump_count - 1];
+
+  if (mark.path[0] && strcmp(mark.path, g_filepath) != 0) {
+    struct stat st;
+    if (stat(mark.path, &st) != 0) {
+      /* Gone since we left it; drop the mark rather than fail repeatedly. */
+      g_jump_count--;
+      snprintf(g_diag_status, sizeof(g_diag_status), " %s is no longer there",
+               asmdiag_base_name(mark.path));
+      return;
+    }
+    if (g_modified) {
+      int choice = prompt_unsaved();
+      if (choice == 1) {
+        if (!editor_do_save())
+          return; /* save failed or cancelled: keep the mark and stay */
+      } else if (choice == 0) {
+        return;
+      }
+    }
+    editor_switch_to(mark.path);
+  }
+
+  g_jump_count--; /* only consume the mark once the move is certain */
   int len = gb_len(&g_buf);
-  cursor_pos = pos > len ? len : pos; /* edits may have shortened the buffer */
+  cursor_pos = mark.pos > len ? len : mark.pos; /* the file may have shrunk */
   cursor_sync_pos();
   scroll_to_cursor();
 }
