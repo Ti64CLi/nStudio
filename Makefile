@@ -14,7 +14,7 @@ else
 	GCCFLAGS += -O0 -g
 endif
 
-SRCS = nstudio.c gfx.c editor.c settings.c gapbuf.c syntax.c asmdb.c browser.c optab.c util.c asmdiag.c fileio.c
+SRCS = nstudio.c gfx.c editor.c editor_ui.c settings.c gapbuf.c syntax.c asmdb.c browser.c optab.c util.c asmdiag.c fileio.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 EXE = nstudio
