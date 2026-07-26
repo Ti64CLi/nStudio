@@ -18,7 +18,7 @@ nStudio is an ARM assembly editor for the TI-Nspire CX and CX II calculators run
 * **Assemble & Run**: Invoke the `nasm` assembler on the current file directly from the editor (Ctrl+B), if its path is configured in Settings. A successful build offers to run the resulting program straight away, and **Ctrl+R** re-runs it later without reassembling (warning first if the source has changed since). When assembly fails, nStudio reads nasm's structured diagnostics and jumps the cursor to the first error in the current file, showing the message in the status bar; **Ctrl + N / Ctrl + P** then step through the remaining errors. Errors inside `INCLUDE`d files are reported in place, naming the file that included them, and **Ctrl + D** shows the full diagnostic with its include chain and related locations ("previously defined here"), which can be jumped to.
 * **File browser**: Navigate the Ndless filesystem to open existing files and save your work.
 * **Instruction & syscall catalogs**: Offline reference for ARM instructions (signatures, descriptions, CPSR flag effects) and the full Ndless syscall list; insert or view details in place.
-* **Navigation**: Jump to a specific line, browse all defined labels, or jump straight to a branch target.
+* **Navigation**: Jump to a specific line, browse all defined labels, or go to a label's definition from any reference to it. Every jump is remembered, so **Ctrl + Shift + Enter** retraces your steps.
 * **Themes**: Dark and Light presets, or a custom color scheme, including the three colors that bracket pairs cycle through by nesting depth. Settings are shared with the `nasm` assembler.
 * **Character map**: Insert special symbols that are not on the physical keypad.
 
@@ -49,7 +49,8 @@ nStudio is an ARM assembly editor for the TI-Nspire CX and CX II calculators run
 * **Ctrl + F / Ctrl + H**: Search / Replace
 * **Ctrl + G**: Go to Line
 * **Ctrl + L**: Label Browser
-* **Ctrl + Enter**: Jump to the label under a `B`/`BL`/`BX` branch
+* **Ctrl + Enter**: Go to a label's definition — the target of a `B`/`BL`/`BX` branch, or the identifier under the cursor on any other line
+* **Ctrl + Shift + Enter**: Jump back to where you were before the last jump (definition, label browser, go-to-line or a diagnostic's related location)
 * **Ctrl + B**: Assemble with `nasm` (offers to run the result on success)
 * **Ctrl + R**: Run the program already built from this file, without reassembling
 * **Ctrl + N / Ctrl + P**: Jump to the next / previous assemble error (wraps around; any edit clears the list)

@@ -126,6 +126,38 @@ static void scroll_to_cursor(void) {
 }
 
 /* ================================================================
+ * Jump-back stack
+ *
+ * Anything that moves the cursor somewhere the user did not navigate to by
+ * hand - a label definition, a browser pick, go-to-line, a diagnostic's
+ * related location - first records where they were, so they can step back
+ * the way they came.  Positions are logical offsets and are clamped when
+ * popped, so editing after a jump leaves them approximate rather than wrong;
+ * that is friendlier than discarding the trail on every keystroke.
+ *
+ * Error cycling (Ctrl+N / Ctrl+P) deliberately does not push: it already
+ * moves in both directions, and recording each step would bury the position
+ * the user actually wants to come back to.
+ * ================================================================ */
+#define JUMP_STACK_MAX 16
+
+static int g_jump_stack[JUMP_STACK_MAX];
+static int g_jump_count;
+
+/* Remember the current position as a place to come back to. */
+static void jump_push(void) {
+  if (g_jump_count == JUMP_STACK_MAX) {
+    /* Full: drop the oldest so the most recent trail is the one kept. */
+    memmove(g_jump_stack, g_jump_stack + 1,
+            sizeof(g_jump_stack[0]) * (JUMP_STACK_MAX - 1));
+    g_jump_count--;
+  }
+  g_jump_stack[g_jump_count++] = cursor_pos;
+}
+
+static void jump_stack_clear(void) { g_jump_count = 0; }
+
+/* ================================================================
  * File I/O
  * ================================================================ */
 static char g_filepath[512];
@@ -1072,6 +1104,7 @@ static void render_all(void) {
 #define ACT_DIAG_PREV (-52)
 #define ACT_DIAG_DETAIL (-53)
 #define ACT_RUN (-54)
+#define ACT_JUMP_BACK (-55)
 
 /* Whether an action counts as a buffer edit for undo-coalescing: a run of
    same-kind edits shares one undo group and any non-edit action ends the
@@ -1129,8 +1162,11 @@ static int poll_key(void) {
   int shift = isKeyPressed(KEY_NSPIRE_SHIFT);
   int ctrl = isKeyPressed(KEY_NSPIRE_CTRL);
 
-  if (isKeyPressed(KEY_NSPIRE_ENTER))
+  if (isKeyPressed(KEY_NSPIRE_ENTER)) {
+    if (ctrl && shift)
+      return ACT_JUMP_BACK;
     return ctrl ? ACT_JUMP_LABEL : ACT_ENTER;
+  }
   if (isKeyPressed(KEY_NSPIRE_ESC))
     return ACT_ESC;
   if (isKeyPressed(KEY_NSPIRE_TAB))
@@ -2027,6 +2063,7 @@ static void editor_open_file(void) {
   undo_forget();
   /* A different buffer: whatever was built before says nothing about it. */
   g_build_stale = 0;
+  jump_stack_clear(); /* the trail belonged to the previous file */
   g_modified = 0;
   g_readonly = !path_is_asm_source(g_filepath);
   /* The retained diagnostics describe the previous buffer, not this one. */
@@ -2132,6 +2169,7 @@ static void editor_goto_line(void) {
     ln = 1;
   if (ln > num_lines)
     ln = num_lines;
+  jump_push();
   cursor_row = ln - 1;
   cursor_col = 0;
   cursor_sync_rowcol();
@@ -2211,6 +2249,7 @@ static int editor_label_browser(void) {
   if (sel < 0)
     return 0;
 
+  jump_push();
   cursor_row = g_labels[sel].line;
   cursor_col = 0;
   cursor_sync_rowcol();
@@ -2231,6 +2270,53 @@ static int editor_label_browser(void) {
  * ================================================================ */
 
 
+/* Copy the identifier the cursor sits on (or just after) into `out`.
+   Returns its length, or 0 when the cursor is not on one. */
+static int word_under_cursor(char *out, int outsz) {
+  extract_line(cursor_row);
+  const char *line = line_scratch;
+  int len = (int)strlen(line);
+  int col = cursor_col > len ? len : cursor_col;
+
+  int ws = col;
+  while (ws > 0 && (isalnum((unsigned char)line[ws - 1]) || line[ws - 1] == '_'))
+    ws--;
+  int we = col;
+  while (we < len && (isalnum((unsigned char)line[we]) || line[we] == '_'))
+    we++;
+
+  int wlen = we - ws;
+  if (wlen <= 0 || wlen >= outsz)
+    return 0;
+  memcpy(out, line + ws, (size_t)wlen);
+  out[wlen] = '\0';
+  return wlen;
+}
+
+/* Move to the definition of `name`, remembering where we came from.
+   Returns 1 when the label exists. */
+static int jump_to_label_named(const char *name) {
+  labels_scan();
+  int target = label_find(name);
+  if (target < 0)
+    return 0;
+
+  jump_push();
+  cursor_row = target;
+  cursor_col = 0;
+  cursor_sync_rowcol();
+  scroll_to_cursor();
+  return 1;
+}
+
+/*
+ * Go to the definition of a label (Ctrl+Enter).
+ *
+ * On a branch instruction the target is its operand, so the cursor can sit
+ * anywhere on the line - that is how this has always worked.  Anywhere else
+ * the identifier under the cursor is used, which makes the shortcut useful on
+ * an operand of any instruction, not only B/BL/BX.
+ */
 static void editor_jump_to_label(void) {
   extract_line(cursor_row);
   const char *line = line_scratch;
@@ -2239,61 +2325,70 @@ static void editor_jump_to_label(void) {
   int i = 0;
   while (i < len && (line[i] == ' ' || line[i] == '\t'))
     i++;
-
   int mstart = i;
   while (i < len && (isalnum((unsigned char)line[i]) || line[i] == '_'))
     i++;
   int mlen = i - mstart;
 
-  if (mlen == 0 || !is_branch_base(line + mstart, mlen)) {
-    static const char *body[] = {"This line is not a branch instruction.",
-                                 "Place the cursor on a B/BL/BX line."};
-    gfx_window_alert("Not a Branch", body, 2, "OK");
-    return;
+  char name[MAX_LABEL_LEN];
+  int nlen = 0;
+
+  if (mlen > 0 && is_branch_base(line + mstart, mlen)) {
+    /* Branch line: follow its operand. */
+    while (i < len && (line[i] == ' ' || line[i] == '\t'))
+      i++;
+    int ostart = i;
+    while (i < len && line[i] != ' ' && line[i] != '\t' && line[i] != ',' &&
+           line[i] != ';')
+      i++;
+    int olen = i - ostart;
+
+    if (olen == 0) {
+      static const char *body[] = {
+          "No operand found on this branch instruction."};
+      gfx_window_alert("No Operand", body, 1, "OK");
+      return;
+    }
+    if (olen >= MAX_LABEL_LEN)
+      olen = MAX_LABEL_LEN - 1;
+    memcpy(name, line + ostart, (size_t)olen);
+    name[olen] = '\0';
+    nlen = olen;
+
+    if (syn_is_reg(name, nlen)) {
+      static const char *body[] = {"This branch uses a register operand,",
+                                   "not a label, cannot jump to definition."};
+      gfx_window_alert("Register Branch", body, 2, "OK");
+      return;
+    }
+  } else {
+    nlen = word_under_cursor(name, sizeof(name));
+    if (nlen == 0) {
+      static const char *body[] = {"Place the cursor on a label name,",
+                                   "or on a B/BL/BX line, and try again."};
+      gfx_window_alert("Go to Definition", body, 2, "OK");
+      return;
+    }
   }
 
-  while (i < len && (line[i] == ' ' || line[i] == '\t'))
-    i++;
-
-  int ostart = i;
-  while (i < len && line[i] != ' ' && line[i] != '\t' && line[i] != ',' &&
-         line[i] != ';' && line[i] != '\0')
-    i++;
-  int olen = i - ostart;
-
-  if (olen == 0) {
-    static const char *body[] = {
-        "No operand found on this branch instruction."};
-    gfx_window_alert("No Operand", body, 1, "OK");
-    return;
-  }
-
-  char opbuf[MAX_LABEL_LEN];
-  if (olen >= MAX_LABEL_LEN)
-    olen = MAX_LABEL_LEN - 1;
-  strncpy(opbuf, line + ostart, olen);
-  opbuf[olen] = '\0';
-
-  if (syn_is_reg(opbuf, olen)) {
-    static const char *body[] = {"This branch uses a register operand,",
-                                 "not a label, cannot jump to definition."};
-    gfx_window_alert("Register Branch", body, 2, "OK");
-    return;
-  }
-
-  labels_scan();
-  int target = label_find(opbuf);
-  if (target < 0) {
+  if (!jump_to_label_named(name)) {
     char msg[128];
-    snprintf(msg, sizeof(msg), "Label \"%s\" not found in this file.", opbuf);
+    snprintf(msg, sizeof(msg), "Label \"%s\" not found in this file.", name);
     const char *body[1] = {msg};
     gfx_window_alert("Label Not Found", body, 1, "OK");
+  }
+}
+
+/* Step back to the position before the last jump (Ctrl+Shift+Enter). */
+static void editor_jump_back(void) {
+  if (g_jump_count == 0) {
+    snprintf(g_diag_status, sizeof(g_diag_status), " Nowhere to jump back to");
     return;
   }
-
-  cursor_row = target;
-  cursor_col = 0;
-  cursor_sync_rowcol();
+  int pos = g_jump_stack[--g_jump_count];
+  int len = gb_len(&g_buf);
+  cursor_pos = pos > len ? len : pos; /* edits may have shortened the buffer */
+  cursor_sync_pos();
   scroll_to_cursor();
 }
 
@@ -2743,6 +2838,7 @@ static void editor_diag_detail(void) {
       while (any_key_pressed())
         msleep(20);
       if (diag_related_reachable(r)) {
+        jump_push();
         editor_goto_line_col(r->line, r->col);
         snprintf(g_diag_status, sizeof(g_diag_status), " %s, line %d: %s",
                  asmdiag_base_name(r->file), r->line, r->message);
@@ -3232,6 +3328,7 @@ int editor_open(const char *path) {
   undo_forget();
   /* A different buffer: whatever was built before says nothing about it. */
   g_build_stale = 0;
+  jump_stack_clear(); /* the trail belonged to the previous file */
 
   render_all();
 
@@ -3461,6 +3558,9 @@ int editor_open(const char *path) {
 
     case ACT_JUMP_LABEL:
       editor_jump_to_label();
+      break;
+    case ACT_JUMP_BACK:
+      editor_jump_back();
       break;
 
     case ACT_CHEATSHEET:
