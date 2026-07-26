@@ -15,7 +15,7 @@ nStudio is an ARM assembly editor for the TI-Nspire CX and CX II calculators run
 * **Editing**: Undo/redo (coalesced by word), cut/copy/paste, select all, block indent/outdent, and search / replace (with case toggle and Replace All).
 * **Line Endings**: Detects and preserves **LF** or **CRLF**; the current mode is shown in the status bar and can be toggled from the File menu.
 * **Read-only Guard**: Files that do not match your ASM source extension open read-only (shown as `[RO]`); the first edit asks before enabling editing, so binaries are never accidentally corrupted.
-* **Assemble**: Invoke the `nasm` assembler on the current file directly from the editor (Ctrl+B), if its path is configured in Settings. When assembly fails, nStudio reads nasm's structured diagnostics and jumps the cursor to the first error in the current file, showing the message in the status bar; **Ctrl + N / Ctrl + P** then step through the remaining errors. Errors inside `INCLUDE`d files are reported in place, naming the file that included them, and **Ctrl + D** shows the full diagnostic with its include chain and related locations ("previously defined here"), which can be jumped to.
+* **Assemble & Run**: Invoke the `nasm` assembler on the current file directly from the editor (Ctrl+B), if its path is configured in Settings. A successful build offers to run the resulting program straight away, and **Ctrl+R** re-runs it later without reassembling (warning first if the source has changed since). When assembly fails, nStudio reads nasm's structured diagnostics and jumps the cursor to the first error in the current file, showing the message in the status bar; **Ctrl + N / Ctrl + P** then step through the remaining errors. Errors inside `INCLUDE`d files are reported in place, naming the file that included them, and **Ctrl + D** shows the full diagnostic with its include chain and related locations ("previously defined here"), which can be jumped to.
 * **File browser**: Navigate the Ndless filesystem to open existing files and save your work.
 * **Instruction & syscall catalogs**: Offline reference for ARM instructions (signatures, descriptions, CPSR flag effects) and the full Ndless syscall list; insert or view details in place.
 * **Navigation**: Jump to a specific line, browse all defined labels, or jump straight to a branch target.
@@ -50,7 +50,8 @@ nStudio is an ARM assembly editor for the TI-Nspire CX and CX II calculators run
 * **Ctrl + G**: Go to Line
 * **Ctrl + L**: Label Browser
 * **Ctrl + Enter**: Jump to the label under a `B`/`BL`/`BX` branch
-* **Ctrl + B**: Assemble with `nasm`
+* **Ctrl + B**: Assemble with `nasm` (offers to run the result on success)
+* **Ctrl + R**: Run the program already built from this file, without reassembling
 * **Ctrl + N / Ctrl + P**: Jump to the next / previous assemble error (wraps around; any edit clears the list)
 * **Ctrl + D**: Diagnostic details for the current error — full message, the `INCLUDE` chain it came through, and related locations (Enter jumps to one in this file)
 * **Ctrl + Trig**: Instruction help for the mnemonic under the cursor

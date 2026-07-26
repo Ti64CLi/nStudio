@@ -1040,6 +1040,7 @@ static void render_all(void) {
 #define ACT_DIAG_NEXT (-51)
 #define ACT_DIAG_PREV (-52)
 #define ACT_DIAG_DETAIL (-53)
+#define ACT_RUN (-54)
 
 /* Whether an action counts as a buffer edit for undo-coalescing: a run of
    same-kind edits shares one undo group and any non-edit action ends the
@@ -1206,6 +1207,8 @@ static int poll_key(void) {
     return ACT_DIAG_PREV;
   if (ctrl && isKeyPressed(KEY_NSPIRE_D))
     return ACT_DIAG_DETAIL;
+  if (ctrl && isKeyPressed(KEY_NSPIRE_R))
+    return ACT_RUN;
   if (ctrl && isKeyPressed(KEY_NSPIRE_TRIG))
     return ACT_CHEATSHEET;
 
@@ -3381,6 +3384,48 @@ static void menu_draw(int top_sel, int sub_sel, int in_sub) {
    already holds nstudio.cfg. */
 #define ASM_DIAG_FILE "/documents/ndless/nstudio_diag.json"
 
+/*
+ * Where nasm will put the program it builds from `src`.
+ *
+ * This mirrors nasm's own make_outpath() exactly: every dot-extension is
+ * stripped from the file name - it cuts at the FIRST dot, not the last - and
+ * ".tns" is appended, so /documents/foo/bar.asm.tns becomes
+ * /documents/foo/bar.tns.  nasm derives this itself and offers no way to
+ * override it from the command line, so recomputing it here is the only way to
+ * know what was built; keep the two in step.
+ *
+ * Returns 0 when no usable path exists: an unsaved buffer, a path too long to
+ * extend, or a result identical to the source - the last being exactly the case
+ * nasm itself refuses to build, so nothing was produced to run.  A name with no
+ * dot simply gains ".tns", matching nasm rather than second-guessing it.
+ */
+static int editor_output_path(const char *src, char *out, size_t outsz) {
+  if (!src || !src[0])
+    return 0;
+  if (strlen(src) + 5 > outsz)
+    return 0; /* no room for the stripped name plus ".tns" and its NUL */
+
+  strncpy(out, src, outsz - 1);
+  out[outsz - 1] = '\0';
+
+  char *name = strrchr(out, '/');
+  name = name ? name + 1 : out;
+
+  char *dot = strchr(name, '.');
+  if (dot)
+    *dot = '\0';
+
+  strcat(out, ".tns");
+  return strcmp(out, src) != 0;
+}
+
+/* Hand the calculator over to `path` and take the screen back afterwards.
+   nl_exec runs the child in this process and returns once it exits. */
+static void editor_run_program(const char *path) {
+  nl_exec(path, 0, NULL);
+  gfx_reinit();
+}
+
 /* Move the cursor to a 1-based line/column in the open buffer, clamping both
    to what the buffer actually holds, and scroll it into view. */
 static void editor_goto_line_col(int line, int col) {
@@ -3442,13 +3487,18 @@ static void diag_jump_to_nav(int nav_pos) {
    that has a real location, whichever file it is in: those in the open file are
    jumped to, the rest are reported in place by diag_jump_to_nav.  Diagnostics
    with no line at all stay out of the cycle, since there is nothing to show.
-   The first entry is selected, preferring one the cursor can actually reach. */
-static void editor_load_diagnostics(void) {
+   The first entry is selected, preferring one the cursor can actually reach.
+
+   Returns what the diagnostics file said: 0 when nasm wrote an empty batch
+   (assembled cleanly), a positive count when it reported problems, and -1 when
+   there was no file to read - a cancelled run, or an nasm too old to know the
+   option.  Only 0 is proof of a successful build. */
+static int editor_load_diagnostics(void) {
   diag_nav_reset();
 
   int n = asmdiag_parse_file(ASM_DIAG_FILE, g_diags, ASMDIAG_MAX);
   if (n <= 0)
-    return;
+    return n;
   g_ndiags = n;
 
   int first_here = -1;
@@ -3462,6 +3512,7 @@ static void editor_load_diagnostics(void) {
 
   if (g_diag_nav_count > 0)
     diag_jump_to_nav(first_here >= 0 ? first_here : 0);
+  return n;
 }
 
 /* Jump to the next / previous navigable diagnostic, wrapping around at the
@@ -3761,8 +3812,71 @@ static void editor_assemble(void) {
   gfx_reinit();
 
   /* Read nasm's diagnostics and jump to the first error in this file. */
-  editor_load_diagnostics();
+  int ndiag = editor_load_diagnostics();
+
+  /* A clean build (nasm wrote an empty batch) is the only case worth offering
+     to run.  Ask first: the program takes over the calculator, and a faulty
+     one can take nStudio down with it. */
+  char outpath[1024];
+  struct stat ost;
+  if (ndiag == 0 && editor_output_path(g_filepath, outpath, sizeof(outpath)) &&
+      stat(outpath, &ost) == 0) {
+    char line[288];
+    snprintf(line, sizeof(line), "Output: %s", asmdiag_base_name(outpath));
+    const char *body[] = {"Assembly succeeded.", line, "Run it now?"};
+    if (gfx_window_confirm2("Assemble", body, 3, "Run", "Close") == 0)
+      editor_run_program(outpath);
+  }
 #undef NASM_MAX_ARGS
+}
+
+/*
+ * Run the program already built from this source, without reassembling.
+ * Runs straight away when the build is newer than the file on disk; when it is
+ * older - or the buffer has unsaved edits - it says so first, since the program
+ * about to run will not contain those changes.
+ */
+static void editor_run_build(void) {
+  char outpath[1024];
+  if (!editor_output_path(g_filepath, outpath, sizeof(outpath))) {
+    static const char *body[] = {"This buffer has not been saved,",
+                                 "so there is no build to run."};
+    gfx_window_alert("Run", body, 2, "OK");
+    return;
+  }
+
+  struct stat ost;
+  if (stat(outpath, &ost) != 0) {
+    char line[288];
+    snprintf(line, sizeof(line), "No %s found.", asmdiag_base_name(outpath));
+    const char *body[] = {line, "Assemble with Ctrl+B first."};
+    gfx_window_alert("Run", body, 2, "OK");
+    return;
+  }
+
+  /*
+   * Warn when what we are about to run predates the source.  Unsaved edits are
+   * always proof of that; the timestamp comparison is a best-effort extra,
+   * applied only when both stamps look real, because the calculator's
+   * filesystem does not guarantee a useful modification time.  Treating an
+   * absent timestamp as "not stale" keeps a spurious prompt off the common
+   * path - the buffer flag already covers the case that actually matters.
+   */
+  struct stat sst;
+  int stale = g_modified;
+  if (!stale && stat(g_filepath, &sst) == 0 && sst.st_mtim.tv_sec > 0 &&
+      ost.st_mtim.tv_sec > 0)
+    stale = sst.st_mtim.tv_sec > ost.st_mtim.tv_sec;
+  if (stale) {
+    char line[288];
+    snprintf(line, sizeof(line), "%s is older than the source.",
+             asmdiag_base_name(outpath));
+    const char *body[] = {line, "Run it anyway, without rebuilding?"};
+    if (gfx_window_confirm2("Run", body, 2, "Run Anyway", "Cancel") != 0)
+      return;
+  }
+
+  editor_run_program(outpath);
 }
 
 /* True for menu entries that modify the buffer, so read-only files can
@@ -4315,6 +4429,9 @@ int editor_open(const char *path) {
 
     case ACT_ASSEMBLE:
       editor_assemble();
+      break;
+    case ACT_RUN:
+      editor_run_build();
       break;
     case ACT_DIAG_NEXT:
       editor_diag_next();
