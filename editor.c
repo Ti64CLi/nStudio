@@ -3252,8 +3252,13 @@ static void editor_diag_panel(void) {
     g_diag_actionable[i] = (char)here;
   }
 
+  /* A full batch means nasm may have reported more than we kept, so say the
+     count is a floor rather than presenting it as the total. */
   char title[48];
-  snprintf(title, sizeof(title), "Diagnostics  (%d)", g_diag_nav_count);
+  if (g_ndiags >= ASMDIAG_MAX)
+    snprintf(title, sizeof(title), "Diagnostics  (%d+)", g_diag_nav_count);
+  else
+    snprintf(title, sizeof(title), "Diagnostics  (%d)", g_diag_nav_count);
 
   int sel = list_pick(title, g_diag_row_ptrs, g_diag_actionable,
                       g_diag_nav_count, g_diag_cur,

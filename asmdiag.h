@@ -56,9 +56,16 @@
 #ifndef ASMDIAG_H_INCLUDED
 #define ASMDIAG_H_INCLUDED
 
-/* Upper bound on diagnostics retained from one assemble.  nasm's own engine
-   caps its output near this, so overflow is not expected in practice. */
-#define ASMDIAG_MAX 100
+/*
+ * Diagnostics retained from one assemble.
+ *
+ * nasm caps its own batch at MAX_ERR_LINES (512), so a very broken file can
+ * produce more than this and the extras are dropped - see asmdiag_parse_file.
+ * The limit is a memory decision rather than a protocol one: the batch is a
+ * static array, so every byte per entry costs this many times over, and no one
+ * works through sixty-four errors before reassembling.
+ */
+#define ASMDIAG_MAX 64
 
 typedef enum { ADIAG_ERROR, ADIAG_WARNING, ADIAG_NOTE } AsmDiagSeverity;
 
@@ -69,8 +76,12 @@ typedef enum { ADIAG_ERROR, ADIAG_WARNING, ADIAG_NOTE } AsmDiagSeverity;
  * deliberate trade-off: the retained batch is a static array of ASMDIAG_MAX
  * diagnostics, so every byte here costs 100x in RAM on the calculator.
  */
-#define ASMDIAG_MAX_RELATED 3
-#define ASMDIAG_MAX_INCLUDE 6
+/* nasm attaches at most one related location today (the "previously defined
+   here" of a redefined label), so two is already headroom; include nesting
+   deeper than four is not plausible on this device.  These two arrays are the
+   bulk of an entry, so their sizes dominate the static footprint. */
+#define ASMDIAG_MAX_RELATED 2
+#define ASMDIAG_MAX_INCLUDE 4
 
 /*
  * A secondary source location explaining the diagnostic, each with its own
@@ -118,6 +129,10 @@ typedef struct {
  * Parse the JSON diagnostics file at `path` into out[0..max).  Returns the
  * number of diagnostics stored (0..max), or -1 if the file is absent or
  * cannot be read.  A malformed document is parsed best-effort.
+ *
+ * A batch longer than `max` is truncated to the first `max` entries.  Since the
+ * count returned is then exactly `max`, a caller that cares can tell it may
+ * have lost some and say so rather than presenting the total as complete.
  */
 int asmdiag_parse_file(const char *path, AsmDiag *out, int max);
 
