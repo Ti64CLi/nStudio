@@ -137,4 +137,16 @@ int asmdiag_first_for_file(const AsmDiag *diags, int n, const char *path);
  */
 int asmdiag_in_file(const AsmDiag *d, const char *path);
 
+/*
+ * Whether a file path recorded in a diagnostic (or in one of its related
+ * locations / include frames) refers to `path`, matched by full path and then
+ * by base name.  Exposed so callers can test a related location, which carries
+ * its own file, with exactly the rule asmdiag_in_file applies to the primary.
+ */
+int asmdiag_same_file(const char *diag_file, const char *path);
+
+/* Base name (component after the last '/') of a path; "" for NULL.  Handy for
+   showing a compact origin in a status line. */
+const char *asmdiag_base_name(const char *path);
+
 #endif /* ASMDIAG_H_INCLUDED */

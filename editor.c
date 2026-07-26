@@ -1039,6 +1039,7 @@ static void render_all(void) {
 #define ACT_UNTAB (-50)
 #define ACT_DIAG_NEXT (-51)
 #define ACT_DIAG_PREV (-52)
+#define ACT_DIAG_DETAIL (-53)
 
 /* Whether an action counts as a buffer edit for undo-coalescing: a run of
    same-kind edits shares one undo group and any non-edit action ends the
@@ -1203,6 +1204,8 @@ static int poll_key(void) {
     return ACT_DIAG_NEXT;
   if (ctrl && isKeyPressed(KEY_NSPIRE_P))
     return ACT_DIAG_PREV;
+  if (ctrl && isKeyPressed(KEY_NSPIRE_D))
+    return ACT_DIAG_DETAIL;
   if (ctrl && isKeyPressed(KEY_NSPIRE_TRIG))
     return ACT_CHEATSHEET;
 
@@ -2836,6 +2839,8 @@ static void editor_open_file(void) {
   g_redo_count = 0;
   g_modified = 0;
   g_readonly = !path_is_asm_source(g_filepath);
+  /* The retained diagnostics describe the previous buffer, not this one. */
+  diag_nav_reset();
 }
 
 /* Save As: pick a directory, then enter a filename; saves as dir/name.tns.
@@ -3376,34 +3381,68 @@ static void menu_draw(int top_sel, int sub_sel, int in_sub) {
    already holds nstudio.cfg. */
 #define ASM_DIAG_FILE "/documents/ndless/nstudio_diag.json"
 
-/* Move the cursor to the diagnostic at navigation position `nav_pos` (an index
-   into g_diag_nav, in [0, g_diag_nav_count)), scroll it into view, and show it
-   in the status bar with its position in the run (e.g. "Error 2/3, line 27").*/
-static void diag_jump_to_nav(int nav_pos) {
-  g_diag_cur = nav_pos;
-  const AsmDiag *d = &g_diags[g_diag_nav[nav_pos]];
-
-  cursor_row = (d->line > num_lines) ? num_lines - 1 : d->line - 1;
+/* Move the cursor to a 1-based line/column in the open buffer, clamping both
+   to what the buffer actually holds, and scroll it into view. */
+static void editor_goto_line_col(int line, int col) {
+  cursor_row = (line > num_lines) ? num_lines - 1 : line - 1;
   if (cursor_row < 0)
     cursor_row = 0;
   int ll = line_len(&g_buf, cursor_row);
-  cursor_col = (d->col >= 1) ? d->col - 1 : 0;
+  cursor_col = (col >= 1) ? col - 1 : 0;
   if (cursor_col > ll)
     cursor_col = ll;
   cursor_sync_rowcol();
   scroll_to_cursor();
-
-  const char *sev = d->severity == ADIAG_WARNING
-                        ? "Warning"
-                        : (d->severity == ADIAG_NOTE ? "Note" : "Error");
-  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d, line %d: %s", sev,
-           nav_pos + 1, g_diag_nav_count, d->line, d->message);
 }
 
-/* After an assemble, read the diagnostics nasm left behind, retain them for
-   navigation, and jump to the first one that lands in the file currently open.
-   A missing file, an empty batch, or errors only in INCLUDEd files leave the
-   cursor where it was, with nothing to navigate. */
+static const char *diag_severity_name(const AsmDiag *d) {
+  return d->severity == ADIAG_WARNING
+             ? "Warning"
+             : (d->severity == ADIAG_NOTE ? "Note" : "Error");
+}
+
+/* Select the diagnostic at navigation position `nav_pos` (an index into
+   g_diag_nav, in [0, g_diag_nav_count)) and describe it in the status bar.
+   Diagnostics in the open file move the cursor to their location; those in
+   another file - typically reached through INCLUDE, and previously skipped
+   altogether - leave the cursor alone and report where they are, naming the
+   file that included them so the origin is not a mystery. */
+static void diag_jump_to_nav(int nav_pos) {
+  g_diag_cur = nav_pos;
+  const AsmDiag *d = &g_diags[g_diag_nav[nav_pos]];
+  const char *sev = diag_severity_name(d);
+
+  /* "  [+2 rel]" when secondary locations are available in the detail popup.
+     Sized for any int so the formatting is provably never truncated. */
+  char rel[24] = "";
+  if (d->related_count > 0)
+    snprintf(rel, sizeof(rel), "  [+%d rel]", d->related_count);
+
+  if (asmdiag_in_file(d, g_filepath)) {
+    editor_goto_line_col(d->line, d->col);
+    snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d, line %d: %s%s",
+             sev, nav_pos + 1, g_diag_nav_count, d->line, d->message, rel);
+    return;
+  }
+
+  /* Another file: name it, and the immediate includer when nasm gave us one
+     (include frames run outermost first, so the parent is the last). */
+  char from[80] = "";
+  if (d->include_count > 0) {
+    const AsmDiagInclude *parent = &d->include_stack[d->include_count - 1];
+    snprintf(from, sizeof(from), " (from %s:%d)",
+             asmdiag_base_name(parent->file), parent->line);
+  }
+  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d in %s:%d%s: %s%s",
+           sev, nav_pos + 1, g_diag_nav_count, asmdiag_base_name(d->file),
+           d->line, from, d->message, rel);
+}
+
+/* After an assemble, read the diagnostics nasm left behind and retain every one
+   that has a real location, whichever file it is in: those in the open file are
+   jumped to, the rest are reported in place by diag_jump_to_nav.  Diagnostics
+   with no line at all stay out of the cycle, since there is nothing to show.
+   The first entry is selected, preferring one the cursor can actually reach. */
 static void editor_load_diagnostics(void) {
   diag_nav_reset();
 
@@ -3412,12 +3451,17 @@ static void editor_load_diagnostics(void) {
     return;
   g_ndiags = n;
 
-  for (int i = 0; i < g_ndiags && g_diag_nav_count < ASMDIAG_MAX; i++)
-    if (asmdiag_in_file(&g_diags[i], g_filepath))
-      g_diag_nav[g_diag_nav_count++] = i;
+  int first_here = -1;
+  for (int i = 0; i < g_ndiags && g_diag_nav_count < ASMDIAG_MAX; i++) {
+    if (g_diags[i].line < 1)
+      continue;
+    if (first_here < 0 && asmdiag_in_file(&g_diags[i], g_filepath))
+      first_here = g_diag_nav_count;
+    g_diag_nav[g_diag_nav_count++] = i;
+  }
 
   if (g_diag_nav_count > 0)
-    diag_jump_to_nav(0);
+    diag_jump_to_nav(first_here >= 0 ? first_here : 0);
 }
 
 /* Jump to the next / previous navigable diagnostic, wrapping around at the
@@ -3437,6 +3481,190 @@ static void editor_diag_prev(void) {
     return;
   }
   diag_jump_to_nav((g_diag_cur - 1 + g_diag_nav_count) % g_diag_nav_count);
+}
+
+/* Can the cursor be placed on this secondary location, i.e. is it in the file
+   the editor currently shows? */
+static int diag_related_reachable(const AsmDiagRelated *r) {
+  return r->line >= 1 && asmdiag_same_file(r->file, g_filepath);
+}
+
+/*
+ * Detail popup for the currently selected diagnostic: its full message, the
+ * INCLUDE chain that led to it, and nasm's secondary locations ("previously
+ * defined here" and friends).  Related locations inside the open file are
+ * selectable and Enter jumps to one; the rest are shown for context only.
+ */
+static void editor_diag_detail(void) {
+  if (g_diag_nav_count == 0) {
+    snprintf(g_diag_status, sizeof(g_diag_status), " No diagnostics to show");
+    return;
+  }
+
+  const AsmDiag *d = &g_diags[g_diag_nav[g_diag_cur]];
+  const int nrel = d->related_count;
+  const int ninc = d->include_count;
+
+  const int WIN_W = GFX_W - 16;
+  const int WIN_X = 8;
+  const int TITLE_H = 12;
+  const int PAD = 5;
+  const int HINT_H = 11;
+  const int INNER_W = WIN_W - 2 * PAD - 2;
+  const int LINE_H = GFX_FONT_H;
+  const int SEC_GAP = 3;
+  const int MSG_LINES = 3; /* message is wrapped into at most this many */
+
+  /* Height the content wants: location, wrapped message, then the INCLUDE and
+     Related sections when present (each a label plus one row per entry), and a
+     final note when nasm gave us more than the caps keep. */
+  int body_h = PAD + LINE_H + SEC_GAP + MSG_LINES * LINE_H;
+  if (ninc)
+    body_h += SEC_GAP + LINE_H + ninc * LINE_H;
+  if (nrel)
+    body_h += SEC_GAP + LINE_H + nrel * LINE_H;
+  if (d->related_truncated || d->include_truncated)
+    body_h += LINE_H;
+  body_h += PAD;
+
+  int WIN_H = TITLE_H + body_h + HINT_H + 2;
+  if (WIN_H > GFX_H - 16)
+    WIN_H = GFX_H - 16;
+  const int WIN_Y = (GFX_H - WIN_H) / 2;
+
+  int sel = 0; /* selected related location */
+
+  while (any_key_pressed())
+    msleep(20);
+
+  for (;;) {
+    gfx_fillrect(WIN_X + 3, WIN_Y + 3, WIN_W, WIN_H,
+                 g_default_theme.border_dark);
+    gfx_borderrect(WIN_X, WIN_Y, WIN_W, WIN_H, g_default_theme.bg,
+                   g_default_theme.border_light);
+
+    /* Title: severity, plus nasm's stable code when it tagged one. */
+    gfx_fillrect(WIN_X + 1, WIN_Y + 1, WIN_W - 2, TITLE_H,
+                 g_default_theme.title_bg);
+    char title[64];
+    if (d->code[0])
+      snprintf(title, sizeof(title), "%s  %s", diag_severity_name(d), d->code);
+    else
+      snprintf(title, sizeof(title), "%s", diag_severity_name(d));
+    gfx_drawstr_clipped(WIN_X + PAD, WIN_Y + 1 + (TITLE_H - GFX_FONT_H) / 2,
+                        title, g_default_theme.title_fg,
+                        g_default_theme.title_bg, WIN_W - 2 * PAD);
+
+    int body_top = WIN_Y + 1 + TITLE_H;
+    int body_bot = WIN_Y + WIN_H - HINT_H - 1;
+    gfx_fillrect(WIN_X + 1, body_top, WIN_W - 2, body_bot - body_top,
+                 g_default_theme.bg);
+
+    const uint16_t BG = g_default_theme.bg;
+    const uint16_t FG = g_default_theme.fg;
+    const uint16_t LABEL = g_default_theme.accent;
+    const uint16_t DIM = g_default_theme.border_light;
+    int tx = WIN_X + 1 + PAD;
+    int ty = body_top + PAD;
+
+    /* Where the diagnostic is, in file:line:col form (col only when known). */
+    char loc[128];
+    if (d->col >= 1)
+      snprintf(loc, sizeof(loc), "%s:%d:%d", asmdiag_base_name(d->file), d->line,
+               d->col);
+    else
+      snprintf(loc, sizeof(loc), "%s:%d", asmdiag_base_name(d->file), d->line);
+    gfx_drawstr_clipped(tx, ty, loc, LABEL, BG, INNER_W);
+    ty += LINE_H + SEC_GAP;
+
+    cheatsheet_draw_wrapped(d->message, tx, ty, INNER_W, MSG_LINES, FG, BG);
+    ty += MSG_LINES * LINE_H;
+
+    /* INCLUDE chain, outermost includer first (nasm's order). */
+    if (ninc && ty + LINE_H <= body_bot) {
+      ty += SEC_GAP;
+      gfx_drawstr_clipped(tx, ty, "Included from:", LABEL, BG, INNER_W);
+      ty += LINE_H;
+      for (int i = 0; i < ninc && ty + LINE_H <= body_bot; i++) {
+        char fr[160];
+        snprintf(fr, sizeof(fr), "  %s:%d",
+                 asmdiag_base_name(d->include_stack[i].file),
+                 d->include_stack[i].line);
+        gfx_drawstr_clipped(tx, ty, fr, FG, BG, INNER_W);
+        ty += LINE_H;
+      }
+    }
+
+    /* Secondary locations; the reachable ones are selectable. */
+    if (nrel && ty + LINE_H <= body_bot) {
+      ty += SEC_GAP;
+      gfx_drawstr_clipped(tx, ty, "Related:", LABEL, BG, INNER_W);
+      ty += LINE_H;
+      for (int i = 0; i < nrel && ty + LINE_H <= body_bot; i++) {
+        const AsmDiagRelated *r = &d->related[i];
+        int reachable = diag_related_reachable(r);
+        char row[224];
+        snprintf(row, sizeof(row), "%c %s:%d %s", i == sel ? '>' : ' ',
+                 asmdiag_base_name(r->file), r->line, r->message);
+        uint16_t rbg = (i == sel) ? g_default_theme.accent : BG;
+        uint16_t rfg = (i == sel) ? g_default_theme.accent_text
+                                  : (reachable ? FG : DIM);
+        gfx_fillrect(WIN_X + 1, ty, WIN_W - 2, LINE_H, rbg);
+        gfx_drawstr_clipped(tx, ty, row, rfg, rbg, INNER_W);
+        ty += LINE_H;
+      }
+    }
+
+    if ((d->related_truncated || d->include_truncated) &&
+        ty + LINE_H <= body_bot)
+      gfx_drawstr_clipped(tx, ty, "(more not shown)", DIM, BG, INNER_W);
+
+    int hy = WIN_Y + WIN_H - HINT_H - 1;
+    gfx_hline(WIN_X + 1, hy, WIN_W - 2, g_default_theme.border_light);
+    gfx_fillrect(WIN_X + 1, hy + 1, WIN_W - 2, HINT_H - 1, BG);
+    gfx_drawstr_clipped(WIN_X + PAD, hy + 2,
+                        nrel ? "Up/Down: select   Enter: jump   Esc: close"
+                             : "Esc: close",
+                        FG, BG, WIN_W - 2 * PAD);
+    gfx_flip();
+
+    /* gfx_poll_nav() does not block, so idle until something is pressed
+       instead of spinning on a full redraw (the shared modal convention). */
+    NavAction a;
+    for (;;) {
+      a = gfx_poll_nav();
+      if (a != NAV_NONE)
+        break;
+      msleep(16);
+      idle();
+    }
+
+    if (a == NAV_ESC) {
+      while (any_key_pressed())
+        msleep(20);
+      return;
+    }
+    if (a == NAV_UP && nrel)
+      sel = (sel - 1 + nrel) % nrel;
+    else if (a == NAV_DOWN && nrel)
+      sel = (sel + 1) % nrel;
+    else if (a == NAV_ENTER && nrel) {
+      const AsmDiagRelated *r = &d->related[sel];
+      while (any_key_pressed())
+        msleep(20);
+      if (diag_related_reachable(r)) {
+        editor_goto_line_col(r->line, r->col);
+        snprintf(g_diag_status, sizeof(g_diag_status), " %s, line %d: %s",
+                 asmdiag_base_name(r->file), r->line, r->message);
+        return;
+      }
+      /* Not in this buffer: say so rather than moving the cursor somewhere
+         misleading. */
+      snprintf(g_diag_status, sizeof(g_diag_status), " %s:%d is in another file",
+               asmdiag_base_name(r->file), r->line);
+      return;
+    }
+  }
 }
 
 static void editor_assemble(void) {
@@ -4093,6 +4321,9 @@ int editor_open(const char *path) {
       break;
     case ACT_DIAG_PREV:
       editor_diag_prev();
+      break;
+    case ACT_DIAG_DETAIL:
+      editor_diag_detail();
       break;
 
     default:

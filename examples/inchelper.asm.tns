@@ -1,0 +1,9 @@
+; Helper included by inctest.asm.tns.
+; The "bogusop" below is a deliberate error: it is not an ARM
+; instruction, so nasm reports it against THIS file while the
+; INCLUDE chain records that inctest.asm.tns pulled it in.
+; Fix it (e.g. change "bogusop" to "sub") to assemble cleanly.
+helper_routine
+ mov r0, #1
+ bogusop r3
+ bx lr

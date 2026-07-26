@@ -1,0 +1,31 @@
+; ==========================================================
+;  nStudio - Related-location test     (open, then Ctrl+B)
+; ==========================================================
+;  The label "start" is defined TWICE, which nasm reports as
+;  "Label name already used" and tags with a RELATED location
+;  pointing at the first definition.
+;
+;  Assembling with Ctrl+B should:
+;    1. run nasm, which lists the error in its own window;
+;    2. after you close it, JUMP the cursor to line 29 (the
+;       second "start"), with the status line ending in
+;       "[+1 rel]": a related location is available.
+;
+;  Then press Ctrl+D to open the diagnostic details:
+;    - title    : "Error  label-redefined"
+;    - Related: > reftest.asm.tns:25 previously defined here
+;    - press Enter on that row to JUMP to line 25 (the first
+;      definition); Esc closes without moving the cursor.
+;
+;  Ctrl+N / Ctrl+P cycle the errors (only one here, so both
+;  simply re-select it).  Any edit clears the list until you
+;  assemble again.
+; ==========================================================
+
+start
+ mov r0, #0
+ bx lr
+
+start
+ mov r1, #1
+ bx lr

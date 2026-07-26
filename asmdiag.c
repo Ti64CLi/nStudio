@@ -476,11 +476,21 @@ static const char *base_name(const char *path) {
   return slash ? slash + 1 : path;
 }
 
-int asmdiag_in_file(const AsmDiag *d, const char *path) {
-  if (!d || !path || d->line < 1)
+int asmdiag_same_file(const char *diag_file, const char *path) {
+  if (!diag_file || !path)
     return 0;
-  return strcmp(d->file, path) == 0 ||
-         strcmp(base_name(d->file), base_name(path)) == 0;
+  return strcmp(diag_file, path) == 0 ||
+         strcmp(base_name(diag_file), base_name(path)) == 0;
+}
+
+const char *asmdiag_base_name(const char *path) {
+  return path ? base_name(path) : "";
+}
+
+int asmdiag_in_file(const AsmDiag *d, const char *path) {
+  if (!d || d->line < 1)
+    return 0;
+  return asmdiag_same_file(d->file, path);
 }
 
 int asmdiag_first_for_file(const AsmDiag *diags, int n, const char *path) {
