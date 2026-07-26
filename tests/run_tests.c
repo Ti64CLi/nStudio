@@ -217,7 +217,8 @@ static void test_lines_shift(void) {
 
   unsigned seed = 12345;
   int mismatches = 0;
-  int saved_starts[MAX_LINES], saved_n;
+  static int saved_starts[8192];
+  int saved_n;
 
   for (int step = 0; step < 4000; step++) {
     seed = seed * 1103515245u + 12345u;
@@ -271,6 +272,21 @@ static void test_lines_shift(void) {
   rebuild_lines(&h);
   CHECK(line_starts[1] == second); /* and the rescan agrees */
   gb_free(&h);
+
+  /* The table grows past the old fixed 4096-line cap. */
+  GapBuf big;
+  gb_init(&big);
+  const int BIG_LINES = 20000;
+  for (int i = 0; i < BIG_LINES; i++)
+    gb_inserts(&big, "x\n");
+  rebuild_lines(&big);
+  CHECK(num_lines == BIG_LINES + 1); /* trailing newline opens a last line */
+  CHECK(g_lines_truncated == 0);
+  CHECK(line_starts[BIG_LINES] == BIG_LINES * 2);
+  CHECK(line_len(&big, 0) == 1);
+  gb_free(&big);
+  lines_free();
+  CHECK(num_lines == 0);
 }
 
 /* ================================================================ */

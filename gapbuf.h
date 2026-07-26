@@ -49,13 +49,23 @@ static inline void gb_delete(GapBuf *g) {
 /* ------------------------------------------------------------------ */
 /* Line table                                                         */
 /* ------------------------------------------------------------------ */
-#define MAX_LINES 4096
-
-extern int line_starts[MAX_LINES];
+/*
+ * Byte offset of the first character of each line.  The table grows on demand,
+ * so the number of lines a file may have is limited only by memory; it is never
+ * NULL, falling back to a single static entry if even the first allocation
+ * fails, so line_starts[0] is always readable.
+ */
+extern int *line_starts;
 extern int num_lines;
-extern int g_lines_truncated; /* set when the file exceeds MAX_LINES lines */
+
+/* Set when the table could not grow to cover the whole buffer, i.e. memory ran
+   out: the lines past that point exist in the text but are not indexed. */
+extern int g_lines_truncated;
 
 void rebuild_lines(const GapBuf *g);
+
+/* Release the line table (back to the static fallback). */
+void lines_free(void);
 int line_len(const GapBuf *g, int line);
 
 /*

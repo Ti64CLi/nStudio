@@ -3217,11 +3217,11 @@ int editor_open(const char *path) {
   render_all();
 
   if (g_lines_truncated) {
-    char msg[64];
-    snprintf(msg, sizeof(msg), "File exceeds %d lines; extra lines are",
-             MAX_LINES);
-    const char *body[] = {msg, "shown but cannot be navigated separately."};
-    gfx_window_alert("Large File", body, 2, "OK");
+    static const char *body[] = {
+        "Not enough memory to index every line.",
+        "Later lines are shown but cannot be",
+        "navigated separately.  Save your work."};
+    gfx_window_alert("Large File", body, 3, "OK");
   }
 
   while (any_key_pressed())
@@ -3490,6 +3490,7 @@ int editor_open(const char *path) {
   }
 
   gb_free(&g_buf);
+  lines_free();
   /* Release the undo/redo snapshots (up to 32 buffer copies) rather than
      holding them while the user is back in the main menu. */
   for (int i = 0; i < UNDO_MAX; i++) {

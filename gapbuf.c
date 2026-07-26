@@ -108,22 +108,82 @@ int gb_insert_n(GapBuf *g, const char *s, int n) {
 /* ================================================================
  * Line table
  * ================================================================ */
-int line_starts[MAX_LINES];
+/* Entries the table starts at, then doubles from.  Big enough that ordinary
+   sources never reallocate, small enough to be free for a scratch buffer. */
+#define LINES_INIT 512
+
+/* Last-resort table, used only if even the first allocation fails.  It keeps
+   line_starts non-NULL and line_starts[0] valid, so the editor can still show
+   and navigate the first line rather than crash. */
+static int lines_fallback[1];
+
+int *line_starts = lines_fallback;
+static int line_cap = 1;
 int num_lines;
-int g_lines_truncated; /* set when the file has more than MAX_LINES lines */
+int g_lines_truncated; /* set when the table could not cover the whole buffer */
+
+/* Grow the table to hold at least `need` entries.  Returns 1 on success, 0 if
+   the allocation failed (leaving the existing table intact and usable).
+   Copies rather than reallocs, since the fallback is not heap memory. */
+static int lines_reserve(int need) {
+  if (need <= line_cap)
+    return 1;
+
+  /* Ceiling on entries, so the byte size below cannot overflow.  Far beyond
+     what the calculator's memory could hold anyway; it exists to keep the
+     arithmetic honest rather than to impose a limit. */
+  const int cap_max = (int)(0x7fffffffu / sizeof(int));
+  if (need > cap_max)
+    return 0;
+
+  int cap = line_cap < LINES_INIT ? LINES_INIT : line_cap;
+  while (cap < need) {
+    if (cap > cap_max / 2) {
+      cap = need; /* one last exact-size step instead of overflowing */
+      break;
+    }
+    cap *= 2;
+  }
+
+  int *nb = (int *)malloc((size_t)cap * sizeof(int));
+  if (!nb)
+    return 0;
+
+  memcpy(nb, line_starts, (size_t)num_lines * sizeof(int));
+  if (line_starts != lines_fallback)
+    free(line_starts);
+  line_starts = nb;
+  line_cap = cap;
+  return 1;
+}
+
+void lines_free(void) {
+  if (line_starts != lines_fallback)
+    free(line_starts);
+  line_starts = lines_fallback;
+  line_cap = 1;
+  num_lines = 0;
+  g_lines_truncated = 0;
+}
 
 void rebuild_lines(const GapBuf *g) {
   int len = gb_len(g);
   num_lines = 0;
-  line_starts[num_lines++] = 0;
-  int i;
-  for (i = 0; i < len && num_lines < MAX_LINES; i++) {
-    if (gb_get(g, i) == '\n')
-      line_starts[num_lines++] = i + 1;
+  g_lines_truncated = 0;
+
+  line_starts[num_lines++] = 0; /* line 0 always fits: cap is at least 1 */
+
+  for (int i = 0; i < len; i++) {
+    if (gb_get(g, i) != '\n')
+      continue;
+    if (num_lines >= line_cap && !lines_reserve(num_lines + 1)) {
+      /* Out of memory: index what we have and say so.  The remaining text is
+         still in the buffer, it just has no line entries. */
+      g_lines_truncated = 1;
+      return;
+    }
+    line_starts[num_lines++] = i + 1;
   }
-  /* If we stopped because the table filled while bytes remain, the file
-     has more lines than we can index. */
-  g_lines_truncated = (num_lines >= MAX_LINES && i < len);
 }
 
 /*
