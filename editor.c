@@ -809,6 +809,16 @@ static void editor_search(void) {
 /* Replace the patlen bytes at pos with g_replace_str.  Assumes the gap
    ops are done by the caller's snapshot policy.  Returns the number of
    replacement bytes actually written. */
+/*
+ * Replace `patlen` bytes at `pos` with `rep`, returning how many were written.
+ *
+ * The line table is deliberately NOT rebuilt here.  Nothing this function or
+ * buf_find() does consults it - both work on raw buffer offsets - so a caller
+ * replacing many matches can rebuild once at the end instead of once per
+ * match, which is the difference between O(matches x file) and O(file).
+ * Callers must rebuild before anything reads the table again, cursor_sync_pos()
+ * and rendering included.
+ */
 static int do_one_replace(int pos, int patlen, const char *rep, int replen) {
   gb_move(&g_buf, pos);
   for (int i = 0; i < patlen; i++)
@@ -819,7 +829,6 @@ static int do_one_replace(int pos, int patlen, const char *rep, int replen) {
       break;
     inserted++;
   }
-  rebuild_lines(&g_buf);
   g_modified = 1;
   return inserted;
 }
@@ -838,6 +847,7 @@ static int replace_all(int patlen, int replen) {
     if (g_gb_oom)
       break;
   }
+  rebuild_lines(&g_buf); /* once for the whole run, not once per match */
   cursor_pos = 0;
   cursor_sync_pos();
   return count;
@@ -909,6 +919,7 @@ static void editor_search_replace(void) {
         msleep(20);
       undo_checkpoint(UK_OTHER);
       int inserted = do_one_replace(pos, patlen, g_replace_str, replen);
+      rebuild_lines(&g_buf);
       cursor_pos = pos + inserted;
       cursor_sync_pos();
       sel_clear();
