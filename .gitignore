@@ -4,3 +4,4 @@
 *.zehn
 nstudio.tns
 tests/run_tests
+/nasm/
