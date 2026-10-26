@@ -28,6 +28,35 @@
 #include "undo.h"
 #include "util.h"
 
+/* ================================================================ */
+/* Allocation fault injection                                       */
+/*                                                                  */
+/* The link wraps malloc/realloc (see the Makefile) so a test can    */
+/* make the next allocation fail.  Arm it immediately before the     */
+/* call under test and disarm immediately after: everything else,    */
+/* printf included, allocates too.                                   */
+/* ================================================================ */
+extern void *__real_malloc(size_t n);
+extern void *__real_realloc(void *p, size_t n);
+
+static int g_alloc_countdown = -1; /* -1 = never fail */
+
+void *__wrap_malloc(size_t n) {
+  if (g_alloc_countdown >= 0 && g_alloc_countdown-- == 0)
+    return NULL;
+  return __real_malloc(n);
+}
+
+void *__wrap_realloc(void *p, size_t n) {
+  if (g_alloc_countdown >= 0 && g_alloc_countdown-- == 0)
+    return NULL;
+  return __real_realloc(p, n);
+}
+
+/* Let `n` allocations succeed, then fail the next one. */
+static void fail_alloc_after(int n) { g_alloc_countdown = n; }
+static void fail_alloc_never(void) { g_alloc_countdown = -1; }
+
 static int g_checks = 0;
 static int g_fails = 0;
 
@@ -888,6 +917,82 @@ static void test_textdiff_gap(void) {
   CHECK(mismatches == 0);
 }
 
+/* ================================================================ */
+/* Out-of-memory behaviour                                          */
+/* ================================================================ */
+static void test_alloc_failures(void) {
+  printf("allocation failure\n");
+
+  /* undo_record must distinguish "could not record" from "nothing to
+     record".  Conflating them is what once let a stale entry be applied to a
+     buffer that had moved on, so this is the assertion that guards it. */
+  undo_reset();
+  fail_alloc_after(0);
+  int r = undo_record("abc", 3, "abd", 3, 0, 0, 0, 0, 0, 0);
+  fail_alloc_never();
+  CHECK(r == -1);
+  CHECK(undo_can_undo() == 0); /* and the history is left untouched */
+
+  /* A successful record still works afterwards: the failure left no debris. */
+  CHECK(undo_record("abc", 3, "abd", 3, 0, 0, 0, 0, 0, 0) == 1);
+  CHECK(undo_can_undo() == 1);
+  undo_reset();
+
+  /* gb_insert_n reports the drop and raises the flag rather than writing
+     into a gap that was never grown. */
+  GapBuf g;
+  gb_init(&g);
+  gb_inserts(&g, "start\n");
+  int len_before = gb_len(&g);
+  static char big[8192];
+  memset(big, 'x', sizeof(big));
+  g_gb_oom = 0;
+  fail_alloc_after(0);
+  int got = gb_insert_n(&g, big, (int)sizeof(big));
+  fail_alloc_never();
+  CHECK(got == 0);
+  CHECK(g_gb_oom == 1);
+  CHECK(gb_len(&g) == len_before); /* contents intact */
+
+  /* The buffer still works once allocation recovers. */
+  CHECK(gb_insert(&g, 'x') == 1);
+  gb_free(&g);
+
+  /* rebuild_lines indexes what it can and says the table is short, rather
+     than dropping lines silently. */
+  GapBuf h;
+  gb_init(&h);
+  for (int i = 0; i < 2000; i++)
+    gb_inserts(&h, "x\n");
+  lines_free(); /* start from the one-entry fallback so a grow is needed */
+  fail_alloc_after(0);
+  rebuild_lines(&h);
+  fail_alloc_never();
+  CHECK(g_lines_truncated == 1);
+  CHECK(num_lines >= 1);        /* line 0 always exists */
+  CHECK(line_starts[0] == 0);   /* and is readable, never NULL */
+
+  /* Recovering re-indexes the whole file. */
+  rebuild_lines(&h);
+  CHECK(g_lines_truncated == 0);
+  CHECK(num_lines == 2001);
+  gb_free(&h);
+  lines_free();
+
+  /* asmdiag reports "unavailable" rather than an empty batch, which would
+     read as "assembled cleanly". */
+  char path[64];
+  CHECK(write_tmp("[{\"severity\":\"error\",\"file\":\"a\",\"line\":1}]\n", path));
+  AsmDiag out[4];
+  fail_alloc_after(0);
+  int n = asmdiag_parse_file(path, out, 4);
+  fail_alloc_never();
+  CHECK(n == -1);
+  /* and parses normally once memory is back */
+  CHECK(asmdiag_parse_file(path, out, 4) == 1);
+  unlink(path);
+}
+
 int main(void) {
   test_util();
   test_optab();
@@ -899,6 +1004,7 @@ int main(void) {
   test_asmdiag();
   test_asmdb();
   test_fileio();
+  test_alloc_failures();
 
   printf("\n%d checks, %d failed\n", g_checks, g_fails);
   return g_fails ? 1 : 0;

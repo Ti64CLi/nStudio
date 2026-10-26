@@ -49,8 +49,14 @@ TEST_MODULES = util.c optab.c gapbuf.c asmdiag.c asmdb.c fileio.c textdiff.c und
 test: $(TEST_BIN)
 	./$(TEST_BIN)
 
+# --wrap lets the tests make a chosen allocation fail, so the out-of-memory
+# paths - which decide whether an edit is recorded, whether the line table is
+# complete, and whether undo stays consistent - are exercised rather than only
+# reasoned about.  GNU ld only; the ARM build is unaffected.
+TEST_LDFLAGS = -Wl,--wrap=malloc -Wl,--wrap=realloc
+
 $(TEST_BIN): tests/run_tests.c $(TEST_MODULES)
-	$(HOSTCC) $(HOSTCFLAGS) -o $@ $^
+	$(HOSTCC) $(HOSTCFLAGS) -o $@ $^ $(TEST_LDFLAGS)
 
 clean:
 	rm -f $(OBJS) $(DEPS) $(EXE).tns $(EXE).elf $(EXE).tns.zehn $(TEST_BIN)
