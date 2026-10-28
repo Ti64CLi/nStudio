@@ -1,0 +1,5 @@
+# a file name that is not UTF-8 (Latin-1 e acute): nasm escapes it in the
+# JSON, and nStudio must turn it back into the very same bytes
+name=$(printf 'caf\351.asm.tns')
+printf 'main\n    bogus r0\n' >"$name"
+printf '%s' "$name" >source

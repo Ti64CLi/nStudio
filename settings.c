@@ -9,7 +9,10 @@
 #include "gfx.h"
 #include "settings.h"
 
+/* Shared with nasm.  Overridable so the host tests can use a scratch file. */
+#ifndef SETTINGS_FILE
 #define SETTINGS_FILE "/documents/ndless/nstudio.cfg"
+#endif
 
 /* ================================================================
  * Colour palette

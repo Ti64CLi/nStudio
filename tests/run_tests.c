@@ -23,6 +23,7 @@
 #include "asmdiag.h"
 #include "fileio.h"
 #include "gapbuf.h"
+#include "nasmlink.h"
 #include "optab.h"
 #include "textdiff.h"
 #include "undo.h"
@@ -1155,11 +1156,100 @@ static void test_gb_load(void) {
   unlink(path);
 }
 
+/* ================================================================ */
+/* nasmlink  (how nStudio calls nasm; integration/ checks it against */
+/*            nasm itself)                                           */
+/* ================================================================ */
+static void test_nasmlink(void) {
+  printf("nasmlink\n");
+  char out[64];
+
+  /* the output name: every extension replaced by .tns, as make_outpath does */
+  CHECK(nasmlink_output_path("/documents/foo/bar.asm.tns", out, sizeof(out)));
+  CHECK(strcmp(out, "/documents/foo/bar.tns") == 0);
+  CHECK(nasmlink_output_path("/d/a.b.c", out, sizeof(out)));
+  CHECK(strcmp(out, "/d/a.tns") == 0);
+  CHECK(nasmlink_output_path("/d/noext", out, sizeof(out)));
+  CHECK(strcmp(out, "/d/noext.tns") == 0);
+  CHECK(nasmlink_output_path("/d.dir/x.asm", out, sizeof(out)));
+  CHECK(strcmp(out, "/d.dir/x.tns") == 0); /* only the name loses its dots */
+  CHECK(nasmlink_output_path("/d/x.tns", out, sizeof(out)) == 0); /* itself */
+  CHECK(nasmlink_output_path("", out, sizeof(out)) == 0);
+  CHECK(nasmlink_output_path("/d/long-name.asm", out, 12) == 0); /* no room */
+
+  /* the command line: source, user tokens, then the two injected options */
+  static NasmInvocation inv;
+  CHECK(nasmlink_invocation(&inv, "/d/p.asm.tns", "  --a   --b\t--c ",
+                            "/x/d.json", (const void *)0x1234));
+  CHECK(inv.argc == 7);
+  CHECK(strcmp(inv.argv[0], "/d/p.asm.tns") == 0);
+  CHECK(strcmp(inv.argv[1], "--a") == 0 && strcmp(inv.argv[3], "--c") == 0);
+  CHECK(strcmp(inv.argv[4], "--diagnostics-file=/x/d.json") == 0);
+  CHECK(strcmp(inv.argv[5], "--fb") == 0);
+  CHECK(strcmp(inv.argv[6], "4660") == 0); /* 0x1234, in decimal */
+  CHECK(nasmlink_invocation(&inv, "/d/p.asm", NULL, "/x/d.json", NULL));
+  CHECK(inv.argc == 4);
+  CHECK(strcmp(inv.argv[3], "0") == 0);
+  /* at most 16 user tokens, so the injected options always fit */
+  CHECK(nasmlink_invocation(&inv, "/d/p.asm",
+                            "a b c d e f g h i j k l m n o p q r s t",
+                            "/x/d.json", NULL));
+  CHECK(inv.argc == NASMLINK_MAX_ARGS);
+  CHECK(strcmp(inv.argv[16], "p") == 0);
+  CHECK(strncmp(inv.argv[17], "--diagnostics-file=", 19) == 0);
+  /* a path that cannot be passed whole is not passed at all */
+  static char longpath[700];
+  memset(longpath, 'x', sizeof(longpath) - 1);
+  longpath[0] = '/';
+  CHECK(nasmlink_invocation(&inv, longpath, "", "/x/d.json", NULL) == 0);
+  CHECK(nasmlink_invocation(&inv, "/d/p.asm", "", longpath, NULL) == 0);
+
+  /* an INCLUDE operand, read as nasm reads the line */
+  CHECK(nasmlink_include_operand("    INCLUDE inc/a.inc", out, sizeof(out)));
+  CHECK(strcmp(out, "inc/a.inc") == 0);
+  CHECK(nasmlink_include_operand("    include x.inc ; why", out, sizeof(out)));
+  CHECK(strcmp(out, "x.inc") == 0);
+  CHECK(nasmlink_include_operand("\tGET\tz.inc\t", out, sizeof(out)));
+  CHECK(strcmp(out, "z.inc") == 0);
+  /* a label may come first; a directive in column 0 IS the label */
+  CHECK(nasmlink_include_operand("here INCLUDE y.inc", out, sizeof(out)));
+  CHECK(strcmp(out, "y.inc") == 0);
+  CHECK(nasmlink_include_operand("INCLUDE y.inc", out, sizeof(out)) == 0);
+  /* the operand runs to the comment, inner blanks and quoted ';' included */
+  CHECK(nasmlink_include_operand("    INCLUDE a\tb.inc", out, sizeof(out)));
+  CHECK(strcmp(out, "a\tb.inc") == 0);
+  CHECK(nasmlink_include_operand("    INCLUDE \"x;y\".inc ; c", out,
+                                 sizeof(out)));
+  CHECK(strcmp(out, "\"x;y\".inc") == 0);
+  CHECK(nasmlink_include_operand("    INCLUDE", out, sizeof(out)) == 0);
+  CHECK(nasmlink_include_operand("    mov r0, r1", out, sizeof(out)) == 0);
+  CHECK(nasmlink_include_operand("; INCLUDE x.inc", out, sizeof(out)) == 0);
+
+  /* resolution against the includer, as nasm's abspath() does */
+  const char *main_file = "/documents/p/main.asm.tns";
+  char path[128];
+  CHECK(nasmlink_resolve_include(main_file, "inc/a.inc", path, sizeof(path)));
+  CHECK(strcmp(path, "/documents/p/inc/a.inc") == 0);
+  CHECK(nasmlink_resolve_include(main_file, "./a.inc", path, sizeof(path)));
+  CHECK(strcmp(path, "/documents/p/a.inc") == 0);
+  CHECK(nasmlink_resolve_include(main_file, "../lib/b.inc", path, sizeof(path)));
+  CHECK(strcmp(path, "/documents/lib/b.inc") == 0);
+  CHECK(nasmlink_resolve_include(main_file, "../../x.inc", path, sizeof(path)));
+  CHECK(strcmp(path, "/x.inc") == 0);
+  CHECK(nasmlink_resolve_include(main_file, "/abs/y.inc", path, sizeof(path)));
+  CHECK(strcmp(path, "/abs/y.inc") == 0);
+  /* only leading ./ and ../ are resolved; the rest is kept as written */
+  CHECK(nasmlink_resolve_include(main_file, "sub/../c.inc", path, sizeof(path)));
+  CHECK(strcmp(path, "/documents/p/sub/../c.inc") == 0);
+  CHECK(nasmlink_resolve_include(main_file, "inc/a.inc", path, 12) == 0);
+}
+
 int main(void) {
   test_util();
   test_optab();
   test_gapbuf();
   test_gb_load();
+  test_nasmlink();
   test_lines_shift();
   test_textdiff();
   test_textdiff_gap();

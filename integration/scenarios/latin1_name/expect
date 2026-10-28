@@ -1,0 +1,3 @@
+status 1: ERRORS
+program: caf\xe9.tns (not written), Run not offered
+error syntax caf\xe9.asm.tns:2:5 -> line 2

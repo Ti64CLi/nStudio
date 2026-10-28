@@ -100,6 +100,17 @@ make
 
 This will produce the `nstudio.tns` executable.
 
+## Testing
+
+Both test suites run on the computer, with its own C compiler rather than the Ndless toolchain:
+
+```bash
+make test         # unit tests of the editor's core modules
+make integration  # nStudio and nasm together, end to end
+```
+
+The integration test builds nasm from its sources and assembles a set of scenarios exactly as the editor does, checking what nStudio makes of each result (diagnostics, where they point, the program it offers to run). It also checks that the settings file survives a round trip through nasm. It needs a checkout of [nasm](https://github.com/Ti64CLi/nasm): by default it looks in `./nasm`, or set `NASM_DIR=<path>`. `python3`, if present, is used to check nasm's diagnostics files against their documented format.
+
 ## Installation
 
 1. Transfer the `nstudio.tns` file to your TI-Nspire using the TI-Nspire Student Software, N-Link, or TiLP.

@@ -1,0 +1,4 @@
+main
+    mov r0, #1
+    INCLUDE sub/main.asm.tns
+    bx lr

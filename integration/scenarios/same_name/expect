@@ -1,0 +1,4 @@
+status 1: ERRORS
+program: main.tns (not written), Run not offered
+error syntax sub/main.asm.tns:2:5 -> include 3
+    via main.asm.tns:3 "sub/main.asm.tns": same file

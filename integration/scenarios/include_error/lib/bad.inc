@@ -1,0 +1,2 @@
+; broken
+    bogus r0

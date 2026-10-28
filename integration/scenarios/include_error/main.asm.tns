@@ -1,0 +1,3 @@
+main
+    INCLUDE inc/mid.inc
+    bx lr

@@ -1,0 +1,3 @@
+status 1: ERRORS
+program: main.tns (not written), Run not offered
+error syntax main.asm.tns:3:5 -> line 3

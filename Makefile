@@ -14,7 +14,7 @@ else
 	GCCFLAGS += -O0 -g
 endif
 
-SRCS = nstudio.c gfx.c editor.c editor_ui.c settings.c gapbuf.c syntax.c asmdb.c browser.c optab.c util.c asmdiag.c fileio.c textdiff.c undo.c
+SRCS = nstudio.c gfx.c editor.c editor_ui.c settings.c gapbuf.c syntax.c asmdb.c browser.c optab.c util.c asmdiag.c fileio.c textdiff.c undo.c nasmlink.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 EXE = nstudio
@@ -44,7 +44,7 @@ $(EXE).tns: $(EXE).elf
 HOSTCC ?= cc
 HOSTCFLAGS = -Wall -W -O0 -g -I.
 TEST_BIN = tests/run_tests
-TEST_MODULES = util.c optab.c gapbuf.c asmdiag.c asmdb.c fileio.c textdiff.c undo.c
+TEST_MODULES = util.c optab.c gapbuf.c asmdiag.c asmdb.c fileio.c textdiff.c undo.c nasmlink.c
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)
@@ -58,7 +58,19 @@ TEST_LDFLAGS = -Wl,--wrap=malloc -Wl,--wrap=realloc
 $(TEST_BIN): tests/run_tests.c $(TEST_MODULES)
 	$(HOSTCC) $(HOSTCFLAGS) -o $@ $^ $(TEST_LDFLAGS)
 
+# ----------------------------------------------------------------------
+# Integration test: nStudio's side of the exchange with nasm (nasmlink.c,
+# asmdiag.c and the settings code) against nasm's real command line, built
+# for the host from its sources.  nasm is a separate repository: NASM_DIR
+# points at a checkout of it.
+# ----------------------------------------------------------------------
+NASM_DIR ?= nasm
+
+integration:
+	sh integration/run.sh $(NASM_DIR)
+
 clean:
 	rm -f $(OBJS) $(DEPS) $(EXE).tns $(EXE).elf $(EXE).tns.zehn $(TEST_BIN)
+	rm -rf integration/build
 
-.PHONY: all clean test
+.PHONY: all clean test integration

@@ -1,0 +1,2 @@
+# a directory where nasm writes its temporary output makes the write fail
+mkdir main.tns.tmp

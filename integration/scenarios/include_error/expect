@@ -1,0 +1,4 @@
+status 1: ERRORS
+program: main.tns (not written), Run not offered
+error syntax lib/bad.inc:2:5 -> include 2
+    via inc/mid.inc:2 "../lib/bad.inc": same file

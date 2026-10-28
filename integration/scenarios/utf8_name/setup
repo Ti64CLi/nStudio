@@ -1,0 +1,4 @@
+# a UTF-8 file name (e acute): passed through the JSON as it is
+name=$(printf 'caf\303\251.asm.tns')
+printf 'main\n    bogus r0\n' >"$name"
+printf '%s' "$name" >source

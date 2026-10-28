@@ -1,0 +1,4 @@
+main
+    mov r0, #1
+    bogus r0
+    bx lr

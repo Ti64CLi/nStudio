@@ -41,6 +41,7 @@
 #include "editor_ui.h"
 #include "fileio.h"
 #include "gapbuf.h"
+#include "nasmlink.h"
 #include "optab.h"
 #include "gfx.h"
 #include "settings.h"
@@ -2405,112 +2406,21 @@ static int editor_label_browser(void) {
 /* ================================================================
  * Follow an INCLUDE
  *
- * nasm resolves an INCLUDE against the directory of the file containing it
- * and takes the operand verbatim - it appends no extension - so on the
- * calculator the directive names the file in full, ".tns" and all.  The
- * resolution below mirrors nasm's abspath(): absolute paths stand, "./" is
- * skipped and each leading "../" climbs one directory.
+ * The directive is read and its file resolved exactly as nasm does - see
+ * nasmlink.h - so the file opened here is the one nasm assembles.
  * ================================================================ */
-
-/* If the current line is an INCLUDE (or GET), copy its operand into `out`.
-   Returns its length, or 0 when this is not an include line. */
-static int include_operand(char *out, int outsz) {
-  extract_line(cursor_row);
-  const char *line = line_scratch;
-  int len = (int)strlen(line);
-
-  int i = 0;
-  while (i < len && (line[i] == ' ' || line[i] == '\t'))
-    i++;
-  int ds = i;
-  while (i < len && (isalnum((unsigned char)line[i]) || line[i] == '_'))
-    i++;
-  int dlen = i - ds;
-  if (dlen == 0 || dlen >= 16)
-    return 0;
-
-  char directive[16];
-  memcpy(directive, line + ds, (size_t)dlen);
-  directive[dlen] = '\0';
-  if (!is_preasm_directive(directive))
-    return 0; /* INCLUDE and GET, as optab defines them */
-
-  while (i < len && (line[i] == ' ' || line[i] == '\t'))
-    i++;
-  int os = i;
-  while (i < len && line[i] != ';' && line[i] != '\t')
-    i++;
-  int olen = i - os;
-  while (olen > 0 && line[os + olen - 1] == ' ') /* trim trailing spaces */
-    olen--;
-
-  if (olen <= 0 || olen >= outsz)
-    return 0;
-  memcpy(out, line + os, (size_t)olen);
-  out[olen] = '\0';
-  return olen;
-}
-
-/* Resolve `rel` against the open file's directory, as nasm's abspath does.
-   Returns 0 if the result would not fit, rather than silently forming a
-   truncated path that would then be reported as missing. */
-static int resolve_include_path(const char *rel, char *out, int outsz) {
-  if (rel[0] == '/') { /* already absolute */
-    if ((int)strlen(rel) >= outsz)
-      return 0;
-    strncpy(out, rel, (size_t)outsz - 1);
-    out[outsz - 1] = '\0';
-    return 1;
-  }
-
-  char dir[1024];
-  strncpy(dir, g_filepath, sizeof(dir) - 1);
-  dir[sizeof(dir) - 1] = '\0';
-  char *slash = strrchr(dir, '/');
-  if (slash)
-    slash[1] = '\0'; /* keep the trailing slash, as nasm does */
-  else
-    dir[0] = '\0';
-
-  while (*rel) {
-    if (rel[0] == '.' && rel[1] == '/') {
-      rel += 2;
-      continue;
-    }
-    if (rel[0] == '.' && rel[1] == '.' && rel[2] == '/') {
-      /* Climb one directory: drop the trailing slash, then the last name. */
-      int dl = (int)strlen(dir);
-      if (dl > 0 && dir[dl - 1] == '/')
-        dir[--dl] = '\0';
-      char *up = strrchr(dir, '/');
-      if (up)
-        up[1] = '\0';
-      else
-        dir[0] = '\0';
-      rel += 3;
-      continue;
-    }
-    break;
-  }
-
-  int dl = (int)strlen(dir), rl = (int)strlen(rel);
-  if (dl + rl >= outsz)
-    return 0;
-  memcpy(out, dir, (size_t)dl);
-  memcpy(out + dl, rel, (size_t)rl + 1); /* copies the terminator too */
-  return 1;
-}
 
 /* Open the file an INCLUDE line names.  Returns 1 when this was an include
    line, whether or not the file could be opened, so the caller knows the line
    was handled. */
 static int editor_follow_include(void) {
   char operand[256];
-  if (include_operand(operand, sizeof(operand)) == 0)
+  extract_line(cursor_row);
+  if (nasmlink_include_operand(line_scratch, operand, sizeof(operand)) == 0)
     return 0;
 
   char path[1024];
-  if (!resolve_include_path(operand, path, sizeof(path))) {
+  if (!nasmlink_resolve_include(g_filepath, operand, path, sizeof(path))) {
     static const char *body[] = {"That include path is too long to open."};
     gfx_window_alert("Follow Include", body, 1, "OK");
     return 1;
@@ -2920,46 +2830,10 @@ static void menu_draw(int top_sel, int sub_sel, int in_sub) {
 
 /* ================================================================
  * Assemble current file via nasm
+ *
+ * The command line, the diagnostics file and the name of the program nasm
+ * builds are nasmlink's; this is the editor's half of the exchange.
  * ================================================================ */
-/* Where nasm writes its JSON diagnostics for us to read back (see asmdiag.h
-   for the contract).  Lives in the shared Ndless config directory, which
-   already holds nstudio.cfg. */
-#define ASM_DIAG_FILE "/documents/ndless/nstudio_diag.json"
-
-/*
- * Where nasm will put the program it builds from `src`.
- *
- * This mirrors nasm's own make_outpath() exactly: every dot-extension is
- * stripped from the file name - it cuts at the FIRST dot, not the last - and
- * ".tns" is appended, so /documents/foo/bar.asm.tns becomes
- * /documents/foo/bar.tns.  nasm derives this itself and offers no way to
- * override it from the command line, so recomputing it here is the only way to
- * know what was built; keep the two in step.
- *
- * Returns 0 when no usable path exists: an unsaved buffer, a path too long to
- * extend, or a result identical to the source - the last being exactly the case
- * nasm itself refuses to build, so nothing was produced to run.  A name with no
- * dot simply gains ".tns", matching nasm rather than second-guessing it.
- */
-static int editor_output_path(const char *src, char *out, size_t outsz) {
-  if (!src || !src[0])
-    return 0;
-  if (strlen(src) + 5 > outsz)
-    return 0; /* no room for the stripped name plus ".tns" and its NUL */
-
-  strncpy(out, src, outsz - 1);
-  out[outsz - 1] = '\0';
-
-  char *name = strrchr(out, '/');
-  name = name ? name + 1 : out;
-
-  char *dot = strchr(name, '.');
-  if (dot)
-    *dot = '\0';
-
-  strcat(out, ".tns");
-  return strcmp(out, src) != 0;
-}
 
 /* Hand the calculator over to `path` and take the screen back afterwards.
    nl_exec runs the child in this process and returns once it exits. */
@@ -3050,7 +2924,7 @@ static void diag_jump_to_nav(int nav_pos) {
 static int editor_load_diagnostics(void) {
   diag_nav_reset();
 
-  int n = asmdiag_parse_file(ASM_DIAG_FILE, g_diags, ASMDIAG_MAX);
+  int n = asmdiag_parse_file(NASMLINK_DIAG_FILE, g_diags, ASMDIAG_MAX);
   if (n <= 0)
     return n;
   g_ndiags = n;
@@ -3358,7 +3232,7 @@ static void editor_report_build(AsmBuildOutcome outcome, int status) {
   }
   case ASMBUILD_NO_REPORT: {
     static const char *body[] = {"nasm could not write its report to",
-                                 ASM_DIAG_FILE,
+                                 NASMLINK_DIAG_FILE,
                                  "so the result of the build is unknown."};
     gfx_window_alert("Assemble", body, 3, "OK");
     break;
@@ -3422,53 +3296,22 @@ static void editor_assemble(void) {
       return;
   }
 
-  /*
-   * argv layout seen by nasm:
-   *   argv[0]  = nasm executable name  (set by nl_exec / Ndless)
-   *   argv[1]  = asm source file path  (args[0])
-   *   argv[2+] = tokens from g_settings.nasm_args
-   *
-   * nl_exec takes only the *extra* arguments after the program name,
-   * and argsn / args[] map straight to argv[1..] of the child.
-   *
-   * We tokenise nasm_args in a local copy (strtok is destructive).
-   * Maximum supported extra tokens: 16.
-   */
-#define NASM_MAX_ARGS                                                          \
-  20 /* 1 (file) + up to 16 flag tokens + 3 (--diagnostics-file, --fb, addr) */
-  char args_copy[128];
-  strncpy(args_copy, g_settings.nasm_args, sizeof(args_copy) - 1);
-  args_copy[sizeof(args_copy) - 1] = '\0';
-
-  char *args[NASM_MAX_ARGS];
-  int argsn = 0;
-  args[argsn++] = g_filepath; /* always first: the source file */
-
-  /* Keep three slots free for the injected diagnostics-file and "--fb addr". */
-  char *tok = strtok(args_copy, " \t");
-  while (tok && argsn < NASM_MAX_ARGS - 3) {
-    args[argsn++] = tok;
-    tok = strtok(NULL, " \t");
+  /* The command line nasm is given (see nasmlink.h).  Static rather than on
+     the stack: nl_exec runs nasm on this very stack, below this frame. */
+  static NasmInvocation inv;
+  if (!nasmlink_invocation(&inv, g_filepath, g_settings.nasm_args,
+                           NASMLINK_DIAG_FILE, gfx_framebuffer())) {
+    static const char *body[] = {"The file's path is too long",
+                                 "to pass to nasm."};
+    gfx_window_alert("Assemble", body, 2, "OK");
+    return;
   }
-
-  /* Ask nasm to write structured diagnostics to a file we can read back;
-     passing this alone is enough to select JSON output.  An older nasm that
-     predates the option ignores it, and we say so after the run. */
-  static char diag_arg[] = "--diagnostics-file=" ASM_DIAG_FILE;
-  args[argsn++] = diag_arg;
-
-  /* Inject the framebuffer argument so nasm can inherit our screen state */
-  char fb_addr_str[32];
-  snprintf(fb_addr_str, sizeof(fb_addr_str), "%lu",
-           (unsigned long)gfx_framebuffer());
-  args[argsn++] = "--fb";
-  args[argsn++] = fb_addr_str;
 
   /* Clear any stale diagnostics from a previous run so a cancelled assemble
      (which never rewrites the file) is never mistaken for this run. */
-  remove(ASM_DIAG_FILE);
+  remove(NASMLINK_DIAG_FILE);
 
-  int status = nl_exec(g_settings.nasm_path, argsn, args);
+  int status = nl_exec(g_settings.nasm_path, inv.argc, inv.argv);
   /*
    * nl_exec returns after the child exits (or immediately if it could not
    * be launched).  The child may have re-initialised or restored the LCD
@@ -3492,7 +3335,7 @@ static void editor_assemble(void) {
 
   char outpath[1024];
   struct stat ost;
-  if (editor_output_path(g_filepath, outpath, sizeof(outpath)) &&
+  if (nasmlink_output_path(g_filepath, outpath, sizeof(outpath)) &&
       stat(outpath, &ost) == 0) {
     char line[288];
     snprintf(line, sizeof(line), "Output: %s", asmdiag_base_name(outpath));
@@ -3500,7 +3343,6 @@ static void editor_assemble(void) {
     if (gfx_window_confirm2("Assemble", body, 3, "Run", "Close") == 0)
       editor_run_program(outpath);
   }
-#undef NASM_MAX_ARGS
 }
 
 /*
@@ -3511,7 +3353,7 @@ static void editor_assemble(void) {
  */
 static void editor_run_build(void) {
   char outpath[1024];
-  if (!editor_output_path(g_filepath, outpath, sizeof(outpath))) {
+  if (!nasmlink_output_path(g_filepath, outpath, sizeof(outpath))) {
     static const char *body[] = {"This buffer has not been saved,",
                                  "so there is no build to run."};
     gfx_window_alert("Run", body, 2, "OK");

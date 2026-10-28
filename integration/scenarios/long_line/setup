@@ -1,0 +1,3 @@
+# a comment line longer than any fixed-size read, then an error on line 3
+long=$(head -c 4100 /dev/zero | tr '\0' x)
+printf 'main\n;%s\n    bogus r0\n' "$long" >main.asm.tns
