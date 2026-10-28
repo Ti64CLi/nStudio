@@ -1,7 +1,7 @@
 /*
  * asmdiag.h
  * Consumer for the structured assembler diagnostics produced by the companion
- * nasm assembler (../nasm).  This is the nStudio side of the contract; nasm's
+ * nasm assembler.  This is the nStudio side of the contract; nasm's
  * diag.c is the producer.
  *
  * ------------------------------------------------------------------
@@ -26,6 +26,12 @@
  *
  *   3. After nl_exec() returns, nStudio parses <path>.  Absent/unreadable is
  *      "no diagnostics available"; an empty array is "assembled cleanly".
+ *
+ *   4. nl_exec() also returns nasm's exit status (ASMDIAG_EXIT_* below), or
+ *      Ndless's own code when nasm could not be run at all.
+ *      asmdiag_build_outcome() combines the two channels: a build counts as
+ *      successful only when the status is 0 AND the batch is empty.  An nasm
+ *      that predates exit statuses always returns 0, which still works.
  *
  * JSON schema (from nasm's diag_write_json; reused here verbatim, never
  * reinterpreted).  Each object has, in order:
@@ -137,31 +143,84 @@ typedef struct {
 int asmdiag_parse_file(const char *path, AsmDiag *out, int max);
 
 /*
- * Index of the first diagnostic that belongs to `path` (matched by full path,
- * else by base name) and carries a real line number (line >= 1), or -1 if
+ * Index of the first diagnostic that belongs to `path` (see
+ * asmdiag_same_file) and carries a real line number (line >= 1), or -1 if
  * none - e.g. when every error is in an INCLUDEd file.  Used to jump only when
  * the location exists in the buffer the editor currently shows.
  */
 int asmdiag_first_for_file(const AsmDiag *diags, int n, const char *path);
 
 /*
- * Whether diagnostic `d` belongs to the file `path` (matched by full path,
- * else by base name) and carries a real line number (line >= 1) - i.e. it has
- * a location the editor can jump to in the buffer it currently shows.  Shared
- * by asmdiag_first_for_file and by the editor's error-navigation list.
+ * Whether diagnostic `d` belongs to the file `path` (see asmdiag_same_file)
+ * and carries a real line number (line >= 1) - i.e. it has a location the
+ * editor can jump to in the buffer it currently shows.  Shared by
+ * asmdiag_first_for_file and by the editor's error-navigation list.
  */
 int asmdiag_in_file(const AsmDiag *d, const char *path);
 
 /*
  * Whether a file path recorded in a diagnostic (or in one of its related
- * locations / include frames) refers to `path`, matched by full path and then
- * by base name.  Exposed so callers can test a related location, which carries
- * its own file, with exactly the rule asmdiag_in_file applies to the primary.
+ * locations / include frames) refers to `path`.  Both are normalised first -
+ * "//", "." and ".." segments resolved - and then compared whole: two files
+ * that merely share a name in different directories are different files.
+ * Exposed so callers can test a related location, which carries its own file,
+ * with exactly the rule asmdiag_in_file applies to the primary.
  */
 int asmdiag_same_file(const char *diag_file, const char *path);
+
+/* Where a diagnostic can be shown in the open file - see asmdiag_locate. */
+typedef enum {
+  ASMDIAG_NOWHERE,   /* no line, or in a file the open one does not include */
+  ASMDIAG_AT_LINE,   /* on its own line, in the open file */
+  ASMDIAG_AT_INCLUDE /* in an included file: at the INCLUDE that brought it in */
+} AsmDiagPlace;
+
+/*
+ * Where diagnostic `d` can be shown in the file `path`: its own line (and
+ * column) when it is in that file; otherwise the line of the innermost INCLUDE
+ * in that file through which its own file was reached, with *col 0.  *line and
+ * *col are set unless the result is ASMDIAG_NOWHERE.
+ */
+AsmDiagPlace asmdiag_locate(const AsmDiag *d, const char *path, int *line,
+                            int *col);
 
 /* Base name (component after the last '/') of a path; "" for NULL.  Handy for
    showing a compact origin in a status line. */
 const char *asmdiag_base_name(const char *path);
+
+/*
+ * What nl_exec() returns when the program never ran: Ndless's loader reports
+ * 0xDEAD when it could not load it at all (missing, not a program, out of
+ * memory), and 0xBEEF when it declined and has already told the user why.
+ */
+#define ASMDIAG_NL_CANNOT_RUN 0xDEAD
+#define ASMDIAG_NL_DECLINED 0xBEEF
+
+/* nasm's exit status for a command-line assemble (its NASM_EXIT_* values). */
+#define ASMDIAG_EXIT_ASSEMBLED 0 /* the output file holds this build */
+#define ASMDIAG_EXIT_ERRORS 1    /* not assembled; the diagnostics say why */
+#define ASMDIAG_EXIT_NOT_RUN 2   /* cancelled or refused before assembling */
+#define ASMDIAG_EXIT_NO_REPORT 3 /* the diagnostics file could not be written */
+
+/* What one assemble came to, judged from both channels together. */
+typedef enum {
+  ASMBUILD_OK,          /* assembled: the program on disk is this build */
+  ASMBUILD_ERRORS,      /* failed, with diagnostics to show */
+  ASMBUILD_FAILED,      /* failed, without any diagnostic to show */
+  ASMBUILD_NOT_RUN,     /* nasm assembled nothing: cancelled or refused */
+  ASMBUILD_NO_REPORT,   /* nasm could not write the diagnostics file */
+  ASMBUILD_NOT_STARTED, /* Ndless could not run nasm */
+  ASMBUILD_DECLINED,    /* Ndless declined to run nasm, and said why */
+  ASMBUILD_UNKNOWN      /* status 0 but no diagnostics file: an nasm older
+                           than both channels, which cannot say how it went */
+} AsmBuildOutcome;
+
+/*
+ * Combine nl_exec()'s return value with asmdiag_parse_file()'s result.  Only
+ * status 0 with an empty batch is success.  A non-empty batch means errors
+ * whatever the status, since an older nasm always returns 0, and a status
+ * this nStudio does not know is never taken for success.
+ */
+AsmBuildOutcome asmdiag_build_outcome(int exit_status, int ndiag);
 
 #endif /* ASMDIAG_H_INCLUDED */

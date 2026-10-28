@@ -199,8 +199,9 @@ static int g_build_stale;
 
 /* Assemble diagnostics retained for next/previous-error navigation.  Populated
    after each assemble: g_diags holds the whole parsed batch, g_diag_nav holds
-   the indices of those that land in the file currently open (line >= 1), and
-   g_diag_cur is the current position within g_diag_nav (-1 when none).  Any
+   the navigation order over it (every diagnostic is in it, placed in the open
+   file or not - see editor_load_diagnostics), and g_diag_cur is the current
+   position within g_diag_nav (-1 when none).  Any
    buffer edit clears this (see diag_nav_reset callers), so navigation can
    never jump to a line the diagnostics no longer describe. */
 static AsmDiag g_diags[ASMDIAG_MAX];
@@ -217,45 +218,22 @@ static void diag_nav_reset(void) {
 
 static int path_is_asm_source(const char *path);
 
-static int load_file(const char *path) {
-  FILE *f = fopen(path, "rb");
-  gb_init(&g_buf);
-  g_crlf = 0;
-  if (!f) {
-    rebuild_lines(&g_buf);
-    return 0;
-  }
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  rewind(f);
-  if (sz > 0) {
-    char *tmp = (char *)malloc(sz);
-    if (tmp) {
-      size_t br = fread(tmp, 1, sz, f);
-      if (path_is_asm_source(path)) {
-        /* Editable source: normalise CRLF -> LF in the buffer and
-           remember the file's style so it round-trips on save. */
-        int out = 0;
-        for (size_t i = 0; i < br; i++) {
-          if (tmp[i] == '\r' && i + 1 < br && tmp[i + 1] == '\n') {
-            g_crlf = 1;
-            continue;
-          }
-          tmp[out++] = tmp[i];
-        }
-        gb_insert_n(&g_buf, tmp, out);
-      } else {
-        /* Byte-exact insert: NUL bytes survive, so an accidentally
-           opened binary is not truncated and round-trips on save. */
-        gb_insert_n(&g_buf, tmp, (int)br);
-      }
-      free(tmp);
-    }
-  }
-  fclose(f);
-  gb_move(&g_buf, 0);
-  rebuild_lines(&g_buf);
-  return 1;
+/* Read `path` into the fresh buffer `g`.  An editable source has CRLF
+   normalised to LF, with *crlf recording the file's style so it round-trips
+   on save; anything else is kept byte-exact, NUL bytes included, so an
+   accidentally opened binary is not truncated and round-trips too. */
+static GbLoadResult load_file(const char *path, GapBuf *g, int *crlf) {
+  return gb_load_file(g, path, path_is_asm_source(path), crlf);
+}
+
+/* Say that `path` could not be opened.  It is never shown as an empty buffer
+   instead, since saving that would replace the file with nothing. */
+static void load_failed_alert(const char *path) {
+  char line[288];
+  snprintf(line, sizeof(line), "Could not open %s.", asmdiag_base_name(path));
+  const char *body[] = {line, "Not enough memory, or the file could",
+                        "not be read in full."};
+  gfx_window_alert("Open", body, 3, "OK");
 }
 
 /* Write a run of bytes, expanding '\n' to "\r\n" when in CRLF mode.
@@ -2153,14 +2131,31 @@ static int editor_do_save(void);
 
 /* Replace the buffer with `path`, discarding everything that described the
    previous file: cursor, selection, undo history, jump trail, diagnostics and
-   the build's currency.  Callers are responsible for offering to save first. */
-static void editor_switch_to(const char *path) {
-  settings_remember_file_dir(path);
+   the build's currency.  Callers are responsible for offering to save first.
 
-  strncpy(g_filepath, path, sizeof(g_filepath) - 1);
-  g_filepath[sizeof(g_filepath) - 1] = '\0';
+   The new file is read before the current one is let go, so one that cannot
+   be loaded leaves the editor exactly as it was: returns 0 in that case, after
+   saying so, and 1 once the switch is made. */
+static int editor_switch_to(const char *path) {
+  char newpath[sizeof(g_filepath)];
+  strncpy(newpath, path, sizeof(newpath) - 1);
+  newpath[sizeof(newpath) - 1] = '\0';
+
+  GapBuf nb;
+  int crlf;
+  if (load_file(newpath, &nb, &crlf) == GB_LOAD_FAILED) {
+    gb_free(&nb);
+    load_failed_alert(newpath);
+    return 0;
+  }
+
+  settings_remember_file_dir(newpath);
+
+  strcpy(g_filepath, newpath);
   gb_free(&g_buf);
-  load_file(g_filepath);
+  g_buf = nb;
+  g_crlf = crlf;
+  rebuild_lines(&g_buf);
   cursor_pos = 0;
   cursor_row = 0;
   cursor_col = 0;
@@ -2177,6 +2172,7 @@ static void editor_switch_to(const char *path) {
   /* The jump trail is deliberately not cleared here: it records the file each
      mark belongs to, so it survives following an INCLUDE.  Callers that mean
      to abandon it say so. */
+  return 1;
 }
 
 static void editor_open_file(void) {
@@ -2203,8 +2199,8 @@ static void editor_open_file(void) {
   if (!browser_pick_file(start_dir, 1, newpath, sizeof(newpath)))
     return;
 
-  editor_switch_to(newpath);
-  jump_stack_clear(); /* picking a file is starting elsewhere, not navigating */
+  if (editor_switch_to(newpath))
+    jump_stack_clear(); /* picking a file is starting elsewhere, not navigating */
 }
 
 /* Save As: pick a directory, then enter a filename; saves as dir/name.tns.
@@ -2365,13 +2361,12 @@ static void labels_scan(void) {
   }
 }
 
-/* Return the line (0-based) of the label with the given name,
-   case-insensitive.  Returns -1 if not found. */
+/* Return the line (0-based) of the label with the given name, or -1 if not
+   found.  Case-sensitive, as nasm's own label lookup is: "LOOP" does not
+   refer to "loop", and saying it does would contradict the assembler. */
 static int label_find(const char *name) {
-  int nlen = (int)strlen(name);
   for (int i = 0; i < g_nlabels; i++) {
-    int llen = (int)strlen(g_labels[i].name);
-    if (llen == nlen && strncaseeq(g_labels[i].name, name, nlen))
+    if (strcmp(g_labels[i].name, name) == 0)
       return g_labels[i].line;
   }
   return -1;
@@ -2542,7 +2537,8 @@ static int editor_follow_include(void) {
   }
 
   jump_push(); /* so Ctrl+Shift+Enter comes back to this line */
-  editor_switch_to(path);
+  if (!editor_switch_to(path))
+    g_jump_count--; /* still here, so there is nothing to come back from */
   return 1;
 }
 
@@ -2689,7 +2685,8 @@ static void editor_jump_back(void) {
         return;
       }
     }
-    editor_switch_to(mark.path);
+    if (!editor_switch_to(mark.path))
+      return; /* keep the mark: the file may open once memory is freed */
   }
 
   g_jump_count--; /* only consume the mark once the move is certain */
@@ -2704,8 +2701,8 @@ static void editor_jump_back(void) {
  *
  * Every mention of a label, wherever it appears as a whole identifier -
  * branch targets, operands, EQU right-hand sides.  Matching is
- * case-insensitive and word-bounded, the same rule label_find uses, so a
- * label named "loop" is not found inside "loopback".
+ * case-sensitive and word-bounded, the same rule label_find (and nasm) uses,
+ * so a label named "loop" is found neither inside "loopback" nor as "LOOP".
  * ================================================================ */
 #define MAX_REFS 128
 /* Source lines have no fixed limit, so this is a pragmatic cap: far more than
@@ -2737,7 +2734,7 @@ static void refs_scan(const char *name) {
       int ws = i;
       while (i < len && (isalnum((unsigned char)line[i]) || line[i] == '_'))
         i++;
-      if (i - ws != nlen || !strncaseeq(line + ws, name, nlen))
+      if (i - ws != nlen || strncmp(line + ws, name, (size_t)nlen) != 0)
         continue;
 
       /* Trim leading blanks so the row shows the code, not the indent. */
@@ -2993,10 +2990,11 @@ static const char *diag_severity_name(const AsmDiag *d) {
 
 /* Select the diagnostic at navigation position `nav_pos` (an index into
    g_diag_nav, in [0, g_diag_nav_count)) and describe it in the status bar.
-   Diagnostics in the open file move the cursor to their location; those in
-   another file - typically reached through INCLUDE, and previously skipped
-   altogether - leave the cursor alone and report where they are, naming the
-   file that included them so the origin is not a mystery. */
+   Diagnostics in the open file move the cursor to their location.  One in a
+   file this one INCLUDEs moves it to the INCLUDE that brought that file in, and
+   one with nowhere to go here - no line at all, or another file entirely -
+   leaves the cursor alone; both report where the diagnostic is, naming the file
+   that included it, so the origin is not a mystery. */
 static void diag_jump_to_nav(int nav_pos) {
   g_diag_cur = nav_pos;
   const AsmDiag *d = &g_diags[g_diag_nav[nav_pos]];
@@ -3008,36 +3006,47 @@ static void diag_jump_to_nav(int nav_pos) {
   if (d->related_count > 0)
     snprintf(rel, sizeof(rel), "  [+%d rel]", d->related_count);
 
-  if (asmdiag_in_file(d, g_filepath)) {
-    editor_goto_line_col(d->line, d->col);
+  int line, col;
+  AsmDiagPlace place = asmdiag_locate(d, g_filepath, &line, &col);
+
+  if (place == ASMDIAG_AT_LINE) {
+    editor_goto_line_col(line, col);
     snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d, line %d: %s%s",
-             sev, nav_pos + 1, g_diag_nav_count, d->line, d->message, rel);
+             sev, nav_pos + 1, g_diag_nav_count, line, d->message, rel);
     return;
   }
 
-  /* Another file: name it, and the immediate includer when nasm gave us one
-     (include frames run outermost first, so the parent is the last). */
+  if (place == ASMDIAG_AT_INCLUDE)
+    editor_goto_line_col(line, col);
+
+  /* Elsewhere: name the file, its line when it has one, and the immediate
+     includer when nasm gave us one (include frames run outermost first, so the
+     parent is the last). */
+  char at[16] = "";
+  if (d->line >= 1)
+    snprintf(at, sizeof(at), ":%d", d->line);
   char from[80] = "";
   if (d->include_count > 0) {
     const AsmDiagInclude *parent = &d->include_stack[d->include_count - 1];
     snprintf(from, sizeof(from), " (from %s:%d)",
              asmdiag_base_name(parent->file), parent->line);
   }
-  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d in %s:%d%s: %s%s",
-           sev, nav_pos + 1, g_diag_nav_count, asmdiag_base_name(d->file),
-           d->line, from, d->message, rel);
+  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d in %s%s%s: %s%s",
+           sev, nav_pos + 1, g_diag_nav_count, asmdiag_base_name(d->file), at,
+           from, d->message, rel);
 }
 
-/* After an assemble, read the diagnostics nasm left behind and retain every one
-   that has a real location, whichever file it is in: those in the open file are
-   jumped to, the rest are reported in place by diag_jump_to_nav.  Diagnostics
-   with no line at all stay out of the cycle, since there is nothing to show.
-   The first entry is selected, preferring one the cursor can actually reach.
+/* After an assemble, read the diagnostics nasm left behind and retain every
+   one, wherever it is and whether or not it has a line: those that can be
+   placed in the open file are jumped to, and the rest are still reported by
+   diag_jump_to_nav - an error that is never mentioned is worse than one that
+   cannot be pointed at.  The first entry is selected, preferring one on its
+   own line in this file, then one reached through an INCLUDE here.
 
    Returns what the diagnostics file said: 0 when nasm wrote an empty batch
    (assembled cleanly), a positive count when it reported problems, and -1 when
    there was no file to read - a cancelled run, or an nasm too old to know the
-   option.  Only 0 is proof of a successful build. */
+   option.  asmdiag_build_outcome() weighs this against nasm's exit status. */
 static int editor_load_diagnostics(void) {
   diag_nav_reset();
 
@@ -3046,17 +3055,21 @@ static int editor_load_diagnostics(void) {
     return n;
   g_ndiags = n;
 
-  int first_here = -1;
+  int first_line = -1, first_include = -1;
   for (int i = 0; i < g_ndiags && g_diag_nav_count < ASMDIAG_MAX; i++) {
-    if (g_diags[i].line < 1)
-      continue;
-    if (first_here < 0 && asmdiag_in_file(&g_diags[i], g_filepath))
-      first_here = g_diag_nav_count;
+    int line, col;
+    AsmDiagPlace place = asmdiag_locate(&g_diags[i], g_filepath, &line, &col);
+    if (place == ASMDIAG_AT_LINE && first_line < 0)
+      first_line = g_diag_nav_count;
+    else if (place == ASMDIAG_AT_INCLUDE && first_include < 0)
+      first_include = g_diag_nav_count;
     g_diag_nav[g_diag_nav_count++] = i;
   }
 
   if (g_diag_nav_count > 0)
-    diag_jump_to_nav(first_here >= 0 ? first_here : 0);
+    diag_jump_to_nav(first_line >= 0      ? first_line
+                     : first_include >= 0 ? first_include
+                                          : 0);
   return n;
 }
 
@@ -3158,9 +3171,12 @@ static void editor_diag_detail(void) {
     int tx = WIN_X + 1 + PAD;
     int ty = body_top + PAD;
 
-    /* Where the diagnostic is, in file:line:col form (col only when known). */
+    /* Where the diagnostic is, in file:line:col form (line and col only when
+       known: a file-level error such as an include cycle has neither). */
     char loc[128];
-    if (d->col >= 1)
+    if (d->line < 1)
+      snprintf(loc, sizeof(loc), "%s", asmdiag_base_name(d->file));
+    else if (d->col >= 1)
       snprintf(loc, sizeof(loc), "%s:%d:%d", asmdiag_base_name(d->file), d->line,
                d->col);
     else
@@ -3263,9 +3279,11 @@ static void editor_diag_detail(void) {
  * Diagnostics panel
  *
  * The whole batch at once, rather than stepping through it with Ctrl+N.
- * Diagnostics in the open file can be jumped to; those in an INCLUDEd file
- * are listed and dimmed, since there is nowhere in this buffer to go - which
- * is exactly the distinction list_pick's `actionable` flags express.
+ * Diagnostics that can be placed in the open file - on their own line, or at
+ * the INCLUDE that brought their file in - can be jumped to; the rest (no line,
+ * or a file this one does not include) are listed and dimmed, since there is
+ * nowhere in this buffer to go - which is exactly the distinction list_pick's
+ * `actionable` flags express.
  * ================================================================ */
 /* Wide enough for a full diagnostic message (AsmDiag carries up to 192 chars)
    plus the severity and location prefix, so scrolling sideways reveals the
@@ -3287,18 +3305,23 @@ static void editor_diag_panel(void) {
     char sev = d->severity == ADIAG_WARNING ? 'W'
                : d->severity == ADIAG_NOTE  ? 'N'
                                             : 'E';
-    int here = asmdiag_in_file(d, g_filepath);
+    int line, col;
+    AsmDiagPlace place = asmdiag_locate(d, g_filepath, &line, &col);
 
-    if (here)
+    if (place == ASMDIAG_AT_LINE)
       snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  Ln %-5d %s", sev, d->line,
                d->message);
-    else
+    else if (d->line >= 1)
       /* Name the file, since the line number alone would be misleading. */
       snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  %s:%d  %s", sev,
                asmdiag_base_name(d->file), d->line, d->message);
+    else
+      snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  %s  %s", sev,
+               asmdiag_base_name(d->file), d->message);
 
     g_diag_row_ptrs[i] = g_diag_rows[i];
-    g_diag_actionable[i] = (char)here;
+    /* Enter can go to its line, or to the INCLUDE that brought it in. */
+    g_diag_actionable[i] = (char)(place != ASMDIAG_NOWHERE);
   }
 
   /* A full batch means nasm may have reported more than we kept, so say the
@@ -3319,6 +3342,45 @@ static void editor_diag_panel(void) {
      carry on from where the panel left off. */
   jump_push();
   diag_jump_to_nav(sel);
+}
+
+/* Say what an assemble that did not succeed came to.  Errors with diagnostics
+   were already jumped to by editor_load_diagnostics; every other outcome has
+   nothing to jump to, so it is explained instead of passing in silence. */
+static void editor_report_build(AsmBuildOutcome outcome, int status) {
+  switch (outcome) {
+  case ASMBUILD_NOT_STARTED: {
+    static const char *body[] = {"nasm could not be started.",
+                                 "Check the path in Settings > Preferences,",
+                                 "or free some memory."};
+    gfx_window_alert("Assemble", body, 3, "OK");
+    break;
+  }
+  case ASMBUILD_NO_REPORT: {
+    static const char *body[] = {"nasm could not write its report to",
+                                 ASM_DIAG_FILE,
+                                 "so the result of the build is unknown."};
+    gfx_window_alert("Assemble", body, 3, "OK");
+    break;
+  }
+  case ASMBUILD_DECLINED: /* Ndless has already said why */
+    snprintf(g_diag_status, sizeof(g_diag_status), " nasm did not run");
+    break;
+  case ASMBUILD_NOT_RUN: /* cancelled, or refused - nasm has said which */
+    snprintf(g_diag_status, sizeof(g_diag_status), " Nothing was assembled");
+    break;
+  case ASMBUILD_FAILED:
+    snprintf(g_diag_status, sizeof(g_diag_status),
+             " Assembly failed (nasm status %d), no details", status);
+    break;
+  case ASMBUILD_UNKNOWN:
+    snprintf(g_diag_status, sizeof(g_diag_status),
+             " No report from nasm (error navigation needs 1.2+)");
+    break;
+  case ASMBUILD_OK:
+  case ASMBUILD_ERRORS:
+    break;
+  }
 }
 
 static void editor_assemble(void) {
@@ -3391,7 +3453,7 @@ static void editor_assemble(void) {
 
   /* Ask nasm to write structured diagnostics to a file we can read back;
      passing this alone is enough to select JSON output.  An older nasm that
-     predates the option ignores it, so we simply do not jump. */
+     predates the option ignores it, and we say so after the run. */
   static char diag_arg[] = "--diagnostics-file=" ASM_DIAG_FILE;
   args[argsn++] = diag_arg;
 
@@ -3406,7 +3468,7 @@ static void editor_assemble(void) {
      (which never rewrites the file) is never mistaken for this run. */
   remove(ASM_DIAG_FILE);
 
-  nl_exec(g_settings.nasm_path, argsn, args);
+  int status = nl_exec(g_settings.nasm_path, argsn, args);
   /*
    * nl_exec returns after the child exits (or immediately if it could not
    * be launched).  The child may have re-initialised or restored the LCD
@@ -3417,15 +3479,20 @@ static void editor_assemble(void) {
   /* Read nasm's diagnostics and jump to the first error in this file. */
   int ndiag = editor_load_diagnostics();
 
-  /* A clean build (nasm wrote an empty batch) is the only case worth offering
-     to run.  Ask first: the program takes over the calculator, and a faulty
-     one can take nStudio down with it. */
+  AsmBuildOutcome outcome = asmdiag_build_outcome(status, ndiag);
+  if (outcome != ASMBUILD_OK) {
+    editor_report_build(outcome, status);
+    return;
+  }
+
+  /* A clean build is the only case worth offering to run.  Ask first: the
+     program takes over the calculator, and a faulty one can take nStudio down
+     with it. */
+  g_build_stale = 0; /* what is on disk now matches this buffer */
+
   char outpath[1024];
   struct stat ost;
-  if (ndiag == 0)
-    g_build_stale = 0; /* what is on disk now matches this buffer */
-
-  if (ndiag == 0 && editor_output_path(g_filepath, outpath, sizeof(outpath)) &&
+  if (editor_output_path(g_filepath, outpath, sizeof(outpath)) &&
       stat(outpath, &ost) == 0) {
     char line[288];
     snprintf(line, sizeof(line), "Output: %s", asmdiag_base_name(outpath));
@@ -3771,7 +3838,12 @@ int editor_open(const char *path) {
   if (path && path[0] != '\0') {
     strncpy(g_filepath, path, sizeof(g_filepath) - 1);
     g_filepath[sizeof(g_filepath) - 1] = '\0';
-    load_file(path);
+    if (load_file(g_filepath, &g_buf, &g_crlf) == GB_LOAD_FAILED) {
+      gb_free(&g_buf);
+      load_failed_alert(g_filepath);
+      return 0;
+    }
+    rebuild_lines(&g_buf);
     g_readonly = !path_is_asm_source(g_filepath);
   } else {
     g_filepath[0] = '\0';

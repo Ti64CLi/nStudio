@@ -3,8 +3,11 @@
  * Gap-buffer text storage and line-start table for the nStudio editor.
  */
 
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include "gapbuf.h"
 
@@ -103,6 +106,55 @@ int gb_insert_n(GapBuf *g, const char *s, int n) {
   memcpy(g->buf + g->gap_lo, s, n);
   g->gap_lo += n;
   return n;
+}
+
+GbLoadResult gb_load_file(GapBuf *g, const char *path, int strip_crlf,
+                          int *had_crlf) {
+  gb_init(g);
+  *had_crlf = 0;
+
+  /* Ask the filesystem first: a file that exists but cannot be opened (for
+     want of memory, say) must not be mistaken for one that does not. */
+  struct stat st;
+  if (stat(path, &st) != 0)
+    return GB_LOAD_MISSING;
+
+  FILE *f = fopen(path, "rb");
+  if (!f)
+    return GB_LOAD_FAILED;
+
+  GbLoadResult res = GB_LOAD_FAILED;
+  long sz = -1;
+  if (fseek(f, 0, SEEK_END) == 0)
+    sz = ftell(f);
+  rewind(f);
+
+  if (sz == 0) {
+    res = GB_LOAD_OK;
+  } else if (sz > 0 && sz < INT_MAX && gb_ensure(g, (int)sz)) {
+    char *dst = g->buf + g->gap_lo;
+    size_t got = fread(dst, 1, (size_t)sz, f);
+
+    if (got == (size_t)sz) {
+      int out = (int)got;
+      if (strip_crlf) {
+        out = 0;
+        for (size_t i = 0; i < got; i++) {
+          if (dst[i] == '\r' && i + 1 < got && dst[i + 1] == '\n') {
+            *had_crlf = 1;
+            continue;
+          }
+          dst[out++] = dst[i];
+        }
+      }
+      g->gap_lo += out; /* only now: a short read leaves the buffer empty */
+      res = GB_LOAD_OK;
+    }
+  }
+
+  fclose(f);
+  gb_move(g, 0);
+  return res;
 }
 
 /* ================================================================

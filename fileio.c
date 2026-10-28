@@ -1,7 +1,8 @@
 /*
  * fileio.c
- * Atomic whole-file replacement shared by the editor's document save and the
- * settings writer.
+ * Atomic whole-file replacement, for every file that must never be left
+ * half-written: documents, settings and assembled programs.  nStudio and nasm
+ * keep identical copies of this file.
  */
 
 #include <stdio.h>
@@ -29,8 +30,8 @@
  */
 int write_file_atomic(const char *path, int (*writer)(FILE *, void *),
                       void *ctx) {
-  /* Large enough for the longest path nStudio builds (Save As uses a
-     2048-byte buffer) plus the ".tmp" suffix. */
+  /* Large enough for the longest path either program builds (nStudio's Save
+     As uses a 2048-byte buffer) plus the ".tmp" suffix. */
   char tmp[2100];
   if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
     return 0; /* path too long to form a temporary name */

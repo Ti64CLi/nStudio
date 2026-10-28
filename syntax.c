@@ -6,7 +6,7 @@
  * which are shared verbatim with the nasm assembler: whatever nasm
  * assembles is what the editor highlights.
  *
- * nasm syntax (see ../nasm/README.md):
+ * nasm syntax (see nasm's README):
  *   - labels sit in column 0 (letter first, then alnum/underscore),
  *     with NO trailing colon; instructions must be indented
  *   - comments run from ';' to end of line (the renderer consumes

@@ -691,26 +691,74 @@ static void test_asmdiag(void) {
     CHECK(out[1].related_truncated == 0);
     CHECK(out[1].include_truncated == 0);
 
-    /* first-for-file: full path, then base name, then no match */
+    /* first-for-file: the same file, never one that only shares its name */
     CHECK(asmdiag_first_for_file(out, n, "/documents/test.asm.tns") == 0);
-    CHECK(asmdiag_first_for_file(out, n, "/other/dir/test.asm.tns") == 0);
+    CHECK(asmdiag_first_for_file(out, n, "/other/dir/test.asm.tns") == -1);
     CHECK(asmdiag_first_for_file(out, n, "nope.asm.tns") == -1);
 
     /* the path matcher shared with related locations / include frames */
     CHECK(asmdiag_same_file("/documents/test.asm.tns",
                             "/documents/test.asm.tns") == 1);
-    CHECK(asmdiag_same_file("test.asm.tns", "/other/test.asm.tns") == 1);
+    CHECK(asmdiag_same_file("test.asm.tns", "/other/test.asm.tns") == 0);
+    CHECK(asmdiag_same_file("/documents/sub/main.asm.tns",
+                            "/documents/main.asm.tns") == 0);
     CHECK(asmdiag_same_file("/a/x.asm.tns", "/a/y.asm.tns") == 0);
     CHECK(asmdiag_same_file(NULL, "/a/x.asm.tns") == 0);
+    /* ...after normalising both sides, as nasm joins INCLUDE paths verbatim */
+    CHECK(asmdiag_same_file("/documents/p/sub/../inc.asm.tns",
+                            "/documents/p/inc.asm.tns") == 1);
+    CHECK(asmdiag_same_file("/documents/p/./inc.asm.tns",
+                            "//documents/p//inc.asm.tns") == 1);
+    CHECK(asmdiag_same_file("/../documents/x.tns", "/documents/x.tns") == 1);
+    CHECK(asmdiag_same_file("../a/x.tns", "a/x.tns") == 0);
+    CHECK(asmdiag_same_file("a/b/../../x.tns", "x.tns") == 1);
     CHECK(strcmp(asmdiag_base_name("/a/b/c.asm.tns"), "c.asm.tns") == 0);
     CHECK(strcmp(asmdiag_base_name("bare.tns"), "bare.tns") == 0);
     CHECK(strcmp(asmdiag_base_name(NULL), "") == 0);
 
-    /* the underlying in-file predicate (full path / base name / line>=1) */
+    /* the underlying in-file predicate (same file, line >= 1) */
     CHECK(asmdiag_in_file(&out[0], "/documents/test.asm.tns") == 1);
-    CHECK(asmdiag_in_file(&out[0], "/other/dir/test.asm.tns") == 1);
+    CHECK(asmdiag_in_file(&out[0], "/other/dir/test.asm.tns") == 0);
     CHECK(asmdiag_in_file(&out[1], "/documents/test.asm.tns") == 0); /* line -1 */
     CHECK(asmdiag_in_file(&out[0], "nope.asm.tns") == 0);
+  }
+
+  /* locate: on its own line, else at the INCLUDE that reached its file */
+  {
+    AsmDiag d;
+    int line = 0, col = 0;
+    memset(&d, 0, sizeof(d));
+    strcpy(d.file, "/documents/p/inc.asm.tns");
+    d.line = 7;
+    d.col = 5;
+    d.include_count = 2; /* main includes mid, mid includes inc */
+    strcpy(d.include_stack[0].file, "/documents/p/main.asm.tns");
+    d.include_stack[0].line = 3;
+    strcpy(d.include_stack[1].file, "/documents/p/mid.asm.tns");
+    d.include_stack[1].line = 9;
+
+    CHECK(asmdiag_locate(&d, "/documents/p/inc.asm.tns", &line, &col) ==
+          ASMDIAG_AT_LINE);
+    CHECK(line == 7 && col == 5);
+    CHECK(asmdiag_locate(&d, "/documents/p/main.asm.tns", &line, &col) ==
+          ASMDIAG_AT_INCLUDE);
+    CHECK(line == 3 && col == 0);
+    /* the innermost frame in the open file wins */
+    CHECK(asmdiag_locate(&d, "/documents/p/mid.asm.tns", &line, &col) ==
+          ASMDIAG_AT_INCLUDE);
+    CHECK(line == 9);
+    CHECK(asmdiag_locate(&d, "/documents/other.asm.tns", &line, &col) ==
+          ASMDIAG_NOWHERE);
+
+    /* no line of its own (an include cycle): only its INCLUDE can be shown */
+    d.line = -1;
+    strcpy(d.file, "/documents/p/main.asm.tns");
+    CHECK(asmdiag_locate(&d, "/documents/p/main.asm.tns", &line, &col) ==
+          ASMDIAG_AT_INCLUDE);
+    CHECK(line == 3);
+    d.include_count = 0;
+    CHECK(asmdiag_locate(&d, "/documents/p/main.asm.tns", &line, &col) ==
+          ASMDIAG_NOWHERE);
   }
 
   /* Over-long related / include_stack truncate gracefully: the caps are
@@ -767,6 +815,18 @@ static void test_asmdiag(void) {
   CHECK(asmdiag_parse_file("/tmp/nstudio_no_such_diag_file_zzz", out,
                            ASMDIAG_MAX) == -1);
 
+  /* a byte nasm escaped as \u00XX (not valid UTF-8, e.g. a Latin-1 name) comes
+     back as that byte, so the path still matches; UTF-8 passes through, and
+     other escapes that cannot be shown become '?' */
+  CHECK(write_tmp("[{\"file\":\"/documents/caf\\u00e9.asm.tns\",\"line\":1,"
+                  "\"message\":\"na\xc3\xafve \\u0001\"}]\n",
+                  path));
+  CHECK(asmdiag_parse_file(path, out, ASMDIAG_MAX) == 1);
+  CHECK(strcmp(out[0].file, "/documents/caf\xe9.asm.tns") == 0);
+  CHECK(asmdiag_in_file(&out[0], "/documents/caf\xe9.asm.tns") == 1);
+  CHECK(strcmp(out[0].message, "na\xc3\xafve ?") == 0);
+  unlink(path);
+
   /* first-for-file honours the line >= 1 guard even on a file match */
   AsmDiag one;
   memset(&one, 0, sizeof(one));
@@ -776,6 +836,24 @@ static void test_asmdiag(void) {
   CHECK(asmdiag_first_for_file(&one, 1, "only.asm.tns") == -1);
   one.line = 7;
   CHECK(asmdiag_first_for_file(&one, 1, "only.asm.tns") == 0);
+
+  /* build outcome: success needs exit status 0 AND an empty batch */
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_ASSEMBLED, 0) == ASMBUILD_OK);
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_ERRORS, 2) == ASMBUILD_ERRORS);
+  /* an nasm that predates exit statuses returns 0 even when it fails */
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_ASSEMBLED, 2) == ASMBUILD_ERRORS);
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_ASSEMBLED, -1) == ASMBUILD_UNKNOWN);
+  /* a failure whose batch is empty or missing is still a failure */
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_ERRORS, 0) == ASMBUILD_FAILED);
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_ERRORS, -1) == ASMBUILD_FAILED);
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_NOT_RUN, -1) == ASMBUILD_NOT_RUN);
+  CHECK(asmdiag_build_outcome(ASMDIAG_EXIT_NO_REPORT, -1) ==
+        ASMBUILD_NO_REPORT);
+  CHECK(asmdiag_build_outcome(ASMDIAG_NL_CANNOT_RUN, -1) ==
+        ASMBUILD_NOT_STARTED);
+  CHECK(asmdiag_build_outcome(ASMDIAG_NL_DECLINED, -1) == ASMBUILD_DECLINED);
+  /* a status this nStudio does not know is never taken for success */
+  CHECK(asmdiag_build_outcome(42, 0) == ASMBUILD_FAILED);
 }
 
 /* ================================================================ */
@@ -993,10 +1071,95 @@ static void test_alloc_failures(void) {
   unlink(path);
 }
 
+/* ================================================================ */
+/* gb_load_file  (opening a file into the editor's buffer)          */
+/* ================================================================ */
+
+/* Write `n` bytes to a fresh temp file; returns 1 and fills path_out. */
+static int write_tmp_bytes(const char *bytes, int n, char *path_out) {
+  strcpy(path_out, "/tmp/nstudio_loadXXXXXX");
+  int fd = mkstemp(path_out);
+  if (fd < 0)
+    return 0;
+  int ok = write(fd, bytes, (size_t)n) == n;
+  close(fd);
+  return ok;
+}
+
+/* Does the buffer hold exactly these bytes? */
+static int gb_equals(const GapBuf *g, const char *bytes, int n) {
+  if (gb_len(g) != n)
+    return 0;
+  for (int i = 0; i < n; i++)
+    if (gb_get(g, i) != bytes[i])
+      return 0;
+  return 1;
+}
+
+static void test_gb_load(void) {
+  printf("gb_load_file\n");
+  char path[64];
+  GapBuf g;
+  int crlf;
+
+  /* a source: CRLF becomes LF, and the style is reported */
+  CHECK(write_tmp_bytes("a\r\nb\r\n", 6, path));
+  CHECK(gb_load_file(&g, path, 1, &crlf) == GB_LOAD_OK);
+  CHECK(gb_equals(&g, "a\nb\n", 4));
+  CHECK(crlf == 1);
+  CHECK(g.gap_lo == 0); /* cursor at the top */
+  gb_free(&g);
+  unlink(path);
+
+  /* anything else is byte-exact, NUL and CRLF included */
+  CHECK(write_tmp_bytes("x\0y\r\n", 5, path));
+  CHECK(gb_load_file(&g, path, 0, &crlf) == GB_LOAD_OK);
+  CHECK(gb_equals(&g, "x\0y\r\n", 5));
+  CHECK(crlf == 0);
+  gb_free(&g);
+  unlink(path);
+
+  /* no such file: an empty buffer, to become it */
+  CHECK(gb_load_file(&g, "/tmp/nstudio_no_such_file_zzz", 1, &crlf) ==
+        GB_LOAD_MISSING);
+  CHECK(gb_len(&g) == 0);
+  gb_free(&g);
+
+  /* whichever allocation fails, an existing file is loaded whole or reported
+     as failed - never as missing, never in part - since an empty buffer that
+     looked like the file would be saved over it */
+  static char big[10000];
+  for (int i = 0; i < (int)sizeof(big); i++)
+    big[i] = (char)('a' + i % 26);
+  CHECK(write_tmp_bytes(big, (int)sizeof(big), path));
+  int saw_failed = 0, saw_ok = 0, bad = 0;
+  for (int k = 0; k < 4; k++) {
+    fail_alloc_after(k);
+    GbLoadResult r = gb_load_file(&g, path, 1, &crlf);
+    fail_alloc_never();
+    if (r == GB_LOAD_FAILED) {
+      saw_failed = 1;
+      if (gb_len(&g) != 0)
+        bad++;
+    } else if (r == GB_LOAD_OK) {
+      saw_ok = 1;
+      if (!gb_equals(&g, big, (int)sizeof(big)))
+        bad++;
+    } else {
+      bad++;
+    }
+    gb_free(&g);
+  }
+  CHECK(bad == 0);
+  CHECK(saw_failed && saw_ok);
+  unlink(path);
+}
+
 int main(void) {
   test_util();
   test_optab();
   test_gapbuf();
+  test_gb_load();
   test_lines_shift();
   test_textdiff();
   test_textdiff_gap();

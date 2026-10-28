@@ -28,6 +28,24 @@ void gb_inserts(GapBuf *g, const char *s);
 /* Bulk insert of exactly n bytes (NUL-safe).  Returns bytes inserted. */
 int gb_insert_n(GapBuf *g, const char *s, int n);
 
+typedef enum {
+  GB_LOAD_OK,      /* the file's bytes are in the buffer */
+  GB_LOAD_MISSING, /* no such file: the buffer is empty, ready to become it */
+  GB_LOAD_FAILED   /* the file exists but could not be read in full (memory,
+                      I/O): the buffer is empty and must not stand in for it,
+                      or a save would replace the file with nothing */
+} GbLoadResult;
+
+/*
+ * Initialise `g` and fill it with the file at `path`, read straight into the
+ * gap so no second copy of the file is ever held.  The bytes are kept exactly
+ * (NUL included), except that with `strip_crlf` every "\r\n" becomes "\n" and
+ * *had_crlf reports whether there were any.  The cursor is left at 0.  `g` is
+ * the caller's to keep or gb_free(), whatever the result.
+ */
+GbLoadResult gb_load_file(GapBuf *g, const char *path, int strip_crlf,
+                          int *had_crlf);
+
 static inline int gb_len(const GapBuf *g) {
   return g->size - (g->gap_hi - g->gap_lo);
 }

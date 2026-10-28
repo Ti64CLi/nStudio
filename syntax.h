@@ -2,7 +2,7 @@
  * syntax.h
  * ARM assembly tokenisation and highlighted line rendering.
  *
- * nasm syntax notes (see ../nasm/README.md):
+ * nasm syntax notes (see nasm's README):
  *   - labels sit in column 0, instructions must be indented
  *   - comments start at ';' (outside quotes)
  *   - directives are bare words (ALIGN, DCD, EQU, ...), never dot-prefixed

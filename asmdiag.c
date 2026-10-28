@@ -124,8 +124,12 @@ static int parse_string(const char **p, char *out, int outsz) {
           cp = cp * 16 + d;
           (*p)++;
         }
-        /* The on-calc font is ASCII; keep printable ASCII, else '?'. */
-        c = (cp >= 0x20 && cp < 0x7f) ? (char)cp : '?';
+        /* nasm writes a byte that is not valid UTF-8 as \u00XX, so U+0080 to
+           U+00FF are restored to that byte: a path then still matches the
+           file's real name.  Printable ASCII is kept; anything else is '?'. */
+        c = ((cp >= 0x20 && cp < 0x7f) || (cp >= 0x80 && cp <= 0xff))
+                ? (char)cp
+                : '?';
         break;
       }
       default:
@@ -476,11 +480,74 @@ static const char *base_name(const char *path) {
   return slash ? slash + 1 : path;
 }
 
+/*
+ * Lexically normalise `in` into `out`: repeated '/' collapse, "." segments go,
+ * and ".." removes the segment before it (nothing, at the root).  nasm joins
+ * an INCLUDE's operand to the includer's directory, so it may name a file
+ * /documents/p/sub/../inc.asm.tns while the editor holds /documents/p/inc.asm.tns.
+ * Returns 0 if the result does not fit in `outsz` bytes.
+ */
+static int normalize_path(const char *in, char *out, int outsz) {
+  int absolute = (in[0] == '/');
+  int root = absolute ? 1 : 0; /* length of the part ".." cannot remove */
+  int len = 0;
+
+  if (outsz < 2)
+    return 0;
+  if (absolute)
+    out[len++] = '/';
+
+  const char *p = in;
+  while (*p) {
+    while (*p == '/')
+      p++;
+    if (!*p)
+      break;
+
+    const char *seg = p;
+    while (*p && *p != '/')
+      p++;
+    int slen = (int)(p - seg);
+
+    if (slen == 1 && seg[0] == '.')
+      continue;
+
+    if (slen == 2 && seg[0] == '.' && seg[1] == '.') {
+      int k = len; /* start of the last segment written */
+      while (k > root && out[k - 1] != '/')
+        k--;
+      int last_is_up = (len - k == 2 && out[k] == '.' && out[k + 1] == '.');
+      if (len > root && !last_is_up) {
+        len = (k > root) ? k - 1 : root; /* drop it and its separator */
+        continue;
+      }
+      if (absolute)
+        continue; /* above the root is the root */
+      /* a relative path climbing past its start keeps the ".." */
+    }
+
+    int sep = (len > root) ? 1 : 0;
+    if (len + sep + slen + 1 > outsz)
+      return 0;
+    if (sep)
+      out[len++] = '/';
+    memcpy(out + len, seg, (size_t)slen);
+    len += slen;
+  }
+
+  out[len] = '\0';
+  return 1;
+}
+
 int asmdiag_same_file(const char *diag_file, const char *path) {
   if (!diag_file || !path)
     return 0;
-  return strcmp(diag_file, path) == 0 ||
-         strcmp(base_name(diag_file), base_name(path)) == 0;
+
+  char a[512], b[512];
+  if (!normalize_path(diag_file, a, sizeof(a)) ||
+      !normalize_path(path, b, sizeof(b)))
+    return strcmp(diag_file, path) == 0; /* too long to normalise */
+  return strcmp(a, b) == 0;
 }
 
 const char *asmdiag_base_name(const char *path) {
@@ -491,6 +558,51 @@ int asmdiag_in_file(const AsmDiag *d, const char *path) {
   if (!d || d->line < 1)
     return 0;
   return asmdiag_same_file(d->file, path);
+}
+
+AsmDiagPlace asmdiag_locate(const AsmDiag *d, const char *path, int *line,
+                            int *col) {
+  if (!d || !path)
+    return ASMDIAG_NOWHERE;
+
+  if (asmdiag_in_file(d, path)) {
+    *line = d->line;
+    *col = d->col;
+    return ASMDIAG_AT_LINE;
+  }
+
+  /* The innermost INCLUDE in `path` on the way to the diagnostic's file is the
+     most precise place this file can offer. */
+  for (int i = d->include_count - 1; i >= 0; i--) {
+    const AsmDiagInclude *fr = &d->include_stack[i];
+    if (fr->line >= 1 && asmdiag_same_file(fr->file, path)) {
+      *line = fr->line;
+      *col = 0;
+      return ASMDIAG_AT_INCLUDE;
+    }
+  }
+
+  return ASMDIAG_NOWHERE;
+}
+
+AsmBuildOutcome asmdiag_build_outcome(int exit_status, int ndiag) {
+  if (exit_status == ASMDIAG_NL_CANNOT_RUN)
+    return ASMBUILD_NOT_STARTED;
+  if (exit_status == ASMDIAG_NL_DECLINED)
+    return ASMBUILD_DECLINED;
+  if (ndiag > 0)
+    return ASMBUILD_ERRORS;
+
+  switch (exit_status) {
+  case ASMDIAG_EXIT_ASSEMBLED:
+    return ndiag == 0 ? ASMBUILD_OK : ASMBUILD_UNKNOWN;
+  case ASMDIAG_EXIT_NOT_RUN:
+    return ASMBUILD_NOT_RUN;
+  case ASMDIAG_EXIT_NO_REPORT:
+    return ASMBUILD_NO_REPORT;
+  default:
+    return ASMBUILD_FAILED; /* errors with no usable batch, or unknown */
+  }
 }
 
 int asmdiag_first_for_file(const AsmDiag *diags, int n, const char *path) {
