@@ -651,6 +651,54 @@ const char *asmdiag_base_name(const char *path) {
   return path ? base_name(path) : "";
 }
 
+void asmdiag_relative_path(const char *path, const char *from, char *out,
+                           int outsz) {
+  char p[512], dir[512];
+
+  if (outsz <= 0)
+    return;
+  if (!path || !from || !normalize_path(path, p, sizeof(p)) ||
+      !normalize_path(from, dir, sizeof(dir)) || (p[0] == '/') != (dir[0] == '/'))
+    goto base;
+
+  /* the folder `from` is in, with its trailing '/' ("" for a bare name) */
+  char *slash = strrchr(dir, '/');
+  if (slash)
+    slash[1] = '\0';
+  else
+    dir[0] = '\0';
+
+  /* the folders both share: up to and including their last common '/' */
+  int common = 0;
+  for (int i = 0; p[i] && p[i] == dir[i]; i++)
+    if (p[i] == '/')
+      common = i + 1;
+
+  int ups = 0; /* folders to climb out of, from `from`'s to the shared one */
+  for (const char *c = dir + common; *c; c++)
+    if (*c == '/')
+      ups++;
+
+  int len = 3 * ups + (int)strlen(p + common);
+  if ((int)strlen(p) < len) { /* climbing is longer than the path itself */
+    if ((int)strlen(p) >= outsz)
+      goto base;
+    strcpy(out, p);
+    return;
+  }
+  if (len >= outsz)
+    goto base;
+
+  out[0] = '\0';
+  for (int i = 0; i < ups; i++)
+    strcat(out, "../");
+  strcat(out, p + common);
+  return;
+
+base:
+  snprintf(out, (size_t)outsz, "%s", asmdiag_base_name(path));
+}
+
 int asmdiag_in_file(const AsmDiag *d, const char *path) {
   if (!d || d->line < 1)
     return 0;

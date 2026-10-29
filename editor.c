@@ -2860,6 +2860,12 @@ static void editor_goto_line_col(int line, int col) {
   scroll_to_cursor();
 }
 
+/* A file a diagnostic mentions, named from the open file's folder (see
+   asmdiag_relative_path). */
+static void diag_file_name(const char *file, char *out, int outsz) {
+  asmdiag_relative_path(file, g_filepath, out, outsz);
+}
+
 static const char *diag_severity_name(const AsmDiag *d) {
   return d->severity == ADIAG_WARNING
              ? "Warning"
@@ -2902,19 +2908,31 @@ static void diag_jump_to_nav(int nav_pos) {
 
   /* Elsewhere: name the file, its line when it has one, and the immediate
      includer when nasm gave us one (include frames run outermost first, so the
-     parent is the last). */
+     parent is the last).  Files are named from the open file's folder, so two
+     files that share a name never read the same. */
   char at[16] = "";
   if (d->line >= 1)
     snprintf(at, sizeof(at), ":%d", d->line);
-  char from[80] = "";
-  if (d->include_count > 0) {
-    const AsmDiagInclude *parent = &d->include_stack[d->include_count - 1];
-    snprintf(from, sizeof(from), " (from %s:%d)",
-             asmdiag_base_name(parent->file), parent->line);
+  /* The status bar shows about fifty characters, so a name too long for 64
+     falls back to its base name (see asmdiag_relative_path). */
+  char name[64];
+  diag_file_name(d->file, name, sizeof(name));
+  if (d->include_count == 0) {
+    snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d%s in %s%s: %s%s",
+             sev, nav_pos + 1, g_diag_nav_count, more, name, at, d->message,
+             rel);
+    return;
   }
-  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d%s in %s%s%s: %s%s",
-           sev, nav_pos + 1, g_diag_nav_count, more, asmdiag_base_name(d->file),
-           at, from, d->message, rel);
+
+  /* "from line 3" when the includer is the open file itself */
+  const AsmDiagInclude *parent = &d->include_stack[d->include_count - 1];
+  char pname[64] = "";
+  if (!asmdiag_same_file(parent->file, g_filepath))
+    diag_file_name(parent->file, pname, sizeof(pname));
+  snprintf(g_diag_status, sizeof(g_diag_status),
+           " %s %d/%d%s in %s%s (from %s%s%d): %s%s", sev, nav_pos + 1,
+           g_diag_nav_count, more, name, at, pname, pname[0] ? ":" : "line ",
+           parent->line, d->message, rel);
 }
 
 /* After an assemble, read the diagnostics nasm left behind and retain every
@@ -3058,14 +3076,14 @@ static void editor_diag_detail(void) {
 
     /* Where the diagnostic is, in file:line:col form (line and col only when
        known: a file-level error such as an include cycle has neither). */
-    char loc[128];
+    char name[128], loc[160];
+    diag_file_name(d->file, name, sizeof(name));
     if (d->line < 1)
-      snprintf(loc, sizeof(loc), "%s", asmdiag_base_name(d->file));
+      snprintf(loc, sizeof(loc), "%s", name);
     else if (d->col >= 1)
-      snprintf(loc, sizeof(loc), "%s:%d:%d", asmdiag_base_name(d->file), d->line,
-               d->col);
+      snprintf(loc, sizeof(loc), "%s:%d:%d", name, d->line, d->col);
     else
-      snprintf(loc, sizeof(loc), "%s:%d", asmdiag_base_name(d->file), d->line);
+      snprintf(loc, sizeof(loc), "%s:%d", name, d->line);
     gfx_drawstr_clipped(tx, ty, loc, LABEL, BG, INNER_W);
     ty += LINE_H + SEC_GAP;
 
@@ -3078,10 +3096,9 @@ static void editor_diag_detail(void) {
       gfx_drawstr_clipped(tx, ty, "Included from:", LABEL, BG, INNER_W);
       ty += LINE_H;
       for (int i = 0; i < ninc && ty + LINE_H <= body_bot; i++) {
-        char fr[160];
-        snprintf(fr, sizeof(fr), "  %s:%d",
-                 asmdiag_base_name(d->include_stack[i].file),
-                 d->include_stack[i].line);
+        char fname[128], fr[160];
+        diag_file_name(d->include_stack[i].file, fname, sizeof(fname));
+        snprintf(fr, sizeof(fr), "  %s:%d", fname, d->include_stack[i].line);
         gfx_drawstr_clipped(tx, ty, fr, FG, BG, INNER_W);
         ty += LINE_H;
       }
@@ -3095,9 +3112,10 @@ static void editor_diag_detail(void) {
       for (int i = 0; i < nrel && ty + LINE_H <= body_bot; i++) {
         const AsmDiagRelated *r = &d->related[i];
         int reachable = diag_related_reachable(r);
-        char row[224];
-        snprintf(row, sizeof(row), "%c %s:%d %s", i == sel ? '>' : ' ',
-                 asmdiag_base_name(r->file), r->line, r->message);
+        char rname[128], row[224];
+        diag_file_name(r->file, rname, sizeof(rname));
+        snprintf(row, sizeof(row), "%c %s:%d %s", i == sel ? '>' : ' ', rname,
+                 r->line, r->message);
         uint16_t rbg = (i == sel) ? g_default_theme.accent : BG;
         uint16_t rfg = (i == sel) ? g_default_theme.accent_text
                                   : (reachable ? FG : DIM);
@@ -3153,8 +3171,10 @@ static void editor_diag_detail(void) {
       }
       /* Not in this buffer: say so rather than moving the cursor somewhere
          misleading. */
+      char rname[128];
+      diag_file_name(r->file, rname, sizeof(rname));
       snprintf(g_diag_status, sizeof(g_diag_status), " %s:%d is in another file",
-               asmdiag_base_name(r->file), r->line);
+               rname, r->line);
       return;
     }
   }
@@ -3196,13 +3216,17 @@ static void editor_diag_panel(void) {
     if (place == ASMDIAG_AT_LINE)
       snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  Ln %-5d %s", sev, d->line,
                d->message);
-    else if (d->line >= 1)
+    else {
       /* Name the file, since the line number alone would be misleading. */
-      snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  %s:%d  %s", sev,
-               asmdiag_base_name(d->file), d->line, d->message);
-    else
-      snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  %s  %s", sev,
-               asmdiag_base_name(d->file), d->message);
+      char name[128];
+      diag_file_name(d->file, name, sizeof(name));
+      if (d->line >= 1)
+        snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  %s:%d  %s", sev, name,
+                 d->line, d->message);
+      else
+        snprintf(g_diag_rows[i], DIAG_ROW_LEN, "%c  %s  %s", sev, name,
+                 d->message);
+    }
 
     g_diag_row_ptrs[i] = g_diag_rows[i];
     /* Enter can go to its line, or to the INCLUDE that brought it in. */

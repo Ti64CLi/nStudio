@@ -238,6 +238,16 @@ AsmDiagPlace asmdiag_locate(const AsmDiag *d, const char *path, int *line,
 const char *asmdiag_base_name(const char *path);
 
 /*
+ * How to name `path` to someone looking at the file `from`: relative to the
+ * folder `from` is in - "inc.asm.tns" beside it, "sub/inc.asm.tns" below it,
+ * "../lib/inc.asm.tns" elsewhere - or `path` itself, normalised, when that is
+ * shorter.  Unlike a base name, two different files never get the same name.
+ * Falls back to the base name if the result does not fit in `outsz` bytes.
+ */
+void asmdiag_relative_path(const char *path, const char *from, char *out,
+                           int outsz);
+
+/*
  * What nl_exec() returns when the program never ran: Ndless's loader reports
  * 0xDEAD when it could not load it at all (missing, not a program, out of
  * memory), and 0xBEEF when it declined and has already told the user why.

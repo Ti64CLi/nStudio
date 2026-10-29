@@ -269,6 +269,8 @@ static void test_lines_shift(void) {
       else
         lines_shift(pos, gb_len(&g) - before);
     } else {
+      if (pos == len)
+        pos--; /* delete a character that exists (len >= 8 here) */
       char c = gb_get(&g, pos);
       gb_move(&g, pos);
       gb_delete(&g);
@@ -857,6 +859,44 @@ static void test_asmdiag(void) {
   CHECK(asmdiag_build_outcome(42, 0) == ASMBUILD_FAILED);
 }
 
+/* Files a diagnostic mentions are named from the open file's folder, so two
+   files sharing a name never read the same. */
+static void test_relative_path(void) {
+  printf("relative_path\n");
+  const char *from = "/documents/p/main.asm.tns";
+  char out[64];
+
+  asmdiag_relative_path("/documents/p/inc.asm.tns", from, out, sizeof(out));
+  CHECK(strcmp(out, "inc.asm.tns") == 0);
+  asmdiag_relative_path("/documents/p/sub/main.asm.tns", from, out,
+                        sizeof(out));
+  CHECK(strcmp(out, "sub/main.asm.tns") == 0);
+  asmdiag_relative_path("/documents/lib/bad.inc", from, out, sizeof(out));
+  CHECK(strcmp(out, "../lib/bad.inc") == 0);
+  /* nasm's unresolved ".." are resolved first */
+  asmdiag_relative_path("/documents/p/inc/../lib/a.inc", from, out,
+                        sizeof(out));
+  CHECK(strcmp(out, "lib/a.inc") == 0);
+  /* a name that merely starts like a folder is not inside it */
+  asmdiag_relative_path("/documents/pp/a.inc", from, out, sizeof(out));
+  CHECK(strcmp(out, "../pp/a.inc") == 0);
+  /* climbing far is longer than the path itself */
+  asmdiag_relative_path("/x.inc", "/documents/a/b/c/m.asm", out, sizeof(out));
+  CHECK(strcmp(out, "/x.inc") == 0);
+  asmdiag_relative_path("/a/x.inc", "/m.asm", out, sizeof(out));
+  CHECK(strcmp(out, "a/x.inc") == 0);
+  /* relative paths work alike; mixed kinds cannot be compared */
+  asmdiag_relative_path("sub/a.inc", "main.asm", out, sizeof(out));
+  CHECK(strcmp(out, "sub/a.inc") == 0);
+  asmdiag_relative_path("/documents/p/sub/a.inc", "main.asm", out,
+                        sizeof(out));
+  CHECK(strcmp(out, "a.inc") == 0);
+  /* too long for `out`: the base name */
+  asmdiag_relative_path("/documents/p/a-folder-name/b-folder-name/x.inc",
+                        from, out, 24);
+  CHECK(strcmp(out, "x.inc") == 0);
+}
+
 /* A results report (nasm 1.3, --report=2), and the bare array nasm 1.2
    writes, read through the same call. */
 static void test_asmreport(void) {
@@ -1385,6 +1425,7 @@ int main(void) {
   test_undo();
   test_asmdiag();
   test_asmreport();
+  test_relative_path();
   test_asmdb();
   test_fileio();
   test_alloc_failures();
