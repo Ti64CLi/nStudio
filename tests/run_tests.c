@@ -857,6 +857,123 @@ static void test_asmdiag(void) {
   CHECK(asmdiag_build_outcome(42, 0) == ASMBUILD_FAILED);
 }
 
+/* A results report (nasm 1.3, --report=2), and the bare array nasm 1.2
+   writes, read through the same call. */
+static void test_asmreport(void) {
+  printf("asmreport\n");
+
+  /* keys in any order, unknown ones (scalar and nested) skipped, the
+     diagnostics array read exactly as a bare one is */
+  static const char *report =
+      "{\n"
+      "  \"version\": 2,\n"
+      "  \"future\": {\"a\": [1, \"}\"]},\n"
+      "  \"status\": \"errors\",\n"
+      "  \"diagnostics\": [\n"
+      "    {\"severity\":\"error\",\"code\":\"syntax\",\"file\":\"/d/m.asm\","
+      "\"line\":3,\"col\":5,\"end_col\":9,\"message\":\"bad ] here\","
+      "\"source_line\":\"\",\"expanded_from\":\"\",\"related\":[],"
+      "\"include_stack\":[]},\n"
+      "    {\"severity\":\"error\",\"code\":\"syntax\",\"file\":\"/d/m.asm\","
+      "\"line\":4,\"col\":5,\"end_col\":9,\"message\":\"again\","
+      "\"source_line\":\"\",\"expanded_from\":\"\",\"related\":[],"
+      "\"include_stack\":[]}\n"
+      "  ],\n"
+      "  \"output\": \"/d/m.tns\",\n"
+      "  \"format\": \"prg\",\n"
+      "  \"code_size\": 0,\n"
+      "  \"errors\": 700,\n"
+      "  \"warnings\": 3\n"
+      "}\n";
+
+  AsmDiag out[ASMDIAG_MAX];
+  AsmReport rep;
+  char path[64];
+
+  CHECK(write_tmp(report, path));
+  int n = asmdiag_parse_report(path, &rep, out, ASMDIAG_MAX);
+  unlink(path);
+  CHECK(n == 2);
+  CHECK(rep.version == 2);
+  CHECK(rep.status == ASMRUN_ERRORS);
+  CHECK(strcmp(rep.output, "/d/m.tns") == 0);
+  CHECK(strcmp(rep.format, "prg") == 0);
+  CHECK(rep.errors == 700 && rep.warnings == 3);
+  CHECK(out[0].line == 3 && strcmp(out[0].message, "bad ] here") == 0);
+  CHECK(out[1].line == 4);
+  /* the batch is capped as before, the counts are not */
+  CHECK(write_tmp(report, path));
+  n = asmdiag_parse_report(path, &rep, out, 1);
+  unlink(path);
+  CHECK(n == 1 && rep.errors == 700 && strcmp(rep.output, "/d/m.tns") == 0);
+
+  /* a clean build */
+  CHECK(write_tmp("{\"version\":2,\"status\":\"assembled\",\"output\":"
+                  "\"/d/m.tns\",\"format\":\"zehn\",\"code_size\":48,"
+                  "\"errors\":0,\"warnings\":0,\"diagnostics\":[]}",
+                  path));
+  n = asmdiag_parse_report(path, &rep, out, ASMDIAG_MAX);
+  unlink(path);
+  CHECK(n == 0 && rep.status == ASMRUN_ASSEMBLED && rep.code_size == 48);
+  CHECK(strcmp(rep.format, "zehn") == 0);
+
+  /* nasm 1.2's bare array: version 1, nothing else known */
+  CHECK(write_tmp("[]\n", path));
+  n = asmdiag_parse_report(path, &rep, out, ASMDIAG_MAX);
+  unlink(path);
+  CHECK(n == 0 && rep.version == 1 && rep.status == ASMRUN_UNKNOWN);
+  CHECK(rep.output[0] == '\0' && rep.errors == 0);
+
+  /* no file at all */
+  n = asmdiag_parse_report("/nonexistent/nstudio_diag.json", &rep, out,
+                           ASMDIAG_MAX);
+  CHECK(n == -1 && rep.version == 0);
+
+  /* a status this nStudio does not know */
+  CHECK(write_tmp("{\"version\":3,\"status\":\"exploded\"}", path));
+  n = asmdiag_parse_report(path, &rep, out, ASMDIAG_MAX);
+  unlink(path);
+  CHECK(n == 0 && rep.version == 3 && rep.status == ASMRUN_UNKNOWN);
+
+  /* the outcome: a report is believed over the batch... */
+  AsmReport r;
+  memset(&r, 0, sizeof(r));
+  r.version = 2;
+  r.status = ASMRUN_ASSEMBLED;
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ASSEMBLED, &r, 0) == ASMBUILD_OK);
+  /* warnings do not make a build fail */
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ASSEMBLED, &r, 2) == ASMBUILD_OK);
+  /* but the exit status must agree */
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ERRORS, &r, 0) == ASMBUILD_FAILED);
+  r.status = ASMRUN_ERRORS;
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ERRORS, &r, 3) == ASMBUILD_ERRORS);
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ERRORS, &r, 0) == ASMBUILD_FAILED);
+  r.status = ASMRUN_REFUSED;
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_NOT_RUN, &r, 0) ==
+        ASMBUILD_REFUSED);
+  r.status = ASMRUN_CANCELLED;
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_NOT_RUN, &r, 0) ==
+        ASMBUILD_NOT_RUN);
+  /* ...a status it does not know falls back on the exit status... */
+  r.status = ASMRUN_UNKNOWN;
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ASSEMBLED, &r, 0) == ASMBUILD_OK);
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_NOT_RUN, &r, 0) ==
+        ASMBUILD_NOT_RUN);
+  /* ...Ndless's own codes win... */
+  r.status = ASMRUN_ASSEMBLED;
+  CHECK(asmdiag_report_outcome(ASMDIAG_NL_CANNOT_RUN, &r, 0) ==
+        ASMBUILD_NOT_STARTED);
+  /* ...and without a report it is asmdiag_build_outcome() */
+  r.version = 1;
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ASSEMBLED, &r, 2) ==
+        ASMBUILD_ERRORS);
+  r.version = 0;
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ASSEMBLED, &r, -1) ==
+        ASMBUILD_UNKNOWN);
+  CHECK(asmdiag_report_outcome(ASMDIAG_EXIT_ASSEMBLED, NULL, 0) ==
+        ASMBUILD_OK);
+}
+
 /* ================================================================ */
 /* asmdb  (catalog + syscall lookups)                               */
 /* ================================================================ */
@@ -1177,32 +1294,44 @@ static void test_nasmlink(void) {
   CHECK(nasmlink_output_path("", out, sizeof(out)) == 0);
   CHECK(nasmlink_output_path("/d/long-name.asm", out, 12) == 0); /* no room */
 
-  /* the command line: source, user tokens, then the two injected options */
+  /* the command line: source, user tokens, then nStudio's own options */
   static NasmInvocation inv;
   CHECK(nasmlink_invocation(&inv, "/d/p.asm.tns", "  --a   --b\t--c ",
-                            "/x/d.json", (const void *)0x1234));
-  CHECK(inv.argc == 7);
+                            "/x/d.json", "zehn", (const void *)0x1234));
+  CHECK(inv.argc == 10);
   CHECK(strcmp(inv.argv[0], "/d/p.asm.tns") == 0);
   CHECK(strcmp(inv.argv[1], "--a") == 0 && strcmp(inv.argv[3], "--c") == 0);
-  CHECK(strcmp(inv.argv[4], "--diagnostics-file=/x/d.json") == 0);
-  CHECK(strcmp(inv.argv[5], "--fb") == 0);
-  CHECK(strcmp(inv.argv[6], "4660") == 0); /* 0x1234, in decimal */
-  CHECK(nasmlink_invocation(&inv, "/d/p.asm", NULL, "/x/d.json", NULL));
-  CHECK(inv.argc == 4);
-  CHECK(strcmp(inv.argv[3], "0") == 0);
+  CHECK(strcmp(inv.argv[4], "--no-ui") == 0);
+  CHECK(strcmp(inv.argv[5], "--report=2") == 0);
+  CHECK(strcmp(inv.argv[6], "--format=zehn") == 0);
+  CHECK(strcmp(inv.argv[7], "--diagnostics-file=/x/d.json") == 0);
+  CHECK(strcmp(inv.argv[8], "--fb") == 0);
+  CHECK(strcmp(inv.argv[9], "4660") == 0); /* 0x1234, in decimal */
+  /* no format: nasm chooses */
+  CHECK(nasmlink_invocation(&inv, "/d/p.asm", NULL, "/x/d.json", NULL, NULL));
+  CHECK(inv.argc == 6);
+  CHECK(strcmp(inv.argv[3], "--diagnostics-file=/x/d.json") == 0);
+  CHECK(strcmp(inv.argv[5], "0") == 0);
   /* at most 16 user tokens, so the injected options always fit */
   CHECK(nasmlink_invocation(&inv, "/d/p.asm",
                             "a b c d e f g h i j k l m n o p q r s t",
-                            "/x/d.json", NULL));
+                            "/x/d.json", "prg", NULL));
   CHECK(inv.argc == NASMLINK_MAX_ARGS);
   CHECK(strcmp(inv.argv[16], "p") == 0);
-  CHECK(strncmp(inv.argv[17], "--diagnostics-file=", 19) == 0);
+  CHECK(strcmp(inv.argv[17], "--no-ui") == 0);
+  CHECK(strcmp(inv.argv[19], "--format=prg") == 0);
+  CHECK(strncmp(inv.argv[20], "--diagnostics-file=", 19) == 0);
+  /* only the formats nasm knows */
+  CHECK(nasmlink_invocation(&inv, "/d/p.asm", "", "/x/d.json", "elf", NULL) ==
+        0);
   /* a path that cannot be passed whole is not passed at all */
   static char longpath[700];
   memset(longpath, 'x', sizeof(longpath) - 1);
   longpath[0] = '/';
-  CHECK(nasmlink_invocation(&inv, longpath, "", "/x/d.json", NULL) == 0);
-  CHECK(nasmlink_invocation(&inv, "/d/p.asm", "", longpath, NULL) == 0);
+  CHECK(nasmlink_invocation(&inv, longpath, "", "/x/d.json", "zehn", NULL) ==
+        0);
+  CHECK(nasmlink_invocation(&inv, "/d/p.asm", "", longpath, "zehn", NULL) ==
+        0);
 
   /* an INCLUDE operand, read as nasm reads the line */
   CHECK(nasmlink_include_operand("    INCLUDE inc/a.inc", out, sizeof(out)));
@@ -1255,6 +1384,7 @@ int main(void) {
   test_textdiff_gap();
   test_undo();
   test_asmdiag();
+  test_asmreport();
   test_asmdb();
   test_fileio();
   test_alloc_failures();

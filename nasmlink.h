@@ -25,8 +25,9 @@
  * stripped from the file name - it cuts at the FIRST dot, not the last - and
  * ".tns" is appended, so /documents/foo/bar.asm.tns becomes
  * /documents/foo/bar.tns.  nasm derives this itself and offers no way to
- * override it from the command line, so recomputing it here is the only way to
- * know what was built; keep the two in step.
+ * override it from the command line.  A results report names the program it
+ * built, but Ctrl+R needs the name without assembling, and nasm 1.2 reports no
+ * name at all, so this copy of the rule stays; keep the two in step.
  *
  * Returns 0 when no usable path exists: an unsaved buffer, a path too long to
  * extend, or a result identical to the source - the last being exactly the case
@@ -40,29 +41,37 @@ int nasmlink_output_path(const char *src, char *out, size_t outsz);
  * only the arguments after the program name, so argv[0] here is nasm's
  * argv[1]:
  *
- *   <source> [user args...] --diagnostics-file=<path> --fb <address>
+ *   <source> [user args...] --no-ui --report=2 [--format=<format>]
+ *            --diagnostics-file=<path> --fb <address>
  *
- * The user's extra arguments are split on blanks (no quoting), at most 16 of
- * them.  `fb` is the caller's framebuffer, which nasm copies so the editor
- * stays visible behind its dialogs; it is passed as a decimal address because
+ * nasm 1.3 then shows nothing and writes a results report; an older nasm
+ * ignores those three options and asks and shows as it always has (see
+ * asmdiag.h).  The user's extra arguments are split on blanks (no quoting), at
+ * most 16 of them, and come first, so nStudio's own options win any clash.
+ * `format` is "zehn" or "prg", or NULL to leave the choice to nasm.  `fb` is
+ * the caller's framebuffer, which an older nasm copies so the editor stays
+ * visible behind its dialogs; it is passed as a decimal address because
  * nl_exec runs nasm in nStudio's own address space.
  */
-#define NASMLINK_MAX_ARGS 20 /* source + 16 user tokens + 3 injected */
+#define NASMLINK_INJECTED 6 /* the most options nStudio adds itself */
+#define NASMLINK_MAX_ARGS (1 + 16 + NASMLINK_INJECTED) /* + source, user */
 
 typedef struct {
   char *argv[NASMLINK_MAX_ARGS];
   int argc;
   char source[512];
   char user_args[128]; /* the user's arguments, split in place */
+  char format_arg[16]; /* "--format=<format>" */
   char diag_arg[600];  /* "--diagnostics-file=<path>" */
   char fb_arg[32];     /* the framebuffer address, in decimal */
 } NasmInvocation;
 
 /* Fill `inv` for assembling `src`.  Returns 0 when the source or diagnostics
-   path is too long to pass whole (nothing truncated is ever passed). */
+   path is too long to pass whole (nothing truncated is ever passed), or the
+   format is not one nasm knows. */
 int nasmlink_invocation(NasmInvocation *inv, const char *src,
                         const char *user_args, const char *diag_path,
-                        const void *fb);
+                        const char *format, const void *fb);
 
 /*
  * If `line` is an INCLUDE (or GET) directive, copy its operand into `out` and

@@ -24,6 +24,8 @@ static void write_settings(void) {
   strcpy(s->nasm_path, "/documents/tools/nasm.tns");
   strcpy(s->nasm_args, "--first --second");
   strcpy(s->last_dir, "/documents/start");
+  s->build_format = 1;
+  s->error_list = 0;
 
   s->theme = 2; /* custom, so the colours below are kept as they are */
   s->ui_bg = 1;
@@ -58,6 +60,7 @@ static void dump_settings(void) {
          s->auto_indent, s->syntax_highlight);
   printf("asm_extension=%s\nnasm_path=%s\nnasm_args=%s\nlast_dir=%s\n",
          s->asm_extension, s->nasm_path, s->nasm_args, s->last_dir);
+  printf("build_format=%d\nerror_list=%d\n", s->build_format, s->error_list);
   printf("theme=%d\n", s->theme);
   printf("ui=%d %d %d %d %d %d %d %d %d\n", s->ui_bg, s->ui_fg,
          s->ui_border_light, s->ui_border_dark, s->ui_title_bg, s->ui_title_fg,

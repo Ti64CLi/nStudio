@@ -47,6 +47,9 @@ typedef struct {
   char nasm_args[128]; /* Extra arguments passed after the source file */
   char last_dir[256];  /* Directory the file browser last visited; persisted
                           as "nasm_last_dir" and shared with the nasm app */
+  int build_format;    /* Ctrl+B builds: 0 = Zehn, 1 = PRG, 2 = ask each time */
+  int error_list;      /* list the errors when Ctrl+B fails, before working
+                          through them (they stay a Ctrl+E away either way) */
 
   /* 0 = Dark, 1 = Light, 2 = Custom */
   int theme;

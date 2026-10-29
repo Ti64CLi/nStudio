@@ -1,0 +1,4 @@
+# more errors than nasm keeps (512), let alone nStudio (64): the report still
+# counts every one
+awk 'BEGIN { print "main"; for (i = 0; i < 520; i++) print "    bogus r0" }' \
+  >main.asm.tns

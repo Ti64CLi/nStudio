@@ -15,7 +15,11 @@
 # A scenario is a directory holding the sources and `expect`, plus optionally:
 #   source   the file to assemble (default: main.asm.tns)
 #   args     the user's extra nasm arguments, as set in Settings
-#   answers  how nasm's dialogs are answered (NASM_HOST_ANSWERS, e.g. "0,1")
+#   format   the Build Format preference, zehn (the default) or prg - or
+#            legacy, for the command line nStudio sent before nasm 1.3
+#   answers  how nasm's dialogs are answered (NASM_HOST_ANSWERS, e.g. "0,1");
+#            only a legacy run has any, since nStudio otherwise asks nasm
+#            not to show any (--no-ui), which is checked
 #   diag     where nasm is asked to write diagnostics (default: nstudio_diag.json)
 #   setup    shell commands run in a copy of the scenario first, for files
 #            that are better generated than committed
@@ -69,6 +73,8 @@ for scen in "$here"/scenarios/*/; do
   [ -f "$work/source" ] && source=$(cat "$work/source")
   args=""
   [ -f "$work/args" ] && args=$(cat "$work/args")
+  format=zehn
+  [ -f "$work/format" ] && format=$(cat "$work/format")
   answers=""
   [ -f "$work/answers" ] && answers=$(cat "$work/answers")
   diag=nstudio_diag.json
@@ -77,11 +83,22 @@ for scen in "$here"/scenarios/*/; do
   [ -f "$work/no_nasm" ] && nasm=$build/no_such_nasm
 
   (cd "$work" && NASM_HOST_ANSWERS=$answers "$build/nstudio_side" "$nasm" \
-    "$work/$source" "$args" "$work/$diag" >"$work/report" 2>"$work/log")
+    "$work/$source" "$args" "$work/$diag" "$format" >"$work/report" \
+    2>"$work/log")
 
   if ! diff -u "$scen/expect" "$work/report" >"$work/diff"; then
     echo "FAIL $name (report differs from expect)"
     sed 's/^/    /' "$work/diff"
+    fail=$((fail + 1))
+    continue
+  fi
+
+  # nasm 1.3 shows nothing when nStudio asks it not to (gfx_host.c logs every
+  # dialog, alert and window it would have shown)
+  if [ "$format" != legacy ] &&
+    grep -q '^\[\(dialog\|alert\|window\)\]' "$work/log"; then
+    echo "FAIL $name (nasm showed something despite --no-ui)"
+    sed 's/^/    /' "$work/log"
     fail=$((fail + 1))
     continue
   fi

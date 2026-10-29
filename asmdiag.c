@@ -403,47 +403,144 @@ static int parse_object(const char **p, AsmDiag *d) {
   }
 }
 
-static int parse_document(const char *buf, AsmDiag *out, int max) {
-  const char *p = buf;
-  skip_ws(&p);
-  if (*p != '[')
-    return 0; /* not an array: treat as no diagnostics */
-  p++;
+/* Parse the array of diagnostics at *p into out[0..max), leaving *p past it.
+   Returns how many were stored; anything but an array stores none. */
+static int parse_diag_array(const char **p, AsmDiag *out, int max) {
+  skip_ws(p);
+  if (**p != '[') {
+    skip_value(p); /* not an array: treat as no diagnostics */
+    return 0;
+  }
+  (*p)++;
 
   int n = 0;
   for (;;) {
-    skip_ws(&p);
-    if (*p == ']' || *p == '\0')
+    skip_ws(p);
+    if (**p == ']') {
+      (*p)++;
+      break;
+    }
+    if (**p == '\0')
       break;
 
-    if (*p == '{') {
+    if (**p == '{') {
       AsmDiag d;
-      if (parse_object(&p, &d)) {
+      if (parse_object(p, &d)) {
         if (n < max)
           out[n] = d;
         if (n < max)
           n++;
       } else {
-        skip_value(&p); /* resync past a malformed object */
+        skip_value(p); /* resync past a malformed object */
       }
     } else {
-      skip_value(&p); /* unexpected token: resync */
+      skip_value(p); /* unexpected token: resync */
     }
 
-    skip_ws(&p);
-    if (*p == ',') {
-      p++;
+    skip_ws(p);
+    if (**p == ',') {
+      (*p)++;
       continue;
     }
-    if (*p == ']' || *p == '\0')
+    if (**p == ']') {
+      (*p)++;
       break;
-    p++; /* stray separator: advance to make progress */
+    }
+    if (**p == '\0')
+      break;
+    (*p)++; /* stray separator: advance to make progress */
   }
   return n;
 }
 
+static AsmRunStatus run_status_from(const char *s) {
+  if (!strcmp(s, "assembled"))
+    return ASMRUN_ASSEMBLED;
+  if (!strcmp(s, "errors"))
+    return ASMRUN_ERRORS;
+  if (!strcmp(s, "refused"))
+    return ASMRUN_REFUSED;
+  if (!strcmp(s, "cancelled"))
+    return ASMRUN_CANCELLED;
+  return ASMRUN_UNKNOWN;
+}
+
+/* Parse a results report at *p (which points at '{'): its fields into rep,
+   its diagnostics into out[0..max).  Returns how many diagnostics were
+   stored. */
+static int parse_report(const char **p, AsmReport *rep, AsmDiag *out,
+                        int max) {
+  int n = 0;
+
+  rep->version = 2; /* an object is a report, whatever it says it is */
+  (*p)++;
+  for (;;) {
+    skip_ws(p);
+    if (**p == '}' || **p == '\0')
+      return n;
+
+    char key[24];
+    if (!parse_string(p, key, sizeof(key)))
+      return n;
+    skip_ws(p);
+    if (**p != ':')
+      return n;
+    (*p)++;
+
+    if (!strcmp(key, "version")) {
+      rep->version = parse_int(p);
+    } else if (!strcmp(key, "status")) {
+      char s[16];
+      s[0] = '\0';
+      parse_string(p, s, sizeof(s));
+      rep->status = run_status_from(s);
+    } else if (!strcmp(key, "output")) {
+      parse_string(p, rep->output, sizeof(rep->output));
+    } else if (!strcmp(key, "format")) {
+      parse_string(p, rep->format, sizeof(rep->format));
+    } else if (!strcmp(key, "code_size")) {
+      rep->code_size = parse_int(p);
+    } else if (!strcmp(key, "errors")) {
+      rep->errors = parse_int(p);
+    } else if (!strcmp(key, "warnings")) {
+      rep->warnings = parse_int(p);
+    } else if (!strcmp(key, "diagnostics")) {
+      n = parse_diag_array(p, out, max);
+    } else {
+      skip_value(p); /* a field from a later version */
+    }
+
+    skip_ws(p);
+    if (**p == ',') {
+      (*p)++;
+      continue;
+    }
+    return n; /* '}' or a malformed tail: keep what we parsed */
+  }
+}
+
+/* Either shape of document: a results report, or nasm 1.2's bare array. */
+static int parse_document(const char *buf, AsmReport *rep, AsmDiag *out,
+                          int max) {
+  const char *p = buf;
+  skip_ws(&p);
+  if (*p == '{')
+    return parse_report(&p, rep, out, max);
+
+  rep->version = 1;
+  return parse_diag_array(&p, out, max);
+}
+
 int asmdiag_parse_file(const char *path, AsmDiag *out, int max) {
-  if (!path || !out || max <= 0)
+  AsmReport rep;
+  return asmdiag_parse_report(path, &rep, out, max);
+}
+
+int asmdiag_parse_report(const char *path, AsmReport *rep, AsmDiag *out,
+                         int max) {
+  if (rep)
+    memset(rep, 0, sizeof(*rep));
+  if (!path || !rep || !out || max <= 0)
     return -1;
 
   FILE *f = fopen(path, "rb");
@@ -469,7 +566,7 @@ int asmdiag_parse_file(const char *path, AsmDiag *out, int max) {
   buf[rd] = '\0';
   fclose(f);
 
-  int n = parse_document(buf, out, max);
+  int n = parse_document(buf, rep, out, max);
   free(buf);
   return n;
 }
@@ -602,6 +699,28 @@ AsmBuildOutcome asmdiag_build_outcome(int exit_status, int ndiag) {
     return ASMBUILD_NO_REPORT;
   default:
     return ASMBUILD_FAILED; /* errors with no usable batch, or unknown */
+  }
+}
+
+AsmBuildOutcome asmdiag_report_outcome(int exit_status, const AsmReport *rep,
+                                       int ndiag) {
+  if (!rep || rep->version < 2 || exit_status == ASMDIAG_NL_CANNOT_RUN ||
+      exit_status == ASMDIAG_NL_DECLINED)
+    return asmdiag_build_outcome(exit_status, ndiag);
+
+  switch (rep->status) {
+  case ASMRUN_ASSEMBLED:
+    /* the status agrees, or something went wrong after the report */
+    return exit_status == ASMDIAG_EXIT_ASSEMBLED ? ASMBUILD_OK
+                                                 : ASMBUILD_FAILED;
+  case ASMRUN_ERRORS:
+    return ndiag > 0 ? ASMBUILD_ERRORS : ASMBUILD_FAILED;
+  case ASMRUN_REFUSED:
+    return ASMBUILD_REFUSED;
+  case ASMRUN_CANCELLED:
+    return ASMBUILD_NOT_RUN;
+  default:
+    return asmdiag_build_outcome(exit_status, ndiag);
   }
 }
 

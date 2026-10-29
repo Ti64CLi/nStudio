@@ -71,6 +71,8 @@ void settings_defaults(NStudioSettings *s) {
   s->nasm_args[0] = '\0';
   strncpy(s->last_dir, "/documents", sizeof(s->last_dir) - 1);
   s->last_dir[sizeof(s->last_dir) - 1] = '\0';
+  s->build_format = 0; /* Zehn: PRG puts every CX II in compatibility mode */
+  s->error_list = 1;
   settings_theme_dark(s);
 }
 
@@ -142,7 +144,7 @@ static int is_known_key(const char *k) {
       "syn_comment", "syn_directive",   "syn_string",
       "syn_normal",  "syn_bracket1",    "syn_bracket2",
       "syn_bracket3", "nasm_path",      "nasm_args",
-      "nasm_last_dir", NULL};
+      "nasm_last_dir", "build_format",  "error_list", NULL};
   for (int i = 0; keys[i]; i++)
     if (!strcmp(k, keys[i]))
       return 1;
@@ -165,6 +167,8 @@ static void settings_validate(NStudioSettings *s) {
   s->tab_width = clampi(s->tab_width, 1, 8);
   s->auto_indent = s->auto_indent ? 1 : 0;
   s->syntax_highlight = s->syntax_highlight ? 1 : 0;
+  s->build_format = clampi(s->build_format, 0, 2);
+  s->error_list = s->error_list ? 1 : 0;
   s->theme = clampi(s->theme, 0, 2);
   s->ui_bg = clampi(s->ui_bg, 0, maxc);
   s->ui_fg = clampi(s->ui_fg, 0, maxc);
@@ -297,6 +301,10 @@ void settings_load(void) {
         copy_str(g_settings.nasm_args, v, sizeof(g_settings.nasm_args));
       else if (!strcmp(k, "nasm_last_dir"))
         copy_str(g_settings.last_dir, v, sizeof(g_settings.last_dir));
+      else if (!strcmp(k, "build_format"))
+        g_settings.build_format = vi;
+      else if (!strcmp(k, "error_list"))
+        g_settings.error_list = vi;
     }
     fclose(f);
   }
@@ -359,6 +367,8 @@ static int settings_writer(FILE *f, void *ctx) {
   fprintf(f, "nasm_path=%s\n", g_settings.nasm_path);
   fprintf(f, "nasm_args=%s\n", g_settings.nasm_args);
   fprintf(f, "nasm_last_dir=%s\n", g_settings.last_dir);
+  fprintf(f, "build_format=%d\n", g_settings.build_format);
+  fprintf(f, "error_list=%d\n", g_settings.error_list);
 
   if (g_extra_len > 0)
     fwrite(g_extra_config, 1, g_extra_len, f);
@@ -493,6 +503,7 @@ static void settings_ui_tick(GfxWindow *win) {
 
 void settings_ui_open(void) {
   static const char *theme_opts[] = {"Dark", "Light", "Custom"};
+  static const char *format_opts[] = {"Zehn", "PRG", "Ask"};
   const char *color_opts[32];
   for (int i = 0; i < g_palette_size && i < 32; i++)
     color_opts[i] = g_palette[i].name;
@@ -535,6 +546,16 @@ void settings_ui_open(void) {
       widget_create_label(col1, yy, col2 - col1, row_h, "nasm Args:");
   GfxWidget *w_nasm_args_val = widget_create_text(
       col2, yy, ww, row_h, g_settings.nasm_args, 127, "nasm Arguments:");
+  yy += row_h;
+  GfxWidget *w_fmt_lbl =
+      widget_create_label(col1, yy, col2 - col1, row_h, "Build Format:");
+  GfxWidget *w_fmt_val = widget_create_dropdown(
+      col2, yy, ww, row_h, &g_settings.build_format, format_opts, 3);
+  yy += row_h;
+  GfxWidget *w_errl_lbl =
+      widget_create_label(col1, yy, col2 - col1, row_h, "List Errors:");
+  GfxWidget *w_errl_val =
+      widget_create_toggle(col2, yy, ww, row_h, &g_settings.error_list);
   yy += row_h;
 
   yy += 10;
@@ -667,7 +688,8 @@ void settings_ui_open(void) {
   GfxWidget *children[] = {
       w_beh_hdr,  w_tab_lbl,     w_tab_val,       w_ind_lbl,       w_ind_val,
       w_syn_lbl,  w_syn_val,     w_ext_lbl,       w_ext_val,       w_nasm_lbl,
-      w_nasm_val, w_nasm_detect, w_nasm_args_lbl, w_nasm_args_val, w_app_hdr,
+      w_nasm_val, w_nasm_detect, w_nasm_args_lbl, w_nasm_args_val, w_fmt_lbl,
+      w_fmt_val,  w_errl_lbl,    w_errl_val,      w_app_hdr,
       w_thm_lbl,  w_thm_val,     w_bg_lbl,        w_bg_val,        w_fg_lbl,
       w_fg_val,   w_acc_lbl,     w_acc_val,       w_atx_lbl,       w_atx_val,
       w_ttb_lbl,  w_ttb_val,     w_ttf_lbl,       w_ttf_val,       w_itm_lbl,

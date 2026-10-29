@@ -210,11 +210,15 @@ static int g_ndiags = 0;
 static int g_diag_nav[ASMDIAG_MAX];
 static int g_diag_nav_count = 0;
 static int g_diag_cur = -1;
+/* How many errors and warnings nasm found in all, from its results report,
+   which may be more than were retained; 0 when nasm did not say. */
+static int g_diag_total = 0;
 
 static void diag_nav_reset(void) {
   g_ndiags = 0;
   g_diag_nav_count = 0;
   g_diag_cur = -1;
+  g_diag_total = 0;
 }
 
 static int path_is_asm_source(const char *path);
@@ -2880,13 +2884,16 @@ static void diag_jump_to_nav(int nav_pos) {
   if (d->related_count > 0)
     snprintf(rel, sizeof(rel), "  [+%d rel]", d->related_count);
 
+  /* "1/64+" when nasm found more than were kept */
+  const char *more = g_diag_total > g_diag_nav_count ? "+" : "";
+
   int line, col;
   AsmDiagPlace place = asmdiag_locate(d, g_filepath, &line, &col);
 
   if (place == ASMDIAG_AT_LINE) {
     editor_goto_line_col(line, col);
-    snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d, line %d: %s%s",
-             sev, nav_pos + 1, g_diag_nav_count, line, d->message, rel);
+    snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d%s, line %d: %s%s",
+             sev, nav_pos + 1, g_diag_nav_count, more, line, d->message, rel);
     return;
   }
 
@@ -2905,9 +2912,9 @@ static void diag_jump_to_nav(int nav_pos) {
     snprintf(from, sizeof(from), " (from %s:%d)",
              asmdiag_base_name(parent->file), parent->line);
   }
-  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d in %s%s%s: %s%s",
-           sev, nav_pos + 1, g_diag_nav_count, asmdiag_base_name(d->file), at,
-           from, d->message, rel);
+  snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d%s in %s%s%s: %s%s",
+           sev, nav_pos + 1, g_diag_nav_count, more, asmdiag_base_name(d->file),
+           at, from, d->message, rel);
 }
 
 /* After an assemble, read the diagnostics nasm left behind and retain every
@@ -2919,15 +2926,19 @@ static void diag_jump_to_nav(int nav_pos) {
 
    Returns what the diagnostics file said: 0 when nasm wrote an empty batch
    (assembled cleanly), a positive count when it reported problems, and -1 when
-   there was no file to read - a cancelled run, or an nasm too old to know the
-   option.  asmdiag_build_outcome() weighs this against nasm's exit status. */
-static int editor_load_diagnostics(void) {
+   there was no file to read - a run nasm 1.2 stopped before assembling, or an
+   nasm too old to know the option.  The rest of the file, when it is a results
+   report, goes to *rep.  asmdiag_report_outcome() weighs both against nasm's
+   exit status. */
+static int editor_load_diagnostics(AsmReport *rep) {
   diag_nav_reset();
 
-  int n = asmdiag_parse_file(NASMLINK_DIAG_FILE, g_diags, ASMDIAG_MAX);
+  int n = asmdiag_parse_report(NASMLINK_DIAG_FILE, rep, g_diags, ASMDIAG_MAX);
   if (n <= 0)
     return n;
   g_ndiags = n;
+  if (rep->version >= 2)
+    g_diag_total = rep->errors + rep->warnings;
 
   int first_line = -1, first_include = -1;
   for (int i = 0; i < g_ndiags && g_diag_nav_count < ASMDIAG_MAX; i++) {
@@ -3198,10 +3209,13 @@ static void editor_diag_panel(void) {
     g_diag_actionable[i] = (char)(place != ASMDIAG_NOWHERE);
   }
 
-  /* A full batch means nasm may have reported more than we kept, so say the
-     count is a floor rather than presenting it as the total. */
+  /* When nasm found more than we kept, say how many it found; without its
+     count, a full batch means there may be more, so the count is a floor. */
   char title[48];
-  if (g_ndiags >= ASMDIAG_MAX)
+  if (g_diag_total > g_diag_nav_count)
+    snprintf(title, sizeof(title), "Diagnostics  (%d of %d)", g_diag_nav_count,
+             g_diag_total);
+  else if (g_ndiags >= ASMDIAG_MAX)
     snprintf(title, sizeof(title), "Diagnostics  (%d+)", g_diag_nav_count);
   else
     snprintf(title, sizeof(title), "Diagnostics  (%d)", g_diag_nav_count);
@@ -3237,10 +3251,17 @@ static void editor_report_build(AsmBuildOutcome outcome, int status) {
     gfx_window_alert("Assemble", body, 3, "OK");
     break;
   }
+  case ASMBUILD_REFUSED: {
+    static const char *body[] = {"nasm will not build this file: its",
+                                 "program would replace the source.",
+                                 "Rename it, e.g. name.asm.tns."};
+    gfx_window_alert("Assemble", body, 3, "OK");
+    break;
+  }
   case ASMBUILD_DECLINED: /* Ndless has already said why */
     snprintf(g_diag_status, sizeof(g_diag_status), " nasm did not run");
     break;
-  case ASMBUILD_NOT_RUN: /* cancelled, or refused - nasm has said which */
+  case ASMBUILD_NOT_RUN: /* cancelled in nasm, or nasm 1.2 refused and said so */
     snprintf(g_diag_status, sizeof(g_diag_status), " Nothing was assembled");
     break;
   case ASMBUILD_FAILED:
@@ -3296,11 +3317,35 @@ static void editor_assemble(void) {
       return;
   }
 
+  /* nasm is told not to ask anything (--no-ui), so what it would have asked
+     is asked here: whether a file that does not look like a source is to be
+     built after all, by the rule nasm applies... */
+  if (!path_is_asm_source(g_filepath)) {
+    static const char *body[] = {"This file does not match your ASM",
+                                 "extension, so it may not be a source.",
+                                 "Assemble it anyway?"};
+    if (gfx_window_confirm2("Assemble", body, 3, "Assemble", "Cancel") != 0)
+      return;
+  }
+
+  /* ...and in which format, unless Preferences already says. */
+  static const char *const formats[] = {"zehn", "prg"};
+  int fmt = g_settings.build_format;
+  if (fmt < 0 || fmt > 1) {
+    static const char *body[] = {"Zehn: runs natively on every model.",
+                                 "PRG: legacy; a CX II runs it in",
+                                 "compatibility mode."};
+    fmt = gfx_window_confirm2("Output Format", body, 3, "Zehn", "PRG");
+    if (fmt < 0)
+      return;
+  }
+
   /* The command line nasm is given (see nasmlink.h).  Static rather than on
      the stack: nl_exec runs nasm on this very stack, below this frame. */
   static NasmInvocation inv;
   if (!nasmlink_invocation(&inv, g_filepath, g_settings.nasm_args,
-                           NASMLINK_DIAG_FILE, gfx_framebuffer())) {
+                           NASMLINK_DIAG_FILE, formats[fmt],
+                           gfx_framebuffer())) {
     static const char *body[] = {"The file's path is too long",
                                  "to pass to nasm."};
     gfx_window_alert("Assemble", body, 2, "OK");
@@ -3311,6 +3356,11 @@ static void editor_assemble(void) {
      (which never rewrites the file) is never mistaken for this run. */
   remove(NASMLINK_DIAG_FILE);
 
+  /* nasm leaves the screen alone, so this stays up while it works. */
+  snprintf(g_diag_status, sizeof(g_diag_status), " Assembling %s...",
+           asmdiag_base_name(g_filepath));
+  render_all();
+
   int status = nl_exec(g_settings.nasm_path, inv.argc, inv.argv);
   /*
    * nl_exec returns after the child exits (or immediately if it could not
@@ -3318,12 +3368,20 @@ static void editor_assemble(void) {
    * mode, so claim the screen back before drawing anything.
    */
   gfx_reinit();
+  g_diag_status[0] = '\0';
 
-  /* Read nasm's diagnostics and jump to the first error in this file. */
-  int ndiag = editor_load_diagnostics();
+  /* Read nasm's report and jump to the first error in this file.  Static,
+     like inv: this frame's size is stack nasm does not get. */
+  static AsmReport rep;
+  int ndiag = editor_load_diagnostics(&rep);
 
-  AsmBuildOutcome outcome = asmdiag_build_outcome(status, ndiag);
+  AsmBuildOutcome outcome = asmdiag_report_outcome(status, &rep, ndiag);
   if (outcome != ASMBUILD_OK) {
+    /* The list first, as a summary of what failed, before working through
+       it.  An nasm without results reports has just shown its own. */
+    if (outcome == ASMBUILD_ERRORS && rep.version >= 2 &&
+        g_settings.error_list)
+      editor_diag_panel();
     editor_report_build(outcome, status);
     return;
   }
@@ -3333,16 +3391,31 @@ static void editor_assemble(void) {
      with it. */
   g_build_stale = 0; /* what is on disk now matches this buffer */
 
+  /* What nasm says it built; nasm 1.2 does not say, so its rule decides. */
   char outpath[1024];
   struct stat ost;
-  if (nasmlink_output_path(g_filepath, outpath, sizeof(outpath)) &&
-      stat(outpath, &ost) == 0) {
-    char line[288];
-    snprintf(line, sizeof(line), "Output: %s", asmdiag_base_name(outpath));
-    const char *body[] = {"Assembly succeeded.", line, "Run it now?"};
-    if (gfx_window_confirm2("Assemble", body, 3, "Run", "Close") == 0)
-      editor_run_program(outpath);
+  if (rep.output[0])
+    snprintf(outpath, sizeof(outpath), "%s", rep.output);
+  else if (!nasmlink_output_path(g_filepath, outpath, sizeof(outpath)))
+    return;
+  if (stat(outpath, &ost) != 0)
+    return;
+
+  char first[288], second[288];
+  const char *body[] = {first, second, "Run it now?"};
+  if (rep.version >= 2) {
+    const char *fmt_name = !strcmp(rep.format, "zehn")  ? "Zehn"
+                           : !strcmp(rep.format, "prg") ? "PRG"
+                                                        : rep.format;
+    snprintf(first, sizeof(first), "Assembled %s", asmdiag_base_name(outpath));
+    snprintf(second, sizeof(second), "(%s, %d bytes)", fmt_name,
+             rep.code_size);
+  } else {
+    snprintf(first, sizeof(first), "Assembly succeeded.");
+    snprintf(second, sizeof(second), "Output: %s", asmdiag_base_name(outpath));
   }
+  if (gfx_window_confirm2("Assemble", body, 3, "Run", "Close") == 0)
+    editor_run_program(outpath);
 }
 
 /*

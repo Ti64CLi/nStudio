@@ -11,29 +11,49 @@
  * captured stdout on the calculator, so the two communicate through a file.
  *
  *   1. nStudio removes the diagnostics file, then invokes:
- *        nasm <source> [user args] --diagnostics-file=<path> --fb <addr>
+ *        nasm <source> [user args] --no-ui --report=2 --format=<zehn|prg>
+ *             --diagnostics-file=<path> --fb <addr>
  *      Passing --diagnostics-file alone makes nasm emit JSON to that file
  *      (it does not also need --diagnostics=json); the file takes precedence
- *      over stdout.  An older nasm that predates the option ignores it as an
- *      unknown flag, so nothing is written and nStudio simply does not jump -
- *      the integration degrades cleanly.
+ *      over stdout.  --no-ui (nasm 1.3) makes nasm show nothing: no format
+ *      question, since --format answers it; no extension warning, since
+ *      nStudio asks that itself; no outcome window, since nStudio shows the
+ *      outcome.  Every option is ignored by an nasm that predates it, which
+ *      then asks and shows as it always has - the integration degrades
+ *      cleanly, down to an nasm that writes no file at all.
  *
- *   2. nasm writes the whole batch to <path> once, after assembling, as a
- *      JSON array - "[]" on success, one object per diagnostic on failure.
- *      Because a cancelled run (e.g. the extension warning) returns before
- *      that write, nStudio removes the file up front so a stale file from a
- *      previous run is never mistaken for this run's result.
+ *   2. nasm writes <path> once, at the end.  With --report=2 (nasm 1.3) it is
+ *      a results report: a JSON object saying how the run ended (assembled,
+ *      errors, refused, cancelled), the program built, its format and size,
+ *      the error and warning counts - every one, including those nasm drops
+ *      past its own cap - and the diagnostics.  nasm 1.2 writes only the
+ *      diagnostics, as a bare JSON array: "[]" on success, one object per
+ *      diagnostic on failure, and nothing at all for a run that stopped
+ *      before assembling.  That is why nStudio removes the file up front: a
+ *      stale file from a previous run is never mistaken for this one.
  *
- *   3. After nl_exec() returns, nStudio parses <path>.  Absent/unreadable is
- *      "no diagnostics available"; an empty array is "assembled cleanly".
+ *   3. After nl_exec() returns, nStudio parses <path> as either shape
+ *      (asmdiag_parse_report).  Absent/unreadable is "no report".
  *
  *   4. nl_exec() also returns nasm's exit status (ASMDIAG_EXIT_* below), or
  *      Ndless's own code when nasm could not be run at all.
- *      asmdiag_build_outcome() combines the two channels: a build counts as
- *      successful only when the status is 0 AND the batch is empty.  An nasm
+ *      asmdiag_report_outcome() combines the two channels.  From a report, a
+ *      build succeeded when it says "assembled" and the status is 0.  From a
+ *      bare array, only when the status is 0 AND the array is empty.  An nasm
  *      that predates exit statuses always returns 0, which still works.
  *
- * JSON schema (from nasm's diag_write_json; reused here verbatim, never
+ * Results report (from nasm's diag_write_report), keys in any order:
+ *   version       2
+ *   status        "assembled" | "errors" | "refused" | "cancelled"
+ *   output        the program written (or that a failed build would have
+ *                 written), "" when there is none
+ *   format        "zehn" | "prg", "" when none was chosen
+ *   code_size     bytes of machine code, 0 unless assembled
+ *   errors, warnings   every diagnostic of that severity, kept or not
+ *   diagnostics   the array below
+ * Unknown keys are skipped, so later versions can add fields.
+ *
+ * Diagnostics (from nasm's diag_write_json; reused here verbatim, never
  * reinterpreted).  Each object has, in order:
  *   severity      "error" | "warning" | "note"
  *   code          stable short identifier, or ""
@@ -142,6 +162,35 @@ typedef struct {
  */
 int asmdiag_parse_file(const char *path, AsmDiag *out, int max);
 
+/* How the run ended, as a results report states it. */
+typedef enum {
+  ASMRUN_UNKNOWN,   /* no report, or a status this nStudio does not know */
+  ASMRUN_ASSEMBLED, /* the program on disk is this build */
+  ASMRUN_ERRORS,    /* not assembled; the diagnostics say why */
+  ASMRUN_REFUSED,   /* not assembled: the program would overwrite the source */
+  ASMRUN_CANCELLED  /* not assembled: the user cancelled in nasm */
+} AsmRunStatus;
+
+/* What the diagnostics file says beyond the diagnostics themselves. */
+typedef struct {
+  int version; /* 0: no file; 1: nasm 1.2's bare array; 2+: a results report.
+                  The fields below are filled only from a report. */
+  AsmRunStatus status;
+  char output[512]; /* the program built, or "" */
+  char format[8];   /* "zehn", "prg", or "" */
+  int code_size;    /* bytes of machine code */
+  int errors;       /* every error nasm found, including any dropped */
+  int warnings;     /* likewise for warnings */
+} AsmReport;
+
+/*
+ * Parse the diagnostics file at `path`, in either shape: fill *rep, and the
+ * diagnostics into out[0..max) exactly as asmdiag_parse_file() does, with the
+ * same return value.  *rep is always set; an absent file leaves version 0.
+ */
+int asmdiag_parse_report(const char *path, AsmReport *rep, AsmDiag *out,
+                         int max);
+
 /*
  * Index of the first diagnostic that belongs to `path` (see
  * asmdiag_same_file) and carries a real line number (line >= 1), or -1 if
@@ -211,8 +260,11 @@ typedef enum {
   ASMBUILD_NO_REPORT,   /* nasm could not write the diagnostics file */
   ASMBUILD_NOT_STARTED, /* Ndless could not run nasm */
   ASMBUILD_DECLINED,    /* Ndless declined to run nasm, and said why */
-  ASMBUILD_UNKNOWN      /* status 0 but no diagnostics file: an nasm older
+  ASMBUILD_UNKNOWN,     /* status 0 but no diagnostics file: an nasm older
                            than both channels, which cannot say how it went */
+  ASMBUILD_REFUSED      /* nasm would not build: the program would overwrite
+                           the source.  Only a report says so; nasm 1.2 shows
+                           it itself and returns NOT_RUN */
 } AsmBuildOutcome;
 
 /*
@@ -222,5 +274,14 @@ typedef enum {
  * this nStudio does not know is never taken for success.
  */
 AsmBuildOutcome asmdiag_build_outcome(int exit_status, int ndiag);
+
+/*
+ * The same judgement from asmdiag_parse_report()'s results.  A results report
+ * is believed over the batch: "assembled" with status 0 is success even with
+ * warnings in the batch.  Without one (version < 2), this is exactly
+ * asmdiag_build_outcome().
+ */
+AsmBuildOutcome asmdiag_report_outcome(int exit_status, const AsmReport *rep,
+                                       int ndiag);
 
 #endif /* ASMDIAG_H_INCLUDED */

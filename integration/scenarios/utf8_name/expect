@@ -1,3 +1,4 @@
 status 1: ERRORS
+report: errors (zehn), errors 1, warnings 0
 program: caf\xc3\xa9.tns (not written), Run not offered
 error syntax caf\xc3\xa9.asm.tns:2:5 -> line 2

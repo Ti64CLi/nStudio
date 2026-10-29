@@ -33,8 +33,10 @@ int nasmlink_output_path(const char *src, char *out, size_t outsz) {
 
 int nasmlink_invocation(NasmInvocation *inv, const char *src,
                         const char *user_args, const char *diag_path,
-                        const void *fb) {
+                        const char *format, const void *fb) {
   static char fb_flag[] = "--fb";
+  static char no_ui_flag[] = "--no-ui";
+  static char report_flag[] = "--report=2";
 
   inv->argc = 0;
   if (strlen(src) >= sizeof(inv->source))
@@ -42,19 +44,28 @@ int nasmlink_invocation(NasmInvocation *inv, const char *src,
   if (snprintf(inv->diag_arg, sizeof(inv->diag_arg), "--diagnostics-file=%s",
                diag_path) >= (int)sizeof(inv->diag_arg))
     return 0;
+  if (format && strcmp(format, "zehn") != 0 && strcmp(format, "prg") != 0)
+    return 0;
 
   strcpy(inv->source, src);
   inv->argv[inv->argc++] = inv->source; /* always first: the source file */
 
-  /* strtok is destructive, hence the copy.  Three slots stay free for the
-     diagnostics file and "--fb <address>". */
+  /* strtok is destructive, hence the copy.  The last slots stay free for
+     nStudio's own options. */
   strncpy(inv->user_args, user_args ? user_args : "",
           sizeof(inv->user_args) - 1);
   inv->user_args[sizeof(inv->user_args) - 1] = '\0';
   char *tok = strtok(inv->user_args, " \t");
-  while (tok && inv->argc < NASMLINK_MAX_ARGS - 3) {
+  while (tok && inv->argc < NASMLINK_MAX_ARGS - NASMLINK_INJECTED) {
     inv->argv[inv->argc++] = tok;
     tok = strtok(NULL, " \t");
+  }
+
+  inv->argv[inv->argc++] = no_ui_flag;
+  inv->argv[inv->argc++] = report_flag;
+  if (format) {
+    snprintf(inv->format_arg, sizeof(inv->format_arg), "--format=%s", format);
+    inv->argv[inv->argc++] = inv->format_arg;
   }
 
   /* Passing the diagnostics file alone is enough to select JSON output; an

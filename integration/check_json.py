@@ -1,4 +1,5 @@
-"""Check a diagnostics file against the format documented in asmdiag.h.
+"""Check a diagnostics file against the format documented in asmdiag.h:
+a results report (nasm 1.3, --report=2) or a bare diagnostics array (1.2).
 
 Usage: python3 -I check_json.py <file>...
 
@@ -11,6 +12,8 @@ import json
 import sys
 
 SEVERITIES = {"error", "warning", "note"}
+RUN_STATUSES = {"assembled", "errors", "refused", "cancelled"}
+FORMATS = {"zehn", "prg", ""}
 
 
 def check_location(where, obj, keys, problems):
@@ -56,6 +59,43 @@ def check_diagnostic(where, d, problems):
             problems.append(f"{where}.include_stack[{i}]: line {fr['line']}")
 
 
+def check_report(path, doc, problems):
+    """A results report (nasm --report=2): the run, then the diagnostics."""
+    fields = {
+        "version": int, "status": str, "output": str, "format": str,
+        "code_size": int, "errors": int, "warnings": int, "diagnostics": list,
+    }
+    for key, kind in fields.items():
+        if not isinstance(doc.get(key), kind) or isinstance(doc.get(key), bool):
+            problems.append(f"{path}: '{key}' missing or not {kind.__name__}")
+            return
+    if doc["version"] != 2:
+        problems.append(f"{path}: version {doc['version']}, expected 2")
+    if doc["status"] not in RUN_STATUSES:
+        problems.append(f"{path}: unknown status {doc['status']!r}")
+    if doc["format"] not in FORMATS:
+        problems.append(f"{path}: unknown format {doc['format']!r}")
+    assembled = doc["status"] == "assembled"
+    if doc["code_size"] < 0 or (not assembled and doc["code_size"] != 0):
+        problems.append(f"{path}: code_size {doc['code_size']} for a run "
+                        f"that is {doc['status']}")
+    if assembled and (not doc["output"] or not doc["format"]):
+        problems.append(f"{path}: assembled, but no output or format")
+    if doc["status"] in ("refused", "cancelled") and doc["output"]:
+        problems.append(f"{path}: {doc['status']}, yet an output")
+    diags = doc["diagnostics"]
+    for i, d in enumerate(diags):
+        check_diagnostic(f"{path}.diagnostics[{i}]", d, problems)
+    # the counts cover every diagnostic, so never fewer than those listed
+    for sev, key in (("error", "errors"), ("warning", "warnings")):
+        listed = sum(1 for d in diags
+                     if isinstance(d, dict) and d.get("severity") == sev)
+        if doc[key] < listed:
+            problems.append(f"{path}: {key} {doc[key]}, but {listed} listed")
+    if doc["status"] == "errors" and doc["errors"] == 0:
+        problems.append(f"{path}: errors, but none counted")
+
+
 def check_file(path):
     problems = []
     try:
@@ -63,8 +103,11 @@ def check_file(path):
             doc = json.load(f)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
         return [f"{path}: {e}"]
+    if isinstance(doc, dict):
+        check_report(path, doc, problems)
+        return problems
     if not isinstance(doc, list):
-        return [f"{path}: not a JSON array"]
+        return [f"{path}: neither a results report nor a JSON array"]
     for i, d in enumerate(doc):
         check_diagnostic(f"{path}[{i}]", d, problems)
     return problems

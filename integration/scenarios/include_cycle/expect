@@ -1,4 +1,5 @@
 status 1: ERRORS
+report: errors (zehn), errors 1, warnings 0
 program: main.tns (not written), Run not offered
 error include-cycle main.asm.tns -> include 2
     via loop.inc:1 "main.asm.tns": same file
