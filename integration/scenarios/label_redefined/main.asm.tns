@@ -1,0 +1,3 @@
+helper
+    INCLUDE lib/dup.inc
+    bx lr

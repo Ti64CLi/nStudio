@@ -1,0 +1,7 @@
+files: main.asm.tns lib/dup.inc
+status 1: ERRORS
+report: errors (zehn), errors 1, warnings 0
+program: main.tns (not written), Run not offered
+error label-redefined lib/dup.inc:1:1 -> include 2
+    via main.asm.tns:2 "lib/dup.inc": same file
+    indexed at lib/dup.inc:1 yes, main.asm.tns:1 yes

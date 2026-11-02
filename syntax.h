@@ -12,14 +12,7 @@
 
 #include <stdint.h>
 
-/* Word-slice classifiers (word need not be NUL-terminated); all are
-   backed by the vendored optab.c tables shared with nasm. */
-int syn_is_mnem(const char *word, int wlen);
-int syn_is_reg(const char *word, int wlen);
-int syn_is_shift(const char *word, int wlen);
-int syn_is_directive(const char *word, int wlen);
-int syn_is_label_word(const char *word, int wlen);
-int is_branch_base(const char *w, int wlen);
+#include "asmlang.h" /* the word classifiers the highlighter is built on */
 
 /* SWI/SVC line scanner shared by the renderer and the cheat sheet */
 int syntax_scan_swi(const char *line, int len, long *out_num);

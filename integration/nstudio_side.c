@@ -3,6 +3,7 @@
  * runs (nasmlink.c, asmdiag.c) around a real nasm - nasm_cli, nasm's own main().
  *
  *   nstudio_side <nasm> <source> <user args> <diagnostics file> <format>
+ *                [<open file>]
  *
  * It builds nasm's command line with nasmlink_invocation(), clears the
  * diagnostics file, runs nasm - fork and exec standing in for nl_exec - and
@@ -15,6 +16,14 @@
  * <format> is the Build Format preference, "zehn" or "prg" - or "legacy", for
  * the command line nStudio sent before nasm 1.3 (no --no-ui, --report or
  * --format), which nasm must still answer exactly as it used to.
+ *
+ * <source> is the file the user opened, which roots the program (project.h);
+ * <open file> is the one being edited when Ctrl+B is pressed - one of the
+ * program's files, by default the source itself.  The program is what gets
+ * built, and diagnostics are placed relative to the open file.  The report
+ * also checks the program index against what nasm saw: every file nasm
+ * reports a diagnostic in must be one of the program's, and a label nasm
+ * says is defined twice must be indexed at both places.
  *
  * The report goes to stdout, with paths relative to the source's directory and
  * any byte outside printable ASCII written as \xNN, so the expected reports
@@ -31,7 +40,9 @@
 #include <unistd.h>
 
 #include "asmdiag.h"
+#include "asmlang.h"
 #include "nasmlink.h"
+#include "project.h"
 
 static char g_base[1024]; /* the source's directory, with its trailing '/' */
 
@@ -194,15 +205,26 @@ static void check_include(const AsmDiag *d) {
   }
 }
 
+/* Whether the program index has a symbol defined at `file`:`line`. */
+static int indexed_at(const Project *p, const char *file, int line) {
+  int f = project_find_file(p, file);
+  for (int i = 0; f >= 0 && i < p->nsyms; i++)
+    if (p->syms[i].file == f && p->syms[i].line == line)
+      return 1;
+  return 0;
+}
+
 int main(int argc, char **argv) {
-  if (argc != 6) {
+  if (argc != 6 && argc != 7) {
     fprintf(stderr,
-            "usage: %s <nasm> <source> <user args> <diag file> <format>\n",
+            "usage: %s <nasm> <source> <user args> <diag file> <format> "
+            "[<open file>]\n",
             argv[0]);
     return 2;
   }
   const char *nasm = argv[1], *src = argv[2], *user_args = argv[3],
              *diag = argv[4], *format = argv[5];
+  const char *open = argc == 7 ? argv[6] : src;
   int legacy = strcmp(format, "legacy") == 0;
 
   snprintf(g_base, sizeof(g_base), "%s", src);
@@ -211,6 +233,27 @@ int main(int argc, char **argv) {
     slash[1] = '\0';
   else
     g_base[0] = '\0';
+
+  /* The program the source roots, as the editor reads it when it is opened.
+     The open file must belong to it. */
+  static Project prog;
+  project_init(&prog, &asmlang_project);
+  project_open(&prog, src);
+  if (prog.nfiles > 1) {
+    printf("files:");
+    for (int f = 0; f < prog.nfiles; f++) {
+      putchar(' ');
+      put_path(project_path(&prog, f));
+    }
+    putchar('\n');
+  }
+  if (project_find_file(&prog, open) < 0) {
+    printf("OPEN FILE NOT IN THE PROGRAM\n");
+  } else if (strcmp(open, src) != 0) {
+    printf("open: ");
+    put_path(open);
+    putchar('\n');
+  }
 
   /* What the editor does, in its order: the command line, then the stale
      diagnostics cleared, then nasm. */
@@ -274,7 +317,7 @@ int main(int argc, char **argv) {
       printf(":%d", d->col);
 
     int line, col;
-    switch (asmdiag_locate(d, src, &line, &col)) {
+    switch (asmdiag_locate(d, open, &line, &col)) {
     case ASMDIAG_AT_LINE:
       printf(" -> line %d\n", line);
       break;
@@ -286,8 +329,24 @@ int main(int argc, char **argv) {
       break;
     }
 
+    if (d->line >= 1 && project_find_file(&prog, d->file) < 0)
+      printf("    OUTSIDE THE PROGRAM\n");
     if (d->include_count > 0)
       check_include(d);
+    if (strcmp(d->code, "label-redefined") == 0) {
+      printf("    indexed at ");
+      put_path(d->file);
+      printf(":%d %s", d->line, indexed_at(&prog, d->file, d->line) ? "yes" : "NO");
+      for (int k = 0; k < d->related_count; k++) {
+        printf(", ");
+        put_path(d->related[k].file);
+        printf(":%d %s", d->related[k].line,
+               indexed_at(&prog, d->related[k].file, d->related[k].line)
+                   ? "yes"
+                   : "NO");
+      }
+      putchar('\n');
+    }
   }
   if (ndiag > 5)
     printf("(%d more)\n", ndiag - 5);

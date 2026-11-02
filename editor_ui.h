@@ -48,18 +48,20 @@ int ui_draw_wrapped(const char *text, int wx, int ty, int max_w, int max_lines,
 
 #define MAX_LABEL_LEN 64
 
-/* One entry of the label table.  The editor scans these out of the buffer -
-   under nasm's rule, an identifier in column 0 with no trailing colon - and
-   the picker below only displays them. */
+/* One entry of the label table.  The editor gathers these from the buffer and
+   the program's other files - under nasm's rule, an identifier in column 0 -
+   and the picker below only displays them. */
 typedef struct {
   char name[MAX_LABEL_LEN];
-  int line; /* 0-based line index */
+  int line;          /* 0-based line index */
+  const char *where; /* the file it is in, as shown; NULL for the open one */
 } LabelEntry;
 
-/* Modal list of the labels defined in the file.  `cur_line` is the line the
-   cursor is on, used to pre-select the nearest label.  Returns the index of
-   the chosen entry, or -1 when cancelled; moving the cursor is the caller's
-   job, so this stays free of editor state like every dialog here. */
+/* Modal list of the labels defined in the program.  `cur_line` is the line
+   the cursor is on, used to pre-select the nearest label of the open file.
+   Returns the index of the chosen entry, or -1 when cancelled; moving the
+   cursor is the caller's job, so this stays free of editor state like every
+   dialog here. */
 int label_pick(const LabelEntry *labels, int n, int cur_line);
 
 /* ------------------------------------------------------------------ */

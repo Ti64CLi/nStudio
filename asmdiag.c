@@ -577,14 +577,10 @@ static const char *base_name(const char *path) {
   return slash ? slash + 1 : path;
 }
 
-/*
- * Lexically normalise `in` into `out`: repeated '/' collapse, "." segments go,
- * and ".." removes the segment before it (nothing, at the root).  nasm joins
- * an INCLUDE's operand to the includer's directory, so it may name a file
- * /documents/p/sub/../inc.asm.tns while the editor holds /documents/p/inc.asm.tns.
- * Returns 0 if the result does not fit in `outsz` bytes.
- */
-static int normalize_path(const char *in, char *out, int outsz) {
+/* See asmdiag.h.  nasm joins an INCLUDE's operand to the includer's directory,
+   so it may name a file /documents/p/sub/../inc.asm.tns while the editor holds
+   /documents/p/inc.asm.tns. */
+int asmdiag_normalize_path(const char *in, char *out, int outsz) {
   int absolute = (in[0] == '/');
   int root = absolute ? 1 : 0; /* length of the part ".." cannot remove */
   int len = 0;
@@ -641,8 +637,8 @@ int asmdiag_same_file(const char *diag_file, const char *path) {
     return 0;
 
   char a[512], b[512];
-  if (!normalize_path(diag_file, a, sizeof(a)) ||
-      !normalize_path(path, b, sizeof(b)))
+  if (!asmdiag_normalize_path(diag_file, a, sizeof(a)) ||
+      !asmdiag_normalize_path(path, b, sizeof(b)))
     return strcmp(diag_file, path) == 0; /* too long to normalise */
   return strcmp(a, b) == 0;
 }
@@ -657,8 +653,8 @@ void asmdiag_relative_path(const char *path, const char *from, char *out,
 
   if (outsz <= 0)
     return;
-  if (!path || !from || !normalize_path(path, p, sizeof(p)) ||
-      !normalize_path(from, dir, sizeof(dir)) || (p[0] == '/') != (dir[0] == '/'))
+  if (!path || !from || !asmdiag_normalize_path(path, p, sizeof(p)) ||
+      !asmdiag_normalize_path(from, dir, sizeof(dir)) || (p[0] == '/') != (dir[0] == '/'))
     goto base;
 
   /* the folder `from` is in, with its trailing '/' ("" for a bare name) */

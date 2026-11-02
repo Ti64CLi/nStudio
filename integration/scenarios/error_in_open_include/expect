@@ -1,0 +1,7 @@
+files: main.asm.tns lib/bad.inc
+open: lib/bad.inc
+status 1: ERRORS
+report: errors (zehn), errors 1, warnings 0
+program: main.tns (not written), Run not offered
+error syntax lib/bad.inc:2:5 -> line 2
+    via main.asm.tns:3 "lib/bad.inc": same file

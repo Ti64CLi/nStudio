@@ -217,6 +217,13 @@ int asmdiag_in_file(const AsmDiag *d, const char *path);
  */
 int asmdiag_same_file(const char *diag_file, const char *path);
 
+/*
+ * Lexically normalise `in` into `out`: repeated '/' collapse, "." segments go,
+ * and ".." removes the segment before it (nothing, at the root).  Returns 0 if
+ * the result does not fit in `outsz` bytes.
+ */
+int asmdiag_normalize_path(const char *in, char *out, int outsz);
+
 /* Where a diagnostic can be shown in the open file - see asmdiag_locate. */
 typedef enum {
   ASMDIAG_NOWHERE,   /* no line, or in a file the open one does not include */

@@ -1,0 +1,6 @@
+main
+    bl helper
+    INCLUDE lib/util.inc
+    bx lr
+counter
+    DCD 0

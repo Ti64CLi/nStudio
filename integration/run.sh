@@ -13,7 +13,10 @@
 #    or: make integration [NASM_DIR=<nasm checkout>]
 #
 # A scenario is a directory holding the sources and `expect`, plus optionally:
-#   source   the file to assemble (default: main.asm.tns)
+#   source   the file the user opened, which roots the program and is what
+#            gets assembled (default: main.asm.tns)
+#   open     the file being edited at Ctrl+B, one the source includes
+#            (default: the source)
 #   args     the user's extra nasm arguments, as set in Settings
 #   format   the Build Format preference, zehn (the default) or prg - or
 #            legacy, for the command line nStudio sent before nasm 1.3
@@ -46,8 +49,8 @@ sh "$nasm_dir/tests/build_host.sh" "$build" nstudio.cfg || exit 1
 
 echo "building nStudio's side..."
 cc -Wall -W -O1 -I"$root" -o "$build/nstudio_side" "$here/nstudio_side.c" \
-  "$root/nasmlink.c" "$root/asmdiag.c" "$root/optab.c" "$root/util.c" ||
-  exit 1
+  "$root/nasmlink.c" "$root/asmdiag.c" "$root/asmlang.c" "$root/project.c" \
+  "$root/optab.c" "$root/util.c" || exit 1
 cc -Wall -W -O1 -I"$root" -I"$here/host" '-DSETTINGS_FILE="nstudio.cfg"' \
   -o "$build/settings_side" "$here/settings_side.c" "$here/host_ui.c" \
   "$root/settings.c" "$root/fileio.c" || exit 1
@@ -75,6 +78,8 @@ for scen in "$here"/scenarios/*/; do
   [ -f "$work/args" ] && args=$(cat "$work/args")
   format=zehn
   [ -f "$work/format" ] && format=$(cat "$work/format")
+  open=$work/$source
+  [ -f "$work/open" ] && open=$work/$(cat "$work/open")
   answers=""
   [ -f "$work/answers" ] && answers=$(cat "$work/answers")
   diag=nstudio_diag.json
@@ -83,8 +88,8 @@ for scen in "$here"/scenarios/*/; do
   [ -f "$work/no_nasm" ] && nasm=$build/no_such_nasm
 
   (cd "$work" && NASM_HOST_ANSWERS=$answers "$build/nstudio_side" "$nasm" \
-    "$work/$source" "$args" "$work/$diag" "$format" >"$work/report" \
-    2>"$work/log")
+    "$work/$source" "$args" "$work/$diag" "$format" "$open" \
+    >"$work/report" 2>"$work/log")
 
   if ! diff -u "$scen/expect" "$work/report" >"$work/diff"; then
     echo "FAIL $name (report differs from expect)"

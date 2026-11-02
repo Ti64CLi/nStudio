@@ -1,0 +1,5 @@
+files: main.asm.tns lib/util.inc
+open: lib/util.inc
+status 0: OK
+report: assembled (zehn, 20 bytes), errors 0, warnings 0
+program: main.tns (written, Zehn), Run offered

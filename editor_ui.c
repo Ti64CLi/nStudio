@@ -871,8 +871,13 @@ static void labels_draw(const LabelEntry *labels, int n, int sel,
 
   gfx_panel(LBL_WIN_X, LBL_WIN_Y, LBL_WIN_W, LBL_WIN_H, LBL_TITLE_H);
 
+  /* labels from other files say so: the count is the program's */
+  int elsewhere = 0;
+  for (int i = 0; i < n && !elsewhere; i++)
+    elsewhere = labels[i].where != NULL;
   char title[48];
-  snprintf(title, sizeof(title), "Labels  (%d defined)", n);
+  snprintf(title, sizeof(title), "Labels  (%d %s)", n,
+           elsewhere ? "in program" : "defined");
   gfx_drawstr_clipped(LBL_WIN_X + 4,
                       LBL_WIN_Y + 1 + (LBL_TITLE_H - GFX_FONT_H) / 2, title,
                       TIT_FG, TIT_BG, LBL_WIN_W - 8);
@@ -901,13 +906,21 @@ static void labels_draw(const LabelEntry *labels, int n, int sel,
 
     gfx_fillrect(LBL_WIN_X + 1, row_y, LBL_WIN_W - 2, LBL_ROW_H, bg);
 
-    gfx_drawstr_clipped(LBL_WIN_X + 4, row_y + 1, labels[ri].name, fg, bg,
-                        LBL_WIN_W - 50);
-
-    char lnbuf[16];
-    snprintf(lnbuf, sizeof(lnbuf), "Ln %d", labels[ri].line + 1);
+    /* where it is: its line here, or file:line for another file, clipped to
+       half the row so the name always shows */
+    char lnbuf[80];
+    if (labels[ri].where)
+      snprintf(lnbuf, sizeof(lnbuf), "%s:%d", labels[ri].where,
+               labels[ri].line + 1);
+    else
+      snprintf(lnbuf, sizeof(lnbuf), "Ln %d", labels[ri].line + 1);
     int lnw = (int)strlen(lnbuf) * GFX_CHAR_W;
-    gfx_drawstr(LBL_WIN_X + LBL_WIN_W - 6 - lnw, row_y + 1, lnbuf, lfg, bg);
+    if (lnw > LBL_WIN_W / 2)
+      lnw = LBL_WIN_W / 2;
+    gfx_drawstr_clipped(LBL_WIN_X + 4, row_y + 1, labels[ri].name, fg, bg,
+                        LBL_WIN_W - 18 - lnw);
+    gfx_drawstr_clipped(LBL_WIN_X + LBL_WIN_W - 6 - lnw, row_y + 1, lnbuf, lfg,
+                        bg, lnw);
   }
 
   gfx_scrollbar_v(LBL_WIN_X, LBL_WIN_W, LBL_LIST_Y, LBL_LIST_H, n,
@@ -933,10 +946,14 @@ int label_pick(const LabelEntry *labels, int n, int cur_line) {
   int scroll = 0;
 
   if (n > 0) {
-    int best = 0, bestd = abs(labels[0].line - cur_line);
-    for (int i = 1; i < n; i++) {
+    /* the nearest label of the open file; other files' lines say nothing
+       about where the cursor is */
+    int best = 0, bestd = -1;
+    for (int i = 0; i < n; i++) {
+      if (labels[i].where)
+        continue;
       int d = abs(labels[i].line - cur_line);
-      if (d < bestd) {
+      if (bestd < 0 || d < bestd) {
         bestd = d;
         best = i;
       }

@@ -17,14 +17,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "asmdb.h"
 #include "asmdiag.h"
+#include "asmlang.h"
 #include "fileio.h"
 #include "gapbuf.h"
 #include "nasmlink.h"
 #include "optab.h"
+#include "project.h"
 #include "textdiff.h"
 #include "undo.h"
 #include "util.h"
@@ -859,6 +862,208 @@ static void test_asmdiag(void) {
   CHECK(asmdiag_build_outcome(42, 0) == ASMBUILD_FAILED);
 }
 
+/* ================================================================ */
+/* asmlang + project  (the program and its symbols)                 */
+/* ================================================================ */
+static void test_asmlang(void) {
+  printf("asmlang\n");
+  char out[16];
+
+  /* a label is a word in column 0 that is not a keyword */
+  CHECK(asmlang_label_def("loop", out, sizeof(out)) == 4);
+  CHECK(strcmp(out, "loop") == 0);
+  CHECK(asmlang_label_def("x1_y EQU 5 ; c", out, sizeof(out)) == 4);
+  CHECK(strcmp(out, "x1_y") == 0);
+  CHECK(asmlang_label_def("    mov r0, #1", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("mov r0, #1", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("addeqs r0, r0, r0", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("r0", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("lsl", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("ALIGN", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("_under", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("", out, sizeof(out)) == 0);
+  CHECK(asmlang_label_def("a_name_far_too_long", out, sizeof(out)) == 0);
+
+  /* a mention is a whole word, case and all, before the comment */
+  CHECK(asmlang_mentions("    b loop", "loop"));
+  CHECK(asmlang_mentions("loop", "loop")); /* its definition too */
+  CHECK(asmlang_mentions("    ldr r0, [r1, #loop+4]", "loop"));
+  CHECK(!asmlang_mentions("    b loopback", "loop"));
+  CHECK(!asmlang_mentions("    b LOOP", "loop"));
+  CHECK(!asmlang_mentions("    b xloop", "loop"));
+  CHECK(!asmlang_mentions("    bx lr ; back to loop", "loop"));
+}
+
+/* Write `text` to dir/rel. */
+static void put_file(const char *dir, const char *rel, const char *text) {
+  char path[256];
+  snprintf(path, sizeof(path), "%s/%s", dir, rel);
+  FILE *f = fopen(path, "wb");
+  if (f) {
+    fputs(text, f);
+    fclose(f);
+  }
+}
+
+typedef struct {
+  int n, stop_after;
+  int file[8], line[8];
+} RefLog;
+
+static int log_ref(void *ctx, int file, int line, const char *text) {
+  RefLog *r = ctx;
+  (void)text;
+  if (r->n < 8) {
+    r->file[r->n] = file;
+    r->line[r->n] = line;
+  }
+  r->n++;
+  return r->stop_after == 0 || r->n < r->stop_after;
+}
+
+/* Every symbol belongs to a file of the program, in file order. */
+static int project_consistent(const Project *p) {
+  for (int i = 0; i < p->nsyms; i++) {
+    if (p->syms[i].file < 0 || p->syms[i].file >= p->nfiles)
+      return 0;
+    if (i > 0 && p->syms[i].file < p->syms[i - 1].file)
+      return 0;
+  }
+  return 1;
+}
+
+static void test_project(void) {
+  printf("project\n");
+
+  char dir[] = "/tmp/nstudio_projXXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  char lib[64], path[128], want[128];
+  snprintf(lib, sizeof(lib), "%s/lib", dir);
+  mkdir(lib, 0700);
+
+  /* main includes util, which includes gfx; main's own INCLUDE of gfx, the
+     second INCLUDE of util and gfx's INCLUDE back to main are each read once
+     only, and a missing file is skipped.  The file beside them that nothing
+     includes is never read. */
+  put_file(dir, "main.asm.tns",
+           "main\n    bl helper\n    INCLUDE lib/util.inc\n"
+           "    INCLUDE gfx.inc\n    INCLUDE missing.inc\n"
+           "    INCLUDE lib/util.inc\n    bx lr\ncounter\n    DCD 0\n");
+  put_file(dir, "lib/util.inc",
+           "helper\n    adr r0, counter\n    INCLUDE ../gfx.inc\n    bx lr\n");
+  put_file(dir, "gfx.inc", "draw\n    INCLUDE main.asm.tns\n    bx lr\n");
+  put_file(dir, "other.asm.tns", "other\n");
+
+  Project p;
+  project_init(&p, &asmlang_project);
+  snprintf(path, sizeof(path), "%s/./main.asm.tns", dir);
+  CHECK(project_open(&p, path) == 1);
+  CHECK(p.nfiles == 3);
+  snprintf(want, sizeof(want), "%s/main.asm.tns", dir);
+  CHECK(project_root(&p) && strcmp(project_root(&p), want) == 0);
+  snprintf(want, sizeof(want), "%s/lib/util.inc", dir);
+  CHECK(strcmp(project_path(&p, 1), want) == 0);
+  CHECK(p.files[1].includer == 0 && p.files[1].line == 3);
+  snprintf(want, sizeof(want), "%s/gfx.inc", dir);
+  CHECK(strcmp(project_path(&p, 2), want) == 0);
+  CHECK(p.files[2].includer == 1 && p.files[2].line == 3);
+  CHECK(project_consistent(&p));
+
+  /* the same file, however it is written */
+  snprintf(path, sizeof(path), "%s/lib/../gfx.inc", dir);
+  CHECK(project_find_file(&p, path) == 2);
+  snprintf(path, sizeof(path), "%s/other.asm.tns", dir);
+  CHECK(project_find_file(&p, path) == -1);
+
+  /* symbols of every file, found in program order */
+  int f, line;
+  CHECK(project_find_symbol(&p, "counter", -1, &f, &line));
+  CHECK(f == 0 && line == 8);
+  CHECK(project_find_symbol(&p, "helper", -1, &f, &line));
+  CHECK(f == 1 && line == 1);
+  CHECK(project_find_symbol(&p, "draw", -1, &f, &line));
+  CHECK(f == 2 && line == 1);
+  CHECK(!project_find_symbol(&p, "counter", 0, &f, &line)); /* skipped */
+  CHECK(!project_find_symbol(&p, "other", -1, &f, &line));
+  CHECK(!project_find_symbol(&p, "Counter", -1, &f, &line));
+
+  /* references, file by file */
+  RefLog r;
+  memset(&r, 0, sizeof(r));
+  CHECK(project_find_refs(&p, "counter", -1, log_ref, &r) == 2);
+  CHECK(r.file[0] == 0 && r.line[0] == 8);
+  CHECK(r.file[1] == 1 && r.line[1] == 2);
+  memset(&r, 0, sizeof(r));
+  CHECK(project_find_refs(&p, "counter", 0, log_ref, &r) == 1);
+  CHECK(r.file[0] == 1);
+  memset(&r, 0, sizeof(r));
+  r.stop_after = 1;
+  CHECK(project_find_refs(&p, "helper", -1, log_ref, &r) == 1);
+
+  /* a save that changes only symbols replaces that file's, in place */
+  put_file(dir, "lib/util.inc",
+           "helper\nhelper2\n    adr r0, counter\n    INCLUDE ../gfx.inc\n");
+  snprintf(path, sizeof(path), "%s/lib/util.inc", dir);
+  CHECK(project_file_saved(&p, path) == 1);
+  CHECK(p.nfiles == 3);
+  CHECK(project_find_symbol(&p, "helper2", -1, &f, &line));
+  CHECK(f == 1 && line == 2);
+  CHECK(project_find_symbol(&p, "counter", -1, &f, &line) && f == 0);
+  CHECK(project_find_symbol(&p, "draw", -1, &f, &line) && f == 2);
+  CHECK(project_consistent(&p));
+
+  /* one that changes what it includes reads the program again */
+  put_file(dir, "lib/extra.inc", "extra\n");
+  put_file(dir, "lib/util.inc", "helper\n    INCLUDE extra.inc\n");
+  CHECK(project_file_saved(&p, path) == 1);
+  CHECK(p.nfiles == 4);
+  snprintf(want, sizeof(want), "%s/lib/extra.inc", dir);
+  CHECK(p.nfiles > 2 && strcmp(project_path(&p, 2), want) == 0);
+  snprintf(want, sizeof(want), "%s/gfx.inc", dir);
+  CHECK(p.nfiles > 3 && strcmp(project_path(&p, 3), want) == 0); /* now via main */
+  CHECK(p.nfiles > 3 && p.files[3].includer == 0 && p.files[3].line == 4);
+  CHECK(project_find_symbol(&p, "extra", -1, &f, &line) && f == 2);
+  CHECK(!project_find_symbol(&p, "helper2", -1, &f, &line));
+  CHECK(project_consistent(&p));
+
+  /* a file outside the program is none of its business */
+  snprintf(path, sizeof(path), "%s/other.asm.tns", dir);
+  CHECK(project_file_saved(&p, path) == 0);
+
+  /* line numbers survive CRLF and a line longer than any buffer */
+  static char longline[6000];
+  memset(longline, 'x', sizeof(longline) - 1);
+  longline[0] = ';';
+  FILE *lf = fopen(want, "wb"); /* gfx.inc */
+  if (lf) {
+    fprintf(lf, "first\r\n%s\r\nthird\r\n    INCLUDE lib/extra.inc\r\n",
+            longline);
+    fclose(lf);
+  }
+  CHECK(project_file_saved(&p, want) == 1);
+  CHECK(project_find_symbol(&p, "third", -1, &f, &line));
+  CHECK(f == 3 && line == 3);
+  CHECK(p.nfiles == 4); /* extra.inc was already in */
+
+  /* a new file is a program of its own, with nothing indexed yet */
+  snprintf(path, sizeof(path), "%s/new.asm.tns", dir);
+  CHECK(project_open(&p, path) == 1);
+  CHECK(p.nfiles == 1 && p.nsyms == 0);
+  CHECK(project_find_file(&p, path) == 0);
+
+  project_close(&p);
+  CHECK(project_root(&p) == NULL);
+
+  const char *made[] = {"main.asm.tns", "lib/util.inc", "lib/extra.inc",
+                        "gfx.inc", "other.asm.tns"};
+  for (int i = 0; i < 5; i++) {
+    snprintf(path, sizeof(path), "%s/%s", dir, made[i]);
+    unlink(path);
+  }
+  rmdir(lib);
+  rmdir(dir);
+}
+
 /* Files a diagnostic mentions are named from the open file's folder, so two
    files sharing a name never read the same. */
 static void test_relative_path(void) {
@@ -1227,6 +1432,38 @@ static void test_alloc_failures(void) {
   /* and parses normally once memory is back */
   CHECK(asmdiag_parse_file(path, out, 4) == 1);
   unlink(path);
+
+  /* The project index, failing each of its allocations in turn: it says it
+     is incomplete, and whatever it kept still holds together. */
+  char dir[] = "/tmp/nstudio_projoomXXXXXX";
+  CHECK(mkdtemp(dir) != NULL);
+  put_file(dir, "m.asm", "main\n    INCLUDE a.inc\n    INCLUDE b.inc\nend\n");
+  put_file(dir, "a.inc", "alpha\nbeta\n    INCLUDE b.inc\n");
+  put_file(dir, "b.inc", "gamma\n");
+  char root[96];
+  snprintf(root, sizeof(root), "%s/m.asm", dir);
+  Project p;
+  project_init(&p, &asmlang_project);
+  int k, bad = 0;
+  for (k = 0; k < 200; k++) {
+    fail_alloc_after(k);
+    int whole = project_open(&p, root);
+    fail_alloc_never();
+    if (whole != !p.incomplete || !project_consistent(&p))
+      bad++;
+    if (whole)
+      break;
+  }
+  CHECK(bad == 0);
+  CHECK(k > 0 && k < 200); /* some did fail, and it got through in the end */
+  CHECK(p.nfiles == 3 && p.nsyms == 5);
+  project_close(&p);
+  const char *made[] = {"m.asm", "a.inc", "b.inc"};
+  for (int i = 0; i < 3; i++) {
+    snprintf(root, sizeof(root), "%s/%s", dir, made[i]);
+    unlink(root);
+  }
+  rmdir(dir);
 }
 
 /* ================================================================ */
@@ -1426,6 +1663,8 @@ int main(void) {
   test_asmdiag();
   test_asmreport();
   test_relative_path();
+  test_asmlang();
+  test_project();
   test_asmdb();
   test_fileio();
   test_alloc_failures();

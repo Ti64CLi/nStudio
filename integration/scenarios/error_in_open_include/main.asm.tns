@@ -1,0 +1,4 @@
+main
+    bl helper
+    INCLUDE lib/bad.inc
+    bx lr

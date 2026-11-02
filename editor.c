@@ -44,6 +44,7 @@
 #include "nasmlink.h"
 #include "optab.h"
 #include "gfx.h"
+#include "project.h"
 #include "settings.h"
 #include "syntax.h"
 #include "textdiff.h"
@@ -190,45 +191,141 @@ static int g_crlf;     /* 0 = LF line endings, 1 = CRLF (write \r\n) */
    error after a jump); "" when none.  Dismissed on the next keypress. */
 static char g_diag_status[224] = "";
 
-/* Set whenever the buffer changes after a successful assemble, i.e. the built
-   program no longer matches the source.  The calculator's filesystem does not
-   report a usable modification time, so this - not the timestamps - is what
-   makes the "older than the source" warning reliable.  It only tracks the
-   current session: after opening a file we cannot know whether an existing
-   build matches, so we start out not warning. */
+/* The program being edited: the file that was opened, every file it
+   includes, and their labels (see project.h).  It follows the open file -
+   see program_follow - so Ctrl+B builds its root, and labels and errors are
+   found in all of its files, whichever of them is open. */
+static Project g_program;
+
+/* The root of the last successful build, and whether a file of that program
+   has been edited since, i.e. the built program no longer matches the
+   source.  The calculator's filesystem does not report a usable modification
+   time, so this - not the timestamps - is what makes the "older than the
+   source" warning reliable.  It only tracks the current session: after
+   opening a file we cannot know whether an existing build matches, so we
+   start out not warning.  g_root_is_built says whether the current program is
+   the one built, so that edits elsewhere do not count. */
+static char g_built_root[512];
 static int g_build_stale;
+static int g_root_is_built;
 
 /* Assemble diagnostics retained for next/previous-error navigation.  Populated
    after each assemble: g_diags holds the whole parsed batch, g_diag_nav holds
    the navigation order over it (every diagnostic is in it, placed in the open
    file or not - see editor_load_diagnostics), and g_diag_cur is the current
-   position within g_diag_nav (-1 when none).  Any
-   buffer edit clears this (see diag_nav_reset callers), so navigation can
-   never jump to a line the diagnostics no longer describe. */
+   position within g_diag_nav (-1 when none).  They belong to the program, so
+   moving between its files keeps them; an edit drops only the edited file's
+   (see diag_file_edited), so navigation can never jump to a line the
+   diagnostics no longer describe. */
 static AsmDiag g_diags[ASMDIAG_MAX];
 static int g_ndiags = 0;
 static int g_diag_nav[ASMDIAG_MAX];
 static int g_diag_nav_count = 0;
 static int g_diag_cur = -1;
+/* Set when the current diagnostic was dropped: g_diag_cur is then the one
+   before the gap it left, so Ctrl+N and Ctrl+P each land on a neighbour. */
+static int g_diag_gap = 0;
 /* How many errors and warnings nasm found in all, from its results report,
    which may be more than were retained; 0 when nasm did not say. */
 static int g_diag_total = 0;
+/* Whether this visit to the open file has already dropped its diagnostics:
+   only the first edit has anything to do. */
+static int g_diag_edit_done = 0;
 
 static void diag_nav_reset(void) {
   g_ndiags = 0;
   g_diag_nav_count = 0;
   g_diag_cur = -1;
+  g_diag_gap = 0;
   g_diag_total = 0;
+  g_diag_edit_done = 0;
+}
+
+/*
+ * The open file was edited.  Its own diagnostics described lines that may
+ * have moved, so they leave the navigation; so do the INCLUDE lines and
+ * related locations in it that other diagnostics point through.  The rest of
+ * the program's diagnostics stay, still pointing at the right lines.
+ */
+static void diag_file_edited(void) {
+  if (g_diag_edit_done)
+    return;
+  g_diag_edit_done = 1;
+
+  int cur = (g_diag_cur >= 0 && g_diag_cur < g_diag_nav_count)
+                ? g_diag_nav[g_diag_cur]
+                : -1;
+  int kept = 0, cur_pos = -1, after_pos = -1, past = 0;
+  for (int i = 0; i < g_diag_nav_count; i++) {
+    int di = g_diag_nav[i];
+    AsmDiag *d = &g_diags[di];
+    if (di == cur)
+      past = 1;
+    if (asmdiag_same_file(d->file, g_filepath)) {
+      if (g_diag_total > 0)
+        g_diag_total--;
+      continue;
+    }
+    for (int k = 0; k < d->include_count; k++)
+      if (asmdiag_same_file(d->include_stack[k].file, g_filepath))
+        d->include_stack[k].line = -1;
+    for (int k = 0; k < d->related_count; k++)
+      if (asmdiag_same_file(d->related[k].file, g_filepath))
+        d->related[k].line = -1;
+    if (di == cur)
+      cur_pos = kept;
+    else if (past && after_pos < 0)
+      after_pos = kept;
+    g_diag_nav[kept++] = di;
+  }
+  g_diag_nav_count = kept;
+
+  if (cur_pos >= 0) {
+    g_diag_cur = cur_pos;
+  } else if (cur >= 0) {
+    g_diag_cur = (after_pos >= 0 ? after_pos : kept) - 1;
+    g_diag_gap = 1;
+  }
 }
 
 static int path_is_asm_source(const char *path);
+
+/* Is `path` to be edited as source: because its name says so, or because the
+   program includes it - an INCLUDEd file is read as source whatever it is
+   called. */
+static int path_is_program_source(const char *path) {
+  return path_is_asm_source(path) || project_find_file(&g_program, path) >= 0;
+}
 
 /* Read `path` into the fresh buffer `g`.  An editable source has CRLF
    normalised to LF, with *crlf recording the file's style so it round-trips
    on save; anything else is kept byte-exact, NUL bytes included, so an
    accidentally opened binary is not truncated and round-trips too. */
-static GbLoadResult load_file(const char *path, GapBuf *g, int *crlf) {
-  return gb_load_file(g, path, path_is_asm_source(path), crlf);
+static GbLoadResult load_file(const char *path, GapBuf *g, int *crlf,
+                              int as_source) {
+  return gb_load_file(g, path, as_source, crlf);
+}
+
+/*
+ * Keep the program while the open file belongs to it; otherwise make the open
+ * file the root of a new one (an untitled buffer has none).  A new program
+ * starts without the previous one's diagnostics.  Returns 1 when the program
+ * changed.
+ */
+static int program_follow(void) {
+  if (g_filepath[0] == '\0') {
+    if (!project_root(&g_program))
+      return 0;
+    project_close(&g_program);
+  } else if (project_find_file(&g_program, g_filepath) >= 0) {
+    return 0;
+  } else {
+    project_open(&g_program, g_filepath);
+  }
+  diag_nav_reset();
+  const char *root = project_root(&g_program);
+  g_root_is_built = root && strcmp(root, g_built_root) == 0;
+  return 1;
 }
 
 /* Say that `path` could not be opened.  It is never shown as an empty buffer
@@ -675,8 +772,9 @@ static void undo_apply(int pos, int remove_len, const char *insert,
   sel_active = active;
   cursor_sync_pos();
   g_modified = 1;
-  diag_nav_reset(); /* the buffer moved; drop stale assemble diagnostics */
-  g_build_stale = 1;
+  diag_file_edited(); /* the buffer moved; drop this file's diagnostics */
+  if (g_root_is_built)
+    g_build_stale = 1;
 
   /* The buffer is now the reference for the next delta.  If that cannot be
      captured, g_last still describes the pre-undo text and the next flush would
@@ -721,8 +819,9 @@ static void do_redo(void) {
 /* Called before a mutation.  Runs of the same kind coalesce into one entry;
    everything else closes the previous entry first. */
 static void undo_checkpoint(UndoKind kind) {
-  diag_nav_reset(); /* an edit invalidates the retained assemble diagnostics */
-  g_build_stale = 1; /* ...and leaves any built program behind the source */
+  diag_file_edited(); /* an edit invalidates this file's diagnostics */
+  if (g_root_is_built)
+    g_build_stale = 1; /* ...and leaves the built program behind the source */
   int coalesce =
       (kind == g_undo_kind) && (kind == UK_INSERT || kind == UK_DELETE);
   if (!coalesce) {
@@ -2135,8 +2234,10 @@ static int prompt_unsaved(void);
 static int editor_do_save(void);
 
 /* Replace the buffer with `path`, discarding everything that described the
-   previous file: cursor, selection, undo history, jump trail, diagnostics and
-   the build's currency.  Callers are responsible for offering to save first.
+   previous file: cursor, selection and undo history.  Callers are
+   responsible for offering to save first.  What describes the program - its
+   diagnostics, its build's currency - is kept while `path` belongs to it, and
+   starts afresh with a new one (program_follow).
 
    The new file is read before the current one is let go, so one that cannot
    be loaded leaves the editor exactly as it was: returns 0 in that case, after
@@ -2146,9 +2247,13 @@ static int editor_switch_to(const char *path) {
   strncpy(newpath, path, sizeof(newpath) - 1);
   newpath[sizeof(newpath) - 1] = '\0';
 
+  /* asked before the switch, while the program is still the one it may
+     belong to */
+  int as_source = path_is_program_source(newpath);
+
   GapBuf nb;
   int crlf;
-  if (load_file(newpath, &nb, &crlf) == GB_LOAD_FAILED) {
+  if (load_file(newpath, &nb, &crlf, as_source) == GB_LOAD_FAILED) {
     gb_free(&nb);
     load_failed_alert(newpath);
     return 0;
@@ -2170,10 +2275,10 @@ static int editor_switch_to(const char *path) {
   sel_anchor = SEL_NONE;
   sel_active = 0;
   undo_forget();
-  g_build_stale = 0;
   g_modified = 0;
-  g_readonly = !path_is_asm_source(g_filepath);
-  diag_nav_reset();
+  g_readonly = !as_source;
+  g_diag_edit_done = 0; /* a new visit: its first edit drops its diagnostics */
+  program_follow();
   /* The jump trail is deliberately not cleared here: it records the file each
      mark belongs to, so it survives following an INCLUDE.  Callers that mean
      to abandon it say so. */
@@ -2268,6 +2373,10 @@ static int editor_save_as(void) {
     g_filepath[sizeof(g_filepath) - 1] = '\0';
     g_modified = 0;
     g_saved = 1;
+    /* Under its new name the file is in the program only if the program
+       already included that name; otherwise it roots a new one. */
+    if (!program_follow())
+      project_file_saved(&g_program, g_filepath);
     return 1;
   }
   const char *body[] = {"Could not write to the specified path.",
@@ -2289,6 +2398,7 @@ static int editor_do_save(void) {
   }
   g_modified = 0;
   g_saved = 1;
+  project_file_saved(&g_program, g_filepath); /* its labels and includes */
   return 1;
 }
 
@@ -2315,83 +2425,158 @@ static void editor_goto_line(void) {
 }
 
 /* ================================================================
- * Label browser
- *
- * Scans the gap buffer for label definitions - under nasm's rule an
- * identifier in column 0 with NO trailing colon - into a table that the
- * picker in editor_ui.c displays.  Scanning needs the buffer and moving
- * the cursor to the chosen label needs the engine, so both stay here;
- * only the list UI lives over there.
- *
- * Also provides label-lookup by name (used by jump-to-label).
+ * Moving around the program
  * ================================================================ */
+static void editor_goto_line_col(int line, int col);
 
-/* LabelEntry and MAX_LABEL_LEN live in editor_ui.h: the table is filled here
-   from the buffer, and displayed by the picker there. */
-#define MAX_LABELS 256
-
-static LabelEntry g_labels[MAX_LABELS];
-static int g_nlabels;
-
-/* Rebuild label table from the gap buffer.  nasm rule: a label is a
-   valid identifier in column 0 (letter first, then alnum/underscore),
-   no trailing colon. */
-static void labels_scan(void) {
-  g_nlabels = 0;
-  for (int row = 0; row < num_lines && g_nlabels < MAX_LABELS; row++) {
-    int start = line_starts[row];
-    int ll = line_len(&g_buf, row);
-    if (ll == 0)
-      continue;
-    char first = gb_get(&g_buf, start);
-    if (!isalpha((unsigned char)first))
-      continue;
-    int i = 0;
-    while (i < ll && (isalnum((unsigned char)gb_get(&g_buf, start + i)) ||
-                      gb_get(&g_buf, start + i) == '_'))
-      i++;
-    int wlen = i;
-    if (wlen == 0 || wlen >= MAX_LABEL_LEN)
-      continue;
-    char tmp[MAX_LABEL_LEN];
-    for (int k = 0; k < wlen; k++)
-      tmp[k] = gb_get(&g_buf, start + k);
-    tmp[wlen] = '\0';
-    if (syn_is_reg(tmp, wlen) || syn_is_mnem(tmp, wlen) ||
-        syn_is_shift(tmp, wlen) || syn_is_directive(tmp, wlen))
-      continue;
-    memcpy(g_labels[g_nlabels].name, tmp, wlen + 1);
-    g_labels[g_nlabels].line = row;
-    g_nlabels++;
+/*
+ * Go to a 1-based line and column of `path`, a file of the program, the way
+ * any jump goes: the trail remembers where we were, so Ctrl+Shift+Enter comes
+ * back, and unsaved changes are offered for saving before another file is
+ * opened.  Returns 1 once there, 0 when it did not happen - the file is gone
+ * or unreadable, or the user chose to stay.
+ */
+static int program_open_at(const char *path, int line, int col) {
+  if (asmdiag_same_file(path, g_filepath)) {
+    jump_push();
+    editor_goto_line_col(line, col);
+    return 1;
   }
+
+  /* copied first: saving may re-read the program, and `path` with it */
+  char target[sizeof(g_filepath)];
+  struct stat st;
+  if (!asmdiag_normalize_path(path, target, sizeof(target)) ||
+      stat(target, &st) != 0)
+    return 0;
+
+  if (g_modified) {
+    int choice = prompt_unsaved();
+    if (choice == 1) {
+      if (!editor_do_save())
+        return 0;
+    } else if (choice == 0) {
+      return 0;
+    }
+  }
+
+  jump_push();
+  if (!editor_switch_to(target)) {
+    g_jump_count--; /* still here, so there is nothing to come back from */
+    return 0;
+  }
+  editor_goto_line_col(line, col);
+  return 1;
 }
 
-/* Return the line (0-based) of the label with the given name, or -1 if not
-   found.  Case-sensitive, as nasm's own label lookup is: "LOOP" does not
-   refer to "loop", and saying it does would contradict the assembler. */
-static int label_find(const char *name) {
-  for (int i = 0; i < g_nlabels; i++) {
-    if (strcmp(g_labels[i].name, name) == 0)
-      return g_labels[i].line;
+/* Program file `f`, named from the open file's folder. */
+static void program_file_name(int f, char *out, int outsz) {
+  asmdiag_relative_path(project_path(&g_program, f), g_filepath, out, outsz);
+}
+
+/* "program" when the open file is not all there is, "file" otherwise. */
+static const char *program_noun(void) {
+  return g_program.nfiles > 1 ? "program" : "file";
+}
+
+/* ================================================================
+ * Labels
+ *
+ * A label is looked for in the open file first - its buffer, unsaved edits
+ * and all - then in the program's other files, through the index
+ * (project.h).  What defines one is asmlang_label_def, the rule the index and
+ * the highlighter use too.  The list UI lives in editor_ui.c.
+ * ================================================================ */
+
+/* Line (0-based) of the open file's definition of `name`, or -1.
+   Case-sensitive, as nasm's own label lookup is: "LOOP" does not refer to
+   "loop", and saying it does would contradict the assembler. */
+static int buffer_label_line(const char *name) {
+  char found[MAX_LABEL_LEN];
+  for (int row = 0; row < num_lines; row++) {
+    extract_line(row);
+    if (asmlang_label_def(line_scratch, found, sizeof(found)) &&
+        strcmp(found, name) == 0)
+      return row;
   }
   return -1;
 }
 
-
-/* Open the label browser.  Returns 1 if cursor was moved. */
+/* Open the label browser on every label of the program: the open file's
+   first, then the other files' in include order.  Returns 1 if the cursor
+   moved. */
 static int editor_label_browser(void) {
-  labels_scan();
+  int here = project_find_file(&g_program, g_filepath);
+  char found[MAX_LABEL_LEN];
 
-  int sel = label_pick(g_labels, g_nlabels, cursor_row);
-  if (sel < 0)
+  int nhere = 0;
+  for (int row = 0; row < num_lines; row++) {
+    extract_line(row);
+    if (asmlang_label_def(line_scratch, found, sizeof(found)))
+      nhere++;
+  }
+  int n = nhere;
+  for (int i = 0; i < g_program.nsyms; i++)
+    if (g_program.syms[i].file != here)
+      n++;
+
+  /* Only for as long as the browser is open: a program's labels can be many,
+     and nothing else needs them. */
+  LabelEntry *labels = malloc((size_t)(n > 0 ? n : 1) * sizeof(*labels));
+  int *files = malloc((size_t)(n > 0 ? n : 1) * sizeof(*files));
+  char(*names)[48] = malloc(
+      (size_t)(g_program.nfiles > 0 ? g_program.nfiles : 1) * sizeof(*names));
+  if (!labels || !files || !names) {
+    free(labels);
+    free(files);
+    free(names);
+    static const char *body[] = {"Not enough memory to list the labels."};
+    gfx_window_alert("Labels", body, 1, "OK");
     return 0;
+  }
 
-  jump_push();
-  cursor_row = g_labels[sel].line;
-  cursor_col = 0;
-  cursor_sync_rowcol();
-  scroll_to_cursor();
-  return 1;
+  int k = 0;
+  for (int row = 0; row < num_lines && k < nhere; row++) {
+    extract_line(row);
+    if (asmlang_label_def(line_scratch, labels[k].name, MAX_LABEL_LEN)) {
+      labels[k].line = row;
+      labels[k].where = NULL;
+      files[k++] = here;
+    }
+  }
+  for (int f = 0; f < g_program.nfiles; f++)
+    program_file_name(f, names[f], sizeof(names[f]));
+  for (int i = 0; i < g_program.nsyms; i++) {
+    const ProjectSymbol *sym = &g_program.syms[i];
+    if (sym->file == here)
+      continue; /* the buffer said, with any unsaved edits */
+    snprintf(labels[k].name, MAX_LABEL_LEN, "%s",
+             project_symbol_name(&g_program, i));
+    labels[k].line = sym->line - 1;
+    labels[k].where = names[sym->file];
+    files[k++] = sym->file;
+  }
+
+  int sel = label_pick(labels, k, cursor_row);
+  int moved = 0, other = 0, line = 0;
+  char path[sizeof(g_filepath)];
+  if (sel >= 0 && !labels[sel].where) {
+    jump_push();
+    cursor_row = labels[sel].line;
+    cursor_col = 0;
+    cursor_sync_rowcol();
+    scroll_to_cursor();
+    moved = 1;
+  } else if (sel >= 0) {
+    other = 1;
+    line = labels[sel].line + 1;
+    snprintf(path, sizeof(path), "%s", project_path(&g_program, files[sel]));
+  }
+  free(labels);
+  free(files);
+  free(names);
+
+  return other ? program_open_at(path, line, 1) : moved;
 }
 
 /* ================================================================
@@ -2414,14 +2599,28 @@ static int editor_label_browser(void) {
  * nasmlink.h - so the file opened here is the one nasm assembles.
  * ================================================================ */
 
-/* Open the file an INCLUDE line names.  Returns 1 when this was an include
-   line, whether or not the file could be opened, so the caller knows the line
-   was handled. */
+static void diag_jump_to_nav(int nav_pos, int may_open);
+
+/* Open the file an INCLUDE line names - at the current error, when that error
+   is shown on this line because it came through this INCLUDE.  Returns 1 when
+   this was an include line, whether or not the file could be opened, so the
+   caller knows the line was handled. */
 static int editor_follow_include(void) {
   char operand[256];
   extract_line(cursor_row);
   if (nasmlink_include_operand(line_scratch, operand, sizeof(operand)) == 0)
     return 0;
+
+  if (g_diag_cur >= 0 && g_diag_cur < g_diag_nav_count && !g_diag_gap) {
+    const AsmDiag *d = &g_diags[g_diag_nav[g_diag_cur]];
+    int line, col;
+    if (d->line >= 1 &&
+        asmdiag_locate(d, g_filepath, &line, &col) == ASMDIAG_AT_INCLUDE &&
+        line == cursor_row + 1) {
+      diag_jump_to_nav(g_diag_cur, 1);
+      return 1;
+    }
+  }
 
   char path[1024];
   if (!nasmlink_resolve_include(g_filepath, operand, path, sizeof(path))) {
@@ -2480,20 +2679,29 @@ static int word_under_cursor(char *out, int outsz) {
   return wlen;
 }
 
-/* Move to the definition of `name`, remembering where we came from.
-   Returns 1 when the label exists. */
+/* Move to the definition of `name` - in the open file, else in another file of
+   the program, which is opened - remembering where we came from.  Returns 1
+   when moved, 0 when the program defines no such label, and -1 when it does
+   but the move did not happen (the user chose to stay with unsaved edits). */
 static int jump_to_label_named(const char *name) {
-  labels_scan();
-  int target = label_find(name);
-  if (target < 0)
-    return 0;
+  int target = buffer_label_line(name);
+  if (target >= 0) {
+    jump_push();
+    cursor_row = target;
+    cursor_col = 0;
+    cursor_sync_rowcol();
+    scroll_to_cursor();
+    return 1;
+  }
 
-  jump_push();
-  cursor_row = target;
-  cursor_col = 0;
-  cursor_sync_rowcol();
-  scroll_to_cursor();
-  return 1;
+  int f, line;
+  if (!project_find_symbol(&g_program, name,
+                           project_find_file(&g_program, g_filepath), &f,
+                           &line))
+    return 0;
+  char path[sizeof(g_filepath)];
+  snprintf(path, sizeof(path), "%s", project_path(&g_program, f));
+  return program_open_at(path, line, 1) ? 1 : -1;
 }
 
 /*
@@ -2563,9 +2771,10 @@ static void editor_jump_to_label(void) {
     }
   }
 
-  if (!jump_to_label_named(name)) {
+  if (jump_to_label_named(name) == 0) {
     char msg[128];
-    snprintf(msg, sizeof(msg), "Label \"%s\" not found in this file.", name);
+    snprintf(msg, sizeof(msg), "Label \"%s\" not found in this %s.", name,
+             program_noun());
     const char *body[1] = {msg};
     gfx_window_alert("Label Not Found", body, 1, "OK");
   }
@@ -2613,58 +2822,54 @@ static void editor_jump_back(void) {
 /* ================================================================
  * Find references
  *
- * Every mention of a label, wherever it appears as a whole identifier -
- * branch targets, operands, EQU right-hand sides.  Matching is
- * case-sensitive and word-bounded, the same rule label_find (and nasm) uses,
- * so a label named "loop" is found neither inside "loopback" nor as "LOOP".
+ * Every mention of a label in the program, wherever it appears as a whole
+ * identifier - branch targets, operands, EQU right-hand sides: the open file
+ * from its buffer, the others from disk.  The rule is asmlang_mentions,
+ * case-sensitive and word-bounded like nasm's labels, so a label named "loop"
+ * is found neither inside "loopback" nor as "LOOP".
  * ================================================================ */
-#define MAX_REFS 128
+#define MAX_REFS 256
 /* Source lines have no fixed limit, so this is a pragmatic cap: far more than
    the window shows, scrollable, and the line itself is one Enter away. */
 #define REF_ROW_LEN 176
 
-static int g_ref_lines[MAX_REFS];
-static char g_ref_rows[MAX_REFS][REF_ROW_LEN];
-static const char *g_ref_ptrs[MAX_REFS];
-static int g_nrefs;
+typedef struct {
+  int file; /* the program file it is in, or -1 for the open one */
+  int line; /* 0-based */
+  char row[REF_ROW_LEN];
+} RefRow;
 
-/* Collect the lines mentioning `name`, formatting a row for each. */
-static void refs_scan(const char *name) {
-  int nlen = (int)strlen(name);
-  g_nrefs = 0;
+typedef struct {
+  RefRow *rows;
+  int n;
+} RefList;
 
-  for (int row = 0; row < num_lines && g_nrefs < MAX_REFS; row++) {
-    extract_line(row);
-    const char *line = line_scratch;
-    int len = (int)strlen(line);
-
-    for (int i = 0; i < len;) {
-      if (line[i] == ';')
-        break; /* a comment mention is not a reference */
-      if (!isalnum((unsigned char)line[i]) && line[i] != '_') {
-        i++;
-        continue;
-      }
-      int ws = i;
-      while (i < len && (isalnum((unsigned char)line[i]) || line[i] == '_'))
-        i++;
-      if (i - ws != nlen || strncmp(line + ws, name, (size_t)nlen) != 0)
-        continue;
-
-      /* Trim leading blanks so the row shows the code, not the indent. */
-      const char *text = line;
-      while (*text == ' ' || *text == '\t')
-        text++;
-      snprintf(g_ref_rows[g_nrefs], REF_ROW_LEN, "Ln %-5d %s", row + 1, text);
-      g_ref_lines[g_nrefs] = row;
-      g_ref_ptrs[g_nrefs] = g_ref_rows[g_nrefs];
-      g_nrefs++;
-      break; /* one row per line, however often the name occurs on it */
-    }
+/* Add the row for line `line` (0-based) of program file `file` (-1: the open
+   one), whose text is `text`.  Returns 0 once the list is full. */
+static int refs_add(RefList *r, int file, int line, const char *text) {
+  if (r->n == MAX_REFS)
+    return 0;
+  while (*text == ' ' || *text == '\t')
+    text++; /* the code, not the indent */
+  RefRow *row = &r->rows[r->n++];
+  row->file = file;
+  row->line = line;
+  if (file < 0) {
+    snprintf(row->row, REF_ROW_LEN, "Ln %-5d %s", line + 1, text);
+  } else {
+    char name[48];
+    program_file_name(file, name, sizeof(name));
+    snprintf(row->row, REF_ROW_LEN, "%s:%d  %s", name, line + 1, text);
   }
+  return 1;
 }
 
-/* List every mention of the label under the cursor (Ctrl+U). */
+/* project_find_refs callback: its lines are 1-based. */
+static int refs_add_from_file(void *ctx, int file, int line, const char *text) {
+  return refs_add(ctx, file, line - 1, text);
+}
+
+/* List every mention of the label under the cursor in the program (Ctrl+U). */
 static void editor_find_refs(void) {
   char name[MAX_LABEL_LEN];
   if (word_under_cursor(name, sizeof(name)) == 0) {
@@ -2674,10 +2879,33 @@ static void editor_find_refs(void) {
     return;
   }
 
-  refs_scan(name);
-  if (g_nrefs == 0) {
+  /* Only for as long as the list is open. */
+  RefList r = {malloc(MAX_REFS * sizeof(RefRow)), 0};
+  const char **ptrs = malloc(MAX_REFS * sizeof(*ptrs));
+  if (!r.rows || !ptrs) {
+    free(r.rows);
+    free(ptrs);
+    static const char *body[] = {"Not enough memory to list them."};
+    gfx_window_alert("Find References", body, 1, "OK");
+    return;
+  }
+
+  for (int row = 0; row < num_lines; row++) {
+    extract_line(row);
+    if (asmlang_mentions(line_scratch, name) &&
+        !refs_add(&r, -1, row, line_scratch))
+      break;
+  }
+  project_find_refs(&g_program, name,
+                    project_find_file(&g_program, g_filepath),
+                    refs_add_from_file, &r);
+
+  if (r.n == 0) {
+    free(r.rows);
+    free(ptrs);
     char msg[128];
-    snprintf(msg, sizeof(msg), "No references to \"%s\" in this file.", name);
+    snprintf(msg, sizeof(msg), "No references to \"%s\" in this %s.", name,
+             program_noun());
     const char *body[1] = {msg};
     gfx_window_alert("Find References", body, 1, "OK");
     return;
@@ -2686,24 +2914,37 @@ static void editor_find_refs(void) {
   /* Pre-select the reference nearest the cursor, so the list opens where the
      user already is rather than at the top of the file. */
   int initial = 0;
-  for (int i = 1; i < g_nrefs; i++) {
-    if (abs(g_ref_lines[i] - cursor_row) <
-        abs(g_ref_lines[initial] - cursor_row))
+  for (int i = 1; i < r.n && r.rows[i].file < 0; i++) {
+    if (abs(r.rows[i].line - cursor_row) <
+        abs(r.rows[initial].line - cursor_row))
       initial = i;
   }
+  for (int i = 0; i < r.n; i++)
+    ptrs[i] = r.rows[i].row;
 
   /* Sized for the longest label plus the suffix, so it is never truncated. */
   char title[MAX_LABEL_LEN + 48];
-  snprintf(title, sizeof(title), "%s  (%d reference%s)", name, g_nrefs,
-           g_nrefs == 1 ? "" : "s");
+  snprintf(title, sizeof(title), "%s  (%d reference%s)", name, r.n,
+           r.n == 1 ? "" : "s");
 
-  int sel = list_pick(title, g_ref_ptrs, NULL, g_nrefs, initial,
+  int sel = list_pick(title, ptrs, NULL, r.n, initial,
                       "Enter:go  <>:scroll  Esc:close");
+  int file = sel >= 0 ? r.rows[sel].file : -1;
+  int line = sel >= 0 ? r.rows[sel].line : 0;
+  char path[sizeof(g_filepath)];
+  if (file >= 0)
+    snprintf(path, sizeof(path), "%s", project_path(&g_program, file));
+  free(r.rows);
+  free(ptrs);
   if (sel < 0)
     return;
 
+  if (file >= 0) {
+    program_open_at(path, line + 1, 1);
+    return;
+  }
   jump_push();
-  cursor_row = g_ref_lines[sel];
+  cursor_row = line;
   cursor_col = 0;
   cursor_sync_rowcol();
   scroll_to_cursor();
@@ -2735,7 +2976,9 @@ static const char *menu_view_items[] = {
     "ARM Catalog", "Ndless Syscalls (Shift+Cat)", "Label Browser",
     "Instruction Help (Ctrl+Trig)"};
 static const char *menu_settings_items[] = {"Preferences"};
-static const char *menu_assemble_items[] = {"Assemble (Ctrl+B)"};
+/* Names what Ctrl+B builds when that is not the open file (menu_run). */
+static char menu_asm_label[64] = "Assemble (Ctrl+B)";
+static const char *menu_assemble_items[] = {menu_asm_label};
 
 static const MenuDef g_menus[] = {
     {"File", menu_file_items, 7},         {"Edit", menu_edit_items, 10},
@@ -2874,13 +3117,16 @@ static const char *diag_severity_name(const AsmDiag *d) {
 
 /* Select the diagnostic at navigation position `nav_pos` (an index into
    g_diag_nav, in [0, g_diag_nav_count)) and describe it in the status bar.
-   Diagnostics in the open file move the cursor to their location.  One in a
-   file this one INCLUDEs moves it to the INCLUDE that brought that file in, and
-   one with nowhere to go here - no line at all, or another file entirely -
-   leaves the cursor alone; both report where the diagnostic is, naming the file
-   that included it, so the origin is not a mystery. */
-static void diag_jump_to_nav(int nav_pos) {
+   Diagnostics in the open file move the cursor to their location.  With
+   `may_open`, one on a line of another file of the program opens that file
+   there.  Otherwise one in a file this one INCLUDEs moves the cursor to the
+   INCLUDE that brought that file in, and one with nowhere to go here - no line
+   at all, or another file entirely - leaves the cursor alone; both report
+   where the diagnostic is, naming the file that included it, so the origin is
+   not a mystery. */
+static void diag_jump_to_nav(int nav_pos, int may_open) {
   g_diag_cur = nav_pos;
+  g_diag_gap = 0;
   const AsmDiag *d = &g_diags[g_diag_nav[nav_pos]];
   const char *sev = diag_severity_name(d);
 
@@ -2900,6 +3146,17 @@ static void diag_jump_to_nav(int nav_pos) {
     editor_goto_line_col(line, col);
     snprintf(g_diag_status, sizeof(g_diag_status), " %s %d/%d%s, line %d: %s%s",
              sev, nav_pos + 1, g_diag_nav_count, more, line, d->message, rel);
+    return;
+  }
+
+  /* On a line of another of the program's files: go there, when asked. */
+  if (may_open && d->line >= 1 &&
+      project_find_file(&g_program, d->file) >= 0 &&
+      program_open_at(d->file, d->line, d->col)) {
+    snprintf(g_diag_status, sizeof(g_diag_status),
+             " %s %d/%d%s in %s, line %d: %s%s", sev, nav_pos + 1,
+             g_diag_nav_count, more, asmdiag_base_name(g_filepath), d->line,
+             d->message, rel);
     return;
   }
 
@@ -2969,22 +3226,25 @@ static int editor_load_diagnostics(AsmReport *rep) {
     g_diag_nav[g_diag_nav_count++] = i;
   }
 
+  /* never into another file by itself: that takes a keypress */
   if (g_diag_nav_count > 0)
     diag_jump_to_nav(first_line >= 0      ? first_line
                      : first_include >= 0 ? first_include
-                                          : 0);
+                                          : 0,
+                     0);
   return n;
 }
 
-/* Jump to the next / previous navigable diagnostic, wrapping around at the
-   ends.  With nothing retained (no assemble yet, or invalidated by an edit)
-   they leave a short note instead. */
+/* Jump to the next / previous diagnostic of the program, opening its file
+   when it is in another one, and wrapping around at the ends.  With nothing
+   retained (no assemble yet, or every one invalidated by edits) they leave a
+   short note instead. */
 static void editor_diag_next(void) {
   if (g_diag_nav_count == 0) {
     snprintf(g_diag_status, sizeof(g_diag_status), " No errors to navigate");
     return;
   }
-  diag_jump_to_nav((g_diag_cur + 1) % g_diag_nav_count);
+  diag_jump_to_nav((g_diag_cur + 1) % g_diag_nav_count, 1);
 }
 
 static void editor_diag_prev(void) {
@@ -2992,20 +3252,25 @@ static void editor_diag_prev(void) {
     snprintf(g_diag_status, sizeof(g_diag_status), " No errors to navigate");
     return;
   }
-  diag_jump_to_nav((g_diag_cur - 1 + g_diag_nav_count) % g_diag_nav_count);
+  /* after a gap, the one before it is g_diag_cur itself */
+  int back = g_diag_gap ? 0 : 1;
+  diag_jump_to_nav((g_diag_cur - back + g_diag_nav_count) % g_diag_nav_count,
+                   1);
 }
 
-/* Can the cursor be placed on this secondary location, i.e. is it in the file
-   the editor currently shows? */
+/* Can the cursor be placed on this secondary location: on a line, in the open
+   file or another of the program's? */
 static int diag_related_reachable(const AsmDiagRelated *r) {
-  return r->line >= 1 && asmdiag_same_file(r->file, g_filepath);
+  return r->line >= 1 && (asmdiag_same_file(r->file, g_filepath) ||
+                          project_find_file(&g_program, r->file) >= 0);
 }
 
 /*
  * Detail popup for the currently selected diagnostic: its full message, the
  * INCLUDE chain that led to it, and nasm's secondary locations ("previously
- * defined here" and friends).  Related locations inside the open file are
- * selectable and Enter jumps to one; the rest are shown for context only.
+ * defined here" and friends).  Related locations on a line of the program
+ * are selectable and Enter goes to one, opening its file if need be; the
+ * rest are shown for context only.
  */
 static void editor_diag_detail(void) {
   if (g_diag_nav_count == 0) {
@@ -3098,7 +3363,10 @@ static void editor_diag_detail(void) {
       for (int i = 0; i < ninc && ty + LINE_H <= body_bot; i++) {
         char fname[128], fr[160];
         diag_file_name(d->include_stack[i].file, fname, sizeof(fname));
-        snprintf(fr, sizeof(fr), "  %s:%d", fname, d->include_stack[i].line);
+        if (d->include_stack[i].line >= 1)
+          snprintf(fr, sizeof(fr), "  %s:%d", fname, d->include_stack[i].line);
+        else /* edited since the build: the line may have moved */
+          snprintf(fr, sizeof(fr), "  %s", fname);
         gfx_drawstr_clipped(tx, ty, fr, FG, BG, INNER_W);
         ty += LINE_H;
       }
@@ -3114,8 +3382,12 @@ static void editor_diag_detail(void) {
         int reachable = diag_related_reachable(r);
         char rname[128], row[224];
         diag_file_name(r->file, rname, sizeof(rname));
-        snprintf(row, sizeof(row), "%c %s:%d %s", i == sel ? '>' : ' ', rname,
-                 r->line, r->message);
+        if (r->line >= 1)
+          snprintf(row, sizeof(row), "%c %s:%d %s", i == sel ? '>' : ' ',
+                   rname, r->line, r->message);
+        else
+          snprintf(row, sizeof(row), "%c %s %s", i == sel ? '>' : ' ', rname,
+                   r->message);
         uint16_t rbg = (i == sel) ? g_default_theme.accent : BG;
         uint16_t rfg = (i == sel) ? g_default_theme.accent_text
                                   : (reachable ? FG : DIM);
@@ -3162,19 +3434,22 @@ static void editor_diag_detail(void) {
       const AsmDiagRelated *r = &d->related[sel];
       while (any_key_pressed())
         msleep(20);
-      if (diag_related_reachable(r)) {
-        jump_push();
-        editor_goto_line_col(r->line, r->col);
+      if (diag_related_reachable(r) &&
+          program_open_at(r->file, r->line, r->col)) {
         snprintf(g_diag_status, sizeof(g_diag_status), " %s, line %d: %s",
-                 asmdiag_base_name(r->file), r->line, r->message);
+                 asmdiag_base_name(g_filepath), r->line, r->message);
         return;
       }
-      /* Not in this buffer: say so rather than moving the cursor somewhere
+      /* Nowhere to go: say so rather than moving the cursor somewhere
          misleading. */
       char rname[128];
       diag_file_name(r->file, rname, sizeof(rname));
-      snprintf(g_diag_status, sizeof(g_diag_status), " %s:%d is in another file",
-               rname, r->line);
+      if (r->line >= 1)
+        snprintf(g_diag_status, sizeof(g_diag_status),
+                 " %s:%d is not in this program", rname, r->line);
+      else
+        snprintf(g_diag_status, sizeof(g_diag_status),
+                 " %s has changed since the build", rname);
       return;
     }
   }
@@ -3230,7 +3505,9 @@ static void editor_diag_panel(void) {
 
     g_diag_row_ptrs[i] = g_diag_rows[i];
     /* Enter can go to its line, or to the INCLUDE that brought it in. */
-    g_diag_actionable[i] = (char)(place != ASMDIAG_NOWHERE);
+    g_diag_actionable[i] =
+        (char)(place != ASMDIAG_NOWHERE ||
+               (d->line >= 1 && project_find_file(&g_program, d->file) >= 0));
   }
 
   /* When nasm found more than we kept, say how many it found; without its
@@ -3253,7 +3530,7 @@ static void editor_diag_panel(void) {
   /* Selecting one also makes it the current entry, so Ctrl+N and Ctrl+P
      carry on from where the panel left off. */
   jump_push();
-  diag_jump_to_nav(sel);
+  diag_jump_to_nav(sel, 1);
 }
 
 /* Say what an assemble that did not succeed came to.  Errors with diagnostics
@@ -3302,6 +3579,13 @@ static void editor_report_build(AsmBuildOutcome outcome, int status) {
   }
 }
 
+/* What Ctrl+B builds and Ctrl+R runs: the program's root, whichever of its
+   files is open - an included file cannot be assembled alone. */
+static const char *build_target(void) {
+  const char *root = project_root(&g_program);
+  return root ? root : g_filepath;
+}
+
 static void editor_assemble(void) {
   if (g_settings.nasm_path[0] == '\0') {
     static const char *body[] = {
@@ -3341,10 +3625,15 @@ static void editor_assemble(void) {
       return;
   }
 
+  /* Built: the program's root, whichever of its files is open.  Copied, as
+     the program may be re-read before nasm runs. */
+  char target[sizeof(g_filepath)];
+  snprintf(target, sizeof(target), "%s", build_target());
+
   /* nasm is told not to ask anything (--no-ui), so what it would have asked
      is asked here: whether a file that does not look like a source is to be
      built after all, by the rule nasm applies... */
-  if (!path_is_asm_source(g_filepath)) {
+  if (!path_is_asm_source(target)) {
     static const char *body[] = {"This file does not match your ASM",
                                  "extension, so it may not be a source.",
                                  "Assemble it anyway?"};
@@ -3367,7 +3656,7 @@ static void editor_assemble(void) {
   /* The command line nasm is given (see nasmlink.h).  Static rather than on
      the stack: nl_exec runs nasm on this very stack, below this frame. */
   static NasmInvocation inv;
-  if (!nasmlink_invocation(&inv, g_filepath, g_settings.nasm_args,
+  if (!nasmlink_invocation(&inv, target, g_settings.nasm_args,
                            NASMLINK_DIAG_FILE, formats[fmt],
                            gfx_framebuffer())) {
     static const char *body[] = {"The file's path is too long",
@@ -3382,7 +3671,7 @@ static void editor_assemble(void) {
 
   /* nasm leaves the screen alone, so this stays up while it works. */
   snprintf(g_diag_status, sizeof(g_diag_status), " Assembling %s...",
-           asmdiag_base_name(g_filepath));
+           asmdiag_base_name(target));
   render_all();
 
   int status = nl_exec(g_settings.nasm_path, inv.argc, inv.argv);
@@ -3413,14 +3702,17 @@ static void editor_assemble(void) {
   /* A clean build is the only case worth offering to run.  Ask first: the
      program takes over the calculator, and a faulty one can take nStudio down
      with it. */
-  g_build_stale = 0; /* what is on disk now matches this buffer */
+  /* what is on disk now matches the program */
+  snprintf(g_built_root, sizeof(g_built_root), "%s", target);
+  g_build_stale = 0;
+  g_root_is_built = 1;
 
   /* What nasm says it built; nasm 1.2 does not say, so its rule decides. */
   char outpath[1024];
   struct stat ost;
   if (rep.output[0])
     snprintf(outpath, sizeof(outpath), "%s", rep.output);
-  else if (!nasmlink_output_path(g_filepath, outpath, sizeof(outpath)))
+  else if (!nasmlink_output_path(target, outpath, sizeof(outpath)))
     return;
   if (stat(outpath, &ost) != 0)
     return;
@@ -3443,14 +3735,15 @@ static void editor_assemble(void) {
 }
 
 /*
- * Run the program already built from this source, without reassembling.
- * Runs straight away when the build is newer than the file on disk; when it is
- * older - or the buffer has unsaved edits - it says so first, since the program
- * about to run will not contain those changes.
+ * Run the program already built from the program's root, without
+ * reassembling.  Runs straight away when the build is newer than the source;
+ * when it is older - or the buffer has unsaved edits - it says so first, since
+ * the program about to run will not contain those changes.
  */
 static void editor_run_build(void) {
   char outpath[1024];
-  if (!nasmlink_output_path(g_filepath, outpath, sizeof(outpath))) {
+  const char *target = build_target();
+  if (!nasmlink_output_path(target, outpath, sizeof(outpath))) {
     static const char *body[] = {"This buffer has not been saved,",
                                  "so there is no build to run."};
     gfx_window_alert("Run", body, 2, "OK");
@@ -3470,7 +3763,9 @@ static void editor_run_build(void) {
    * Warn when what we are about to run no longer matches the source.
    *
    * Two things prove that outright: unsaved edits in the buffer, and any change
-   * made since the last successful assemble.  Both are tracked here rather than
+   * to the program's files since its last successful assemble in this session
+   * (another program's build says nothing about this one).  Both are tracked
+   * here rather than
    * asked of the filesystem, because Ndless does not fill in a modification
    * time - stat() reports zero - so a timestamp comparison silently never
    * fires on the calculator.  It is still attempted, guarded on both stamps
@@ -3478,8 +3773,8 @@ static void editor_run_build(void) {
    * platform that does report times.
    */
   struct stat sst;
-  int stale = g_modified || g_build_stale;
-  if (!stale && stat(g_filepath, &sst) == 0 && sst.st_mtim.tv_sec > 0 &&
+  int stale = g_modified || (g_root_is_built && g_build_stale);
+  if (!stale && stat(target, &sst) == 0 && sst.st_mtim.tv_sec > 0 &&
       ost.st_mtim.tv_sec > 0)
     stale = sst.st_mtim.tv_sec > ost.st_mtim.tv_sec;
   if (stale) {
@@ -3634,6 +3929,12 @@ static int menu_run(void) {
   int in_sub = 0;
   int result = 0;
 
+  const char *target = build_target();
+  if (target[0] && !asmdiag_same_file(target, g_filepath))
+    snprintf(menu_asm_label, sizeof(menu_asm_label), "Assemble %.20s (Ctrl+B)",
+             asmdiag_base_name(target));
+  else
+    snprintf(menu_asm_label, sizeof(menu_asm_label), "Assemble (Ctrl+B)");
   snprintf(menu_le_label, sizeof(menu_le_label), "Line Ending: %s",
            g_crlf ? "CRLF" : "LF");
 
@@ -3777,7 +4078,8 @@ int editor_open(const char *path) {
   if (path && path[0] != '\0') {
     strncpy(g_filepath, path, sizeof(g_filepath) - 1);
     g_filepath[sizeof(g_filepath) - 1] = '\0';
-    if (load_file(g_filepath, &g_buf, &g_crlf) == GB_LOAD_FAILED) {
+    if (load_file(g_filepath, &g_buf, &g_crlf,
+                  path_is_asm_source(g_filepath)) == GB_LOAD_FAILED) {
       gb_free(&g_buf);
       load_failed_alert(g_filepath);
       return 0;
@@ -3806,8 +4108,15 @@ int editor_open(const char *path) {
   sel_active = 0;
   undo_forget();
   /* A different buffer: whatever was built before says nothing about it. */
+  g_built_root[0] = '\0';
   g_build_stale = 0;
   jump_stack_clear(); /* the trail belonged to the previous file */
+
+  /* The file opened is the program: read what it includes. */
+  if (!g_program.lang)
+    project_init(&g_program, &asmlang_project);
+  project_close(&g_program);
+  program_follow();
 
   render_all();
 
@@ -4098,5 +4407,7 @@ int editor_open(const char *path) {
   /* Release the undo/redo snapshots (up to 32 buffer copies) rather than
      holding them while the user is back in the main menu. */
   undo_forget();
+  project_close(&g_program);
+  diag_nav_reset();
   return g_saved;
 }
